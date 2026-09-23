@@ -41,6 +41,9 @@ type AnalysisEnvironment = {
   modelReady: boolean
   runtimeDirectory: string
   modelDirectory: string
+  baseRuntimeVersion: string
+  baseRuntimePath: string
+  baseRuntimeReady: boolean
   busy: boolean
 }
 
@@ -450,6 +453,21 @@ export default function App() {
     } catch (error) {
       setAnalysisProgress('环境安装未完成')
       setNotice(`分析环境安装失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const prepareBaseRuntime = async () => {
+    if (!window.pitchordDesktop?.prepareBaseRuntime) return
+    setAnalysisEnvironmentBusy(true)
+    setAnalysisProgress('正在准备内置 Python…')
+    try {
+      const status = await window.pitchordDesktop.prepareBaseRuntime()
+      setAnalysisEnvironment(status)
+      setAnalysisProgress(`内置 Python ${status.baseRuntimeVersion} 已准备完成`)
+      setNotice('内置 Python 已安装到 Pitchord 本地目录，新设备无需再安装系统 Python。')
+    } catch (error) {
+      setAnalysisProgress('内置 Python 准备未完成')
+      setNotice(`内置 Python 安装失败：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
   }
 
@@ -1161,17 +1179,19 @@ export default function App() {
               </div>
               {window.pitchordDesktop && <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3" data-analysis-environment>
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">独立存放 Python 依赖和模型，不修改系统 Python 或 PATH。</p></div></div>
+                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">可自动下载内置 Python，独立存放依赖和模型，不修改系统 Python 或 PATH。</p></div></div>
                   <Badge variant={analysisEnvironment?.runtimeReady ? 'secondary' : 'outline'}>{analysisEnvironment?.runtimeReady ? <CheckCircle2 className="mr-1 size-3" /> : <AlertCircle className="mr-1 size-3" />}{analysisSourceLabel}</Badge>
                 </div>
-                <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+                <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 xl:grid-cols-4">
+                  <span>内置 Python：{analysisEnvironment?.baseRuntimeReady ? `${analysisEnvironment.baseRuntimeVersion} 已就绪` : '尚未下载'}</span>
                   <span>Python：{analysisEnvironment?.pythonVersion || '未检测到'}</span>
                   <span>组件：{analysisEnvironment?.runtimeReady ? 'Demucs 与音高依赖已就绪' : '需要安装或修复'}</span>
                   <span>模型：{analysisEnvironment?.modelReady ? `${analysisEnvironment.model} 已就绪` : `${analysisEnvironment?.model || 'htdemucs'} 尚未预下载`}</span>
                 </div>
                 <p className="mt-2 break-all text-xs text-muted-foreground">{analysisProgress}{pythonPath ? ` · ${pythonPath}` : ''}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Button size="sm" variant="secondary" onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '修复独立环境' : '安装独立环境'}</Button>
+                  <Button size="sm" variant="secondary" onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '修复独立环境' : '一键安装分析环境'}</Button>
+                  <Button size="sm" variant="outline" onClick={() => void prepareBaseRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.baseRuntimeReady ? '检查内置 Python' : '仅下载内置 Python'}</Button>
                   <Button size="sm" variant="outline" onClick={() => void prepareAnalysisModel()} disabled={analysisEnvironmentBusy || !analysisEnvironment?.runtimeReady}>{analysisEnvironment?.modelReady ? '重新检查模型' : '准备人声分离模型'}</Button>
                   <Button size="sm" variant="ghost" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()} disabled={analysisEnvironmentBusy}><HardDrive />存储位置</Button>
                   <Button size="sm" variant="ghost" onClick={choosePython} disabled={analysisEnvironmentBusy}>高级：选择已有 Python</Button>

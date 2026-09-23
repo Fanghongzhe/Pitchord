@@ -25,12 +25,21 @@ let activeProject = null
 
 const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
 const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
-const analysisRuntimeVersion = '1'
+const analysisRuntimeVersion = '2'
 const analysisModel = 'htdemucs'
+const baseRuntime = {
+  version: '3.12.14+20260901',
+  archive: 'cpython-3.12.14+20260901-x86_64-pc-windows-msvc-install_only.tar.gz',
+  url: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz',
+  sha256: 'e90c1b6419da3bd812dd73bb3de40287a21abf153438147639ec5e20375ea93f',
+  size: 46184075,
+}
 const localDataRoot = () => process.env.LOCALAPPDATA || app.getPath('userData')
 const analysisRoot = () => path.join(localDataRoot(), 'Pitchord')
 const managedRuntimeRoot = () => path.join(analysisRoot(), 'analysis-runtime', `v${analysisRuntimeVersion}`)
 const managedPythonPath = () => path.join(managedRuntimeRoot(), process.platform === 'win32' ? 'Scripts' : 'bin', pythonExecutable)
+const baseRuntimeRoot = () => path.join(analysisRoot(), 'base-runtime', `cpython-${baseRuntime.version}`)
+const basePythonPath = () => path.join(baseRuntimeRoot(), 'python', pythonExecutable)
 const modelRoot = () => path.join(analysisRoot(), 'models')
 const modelMarker = () => path.join(modelRoot(), 'demucs', `${analysisModel}.json`)
 let analysisInstallTask = null
@@ -93,6 +102,7 @@ function analysisEnvironment(pythonPath) {
     TORCH_HOME: path.join(modelRoot(), 'torch'),
     HF_HOME: path.join(modelRoot(), 'huggingface'),
     XDG_CACHE_HOME: path.join(modelRoot(), 'cache'),
+    PIP_CACHE_DIR: path.join(analysisRoot(), 'cache', 'pip'),
     PYTHONNOUSERSITE: '1',
     ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
   }
@@ -127,6 +137,7 @@ async function analysisRuntimeStatus() {
   const managedPath = managedPythonPath()
   const selectedPath = await preferredPythonPath()
   const probe = await probePython(selectedPath)
+  const baseProbe = await probePython(basePythonPath())
   const source = selectedPath === managedPath ? 'managed' : selectedPath && nearbyPythonPaths().includes(selectedPath) ? 'portable' : selectedPath ? 'custom' : 'missing'
   let modelReady = false
   try { modelReady = JSON.parse(await readFile(modelMarker(), 'utf8')).model === analysisModel } catch { /* not prepared by Pitchord */ }
@@ -141,6 +152,9 @@ async function analysisRuntimeStatus() {
     modelReady,
     runtimeDirectory: managedRuntimeRoot(),
     modelDirectory: modelRoot(),
+    baseRuntimeVersion: baseRuntime.version,
+    baseRuntimePath: baseProbe?.path || basePythonPath(),
+    baseRuntimeReady: !!baseProbe,
     busy: !!analysisInstallTask,
   }
 }
@@ -149,8 +163,19 @@ function sendAnalysisProgress(stage, message) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('pitchord:analysis-progress', { stage, message })
 }
 
+async function requireFreeSpace(bytes, label) {
+  await mkdir(analysisRoot(), { recursive: true })
+  const stats = fs.statfsSync(analysisRoot())
+  const available = Number(stats.bavail) * Number(stats.bsize)
+  if (Number.isFinite(available) && available < bytes) {
+    const neededGb = Math.ceil(bytes / 1024 / 1024 / 1024)
+    const availableGb = Math.max(0, available / 1024 / 1024 / 1024).toFixed(1)
+    throw new Error(`${label}至少需要约 ${neededGb} GB 可用空间，当前仅有 ${availableGb} GB。`)
+  }
+}
+
 async function findBootstrapPython() {
-  const candidates = [...nearbyPythonPaths(), await savedPythonPath(), process.env.PITCHORD_PYTHON, process.platform === 'win32' ? 'py' : 'python3', 'python'].filter(Boolean)
+  const candidates = [basePythonPath(), ...nearbyPythonPaths(), await savedPythonPath(), process.env.PITCHORD_PYTHON, process.platform === 'win32' ? 'py' : 'python3', 'python'].filter(Boolean)
   for (const candidate of [...new Set(candidates)]) {
     if (candidate === managedPythonPath()) continue
     const args = path.basename(candidate).toLowerCase() === 'py.exe' || candidate === 'py' ? ['-3', '-c', 'import sys; print(sys.executable)'] : ['-c', 'import sys; print(sys.executable)']
@@ -160,6 +185,86 @@ async function findBootstrapPython() {
     } catch { /* try next candidate */ }
   }
   return null
+}
+
+async function downloadVerifiedFile(url, destination, expectedHash, expectedSize) {
+  const partial = `${destination}.part`
+  await fs.promises.rm(partial, { force: true })
+  const response = await net.fetch(url)
+  if (!response.ok || !response.body) throw new Error(`基础运行时下载失败（HTTP ${response.status}）。`)
+  const total = Number(response.headers.get('content-length')) || expectedSize
+  const reader = response.body.getReader()
+  const handle = await fs.promises.open(partial, 'w')
+  const hash = createHash('sha256')
+  let received = 0
+  let lastPercent = -1
+  try {
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = Buffer.from(value)
+        received += chunk.length
+        if (received > expectedSize + 1024) throw new Error('基础运行时下载大小异常。')
+        hash.update(chunk)
+        await handle.write(chunk)
+        const percent = Math.min(100, Math.floor(received / total * 100))
+        if (percent !== lastPercent) {
+          lastPercent = percent
+          sendAnalysisProgress('base-runtime', `正在下载内置 Python… ${percent}%`)
+        }
+      }
+    } finally { await handle.close() }
+  } catch (error) {
+    await fs.promises.rm(partial, { force: true })
+    throw error
+  }
+  if (received !== expectedSize) {
+    await fs.promises.rm(partial, { force: true })
+    throw new Error(`基础运行时下载不完整：应为 ${expectedSize} 字节，实际为 ${received} 字节。`)
+  }
+  const digest = hash.digest('hex')
+  if (digest !== expectedHash) {
+    await fs.promises.rm(partial, { force: true })
+    throw new Error('基础运行时校验失败，文件已丢弃。请检查网络后重试。')
+  }
+  await fs.promises.rename(partial, destination)
+}
+
+async function ensureBaseRuntime(force = false) {
+  if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('当前自动下载基础运行时仅支持 Windows 64 位。')
+  if (!force && await probePython(basePythonPath())) return basePythonPath()
+  await requireFreeSpace(512 * 1024 * 1024, '安装内置 Python ')
+  const downloads = path.join(analysisRoot(), 'downloads')
+  const archive = path.join(downloads, baseRuntime.archive)
+  const staging = `${baseRuntimeRoot()}.installing`
+  await mkdir(downloads, { recursive: true })
+  await fs.promises.rm(staging, { recursive: true, force: true })
+  await fs.promises.rm(baseRuntimeRoot(), { recursive: true, force: true })
+  await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size)
+  sendAnalysisProgress('base-runtime', '下载校验通过，正在解压内置 Python…')
+  await mkdir(staging, { recursive: true })
+  try {
+    try { await runProcess('tar.exe', ['-xzf', archive, '-C', staging], { env: process.env }) }
+    catch (error) { throw new Error(`无法解压内置 Python：${error instanceof Error ? error.message : String(error)}`) }
+    const extractedPython = path.join(staging, 'python', pythonExecutable)
+    const probe = await probePython(extractedPython)
+    if (!probe) throw new Error('内置 Python 解压完成，但启动检查失败。')
+    await fs.promises.rename(staging, baseRuntimeRoot())
+    await writeFile(path.join(baseRuntimeRoot(), 'pitchord-base-runtime.json'), JSON.stringify({
+      version: baseRuntime.version,
+      source: baseRuntime.url,
+      sha256: baseRuntime.sha256,
+      sourceProject: 'astral-sh/python-build-standalone',
+      sourceLicense: 'MPL-2.0; bundled CPython and components retain their respective licenses',
+      installedAt: new Date().toISOString(),
+    }, null, 2), 'utf8')
+  } catch (error) {
+    await fs.promises.rm(staging, { recursive: true, force: true })
+    throw error
+  } finally { await fs.promises.rm(archive, { force: true }) }
+  sendAnalysisProgress('base-runtime', '内置 Python 已准备完成。')
+  return basePythonPath()
 }
 
 const projectRoot = () => path.join(app.getPath('documents'), 'Pitchord Projects')
@@ -293,12 +398,27 @@ app.whenReady().then(() => {
     return analysisRuntimeStatus()
   })
 
+  ipcMain.handle('pitchord:prepare-base-runtime', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
+    analysisInstallTask = (async () => {
+      await ensureBaseRuntime()
+      return { ...await analysisRuntimeStatus(), busy: false }
+    })()
+    try { return await analysisInstallTask } finally { analysisInstallTask = null }
+  })
+
   ipcMain.handle('pitchord:install-analysis-runtime', async event => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
     analysisInstallTask = (async () => {
-      const bootstrap = await findBootstrapPython()
-      if (!bootstrap) throw new Error('未找到可用于创建独立环境的 Python 3。请先在“高级选项”选择已有 Python；后续版本将支持直接下载基础运行时。')
+      await requireFreeSpace(fs.existsSync(managedPythonPath()) ? 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024, '安装分析环境')
+      let bootstrap
+      if (process.platform === 'win32' && process.arch === 'x64') {
+        const executable = await ensureBaseRuntime()
+        bootstrap = { command: executable, prefix: [], executable }
+      } else bootstrap = await findBootstrapPython()
+      if (!bootstrap) throw new Error('未找到可用于创建独立环境的 Python 3。')
       await mkdir(path.dirname(managedRuntimeRoot()), { recursive: true })
       sendAnalysisProgress('runtime', '正在创建 Pitchord 独立分析环境…')
       await runProcess(bootstrap.command, [...bootstrap.prefix, '-m', 'venv', '--clear', managedRuntimeRoot()], { env: process.env })
@@ -327,6 +447,7 @@ app.whenReady().then(() => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
     analysisInstallTask = (async () => {
+      await requireFreeSpace(1024 * 1024 * 1024, '准备人声分离模型')
       const python = await preferredPythonPath()
       const probe = await probePython(python)
       if (!probe?.demucs) throw new Error('请先安装或修复分析环境。')

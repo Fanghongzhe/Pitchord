@@ -11,6 +11,9 @@ type AnalysisRuntimeStatus = {
   modelReady: boolean
   runtimeDirectory: string
   modelDirectory: string
+  baseRuntimeVersion: string
+  baseRuntimePath: string
+  baseRuntimeReady: boolean
   busy: boolean
 }
 
@@ -21,6 +24,7 @@ declare global {
       getPython: () => Promise<string | null>
       pickPython: () => Promise<string | null>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
+      prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: () => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>

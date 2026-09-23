@@ -45,7 +45,7 @@
 - 桌面工程在新建时指定名称和父目录，默认父目录为系统文档下的 `Pitchord Projects`。每个工程包含 `media`、`analysis`、`exports` 和 `project.pitchord.json`；原媒体及分离后的 WAV 保留在工程内，工程文件夹可从界面直接打开。
 - 歌词在 `lyrics/current.lyrics.json` 和 `lyrics/current.lrc` 独立保存；每次实际改变句字内容或时间后，`lyrics/backups` 写入带时间戳的 JSON 和 LRC，原始导入或粘贴内容存入 `lyrics/sources`。界面可打开备份目录并恢复 JSON 版本，恢复操作可撤回。
 - 启动时优先查找便携程序目录、上一级与上两级目录和开发目录附近的 `.venv-analysis`、`.venv`、`venv` Python；手动选择路径作为后备。
-- 分析环境使用独立管理区：运行依赖放在 `%LOCALAPPDATA%/Pitchord/analysis-runtime/v1`，模型放在 `%LOCALAPPDATA%/Pitchord/models`，供全部工程共用。环境卡片显示来源、Python 版本、依赖完整性和模型状态，并提供安装或修复、模型准备、打开存储位置与高级自选 Python。安装和模型下载由用户主动触发，不修改系统 Python、PATH 或全局包。
+- 分析环境使用独立管理区：经校验的基础 Python 放在 `%LOCALAPPDATA%/Pitchord/base-runtime`，运行依赖放在 `%LOCALAPPDATA%/Pitchord/analysis-runtime/v2`，模型放在 `%LOCALAPPDATA%/Pitchord/models`，供全部工程共用。环境卡片显示基础运行时、来源、Python 版本、依赖完整性和模型状态，并提供一键安装或修复、单独准备基础运行时、模型准备、打开存储位置与高级自选 Python。安装和模型下载由用户主动触发，不修改系统 Python、PATH 或全局包。
 - 可导出和导入 `.pitchord.json` 项目文件，保留句级与字级标注；普通 LRC 只用于句级交换。
 - 调整句边界时，相邻句不得交叠。调整字边界时，字不得越过句界或相邻字。
 - 拖动句级矩形移动时采用相邻推挤：相邻句先压缩到最小范围，继续拖动会推动同方向的后续矩形并继续压缩下一句；反方向拖回时按原顺序释放空间。时间轴保持在媒体范围内。
