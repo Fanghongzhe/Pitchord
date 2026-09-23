@@ -2,9 +2,14 @@
 
 用于校对歌曲歌词时间的本地桌面编辑器。本阶段完成句级和字级时间编辑。界面规范见 [design.md](./design.md)。
 
-## 启动桌面版（Windows）
+## Windows 安装包
 
-直接双击 `release-desktop/Pitchord-0.1.0-x64-portable.exe`，不需要打开浏览器或安装 Node.js。它是便携版，会在本机保存草稿；音频和视频仍只在本机处理。
+Pitchord 提供两种安装包，二者都不修改系统 Python、`PATH` 或其他软件的环境：
+
+- **轻量在线版**：`Pitchord-<版本>-x64-online-setup.exe`。应用本体较小；第一次使用分析功能时，由 Pitchord 下载并校验专用 Python、分析依赖和模型。适合网络稳定、希望先快速下载应用的用户。
+- **完整离线版**：`Pitchord-<版本>-x64-full-setup.exe`。安装包已经包含专用 Python、固定版本的分析依赖和 htdemucs 模型；安装完成后，准备分析环境不需要联网。适合新设备、离线设备和需要固定环境的用户。
+
+两种安装包都使用当前 Windows 用户目录，不需要管理员权限。分析数据默认存放在 `%LOCALAPPDATA%\Pitchord`。可以在应用的“分析环境 → 管理存储”中分别删除运行环境、模型或缓存；卸载程序也会询问是否一并删除这些数据。工程、歌词和用户选择的外部 Python 不会随之删除。
 
 开发时可以运行：
 
@@ -18,7 +23,20 @@ pnpm desktop:start
 pnpm desktop:portable
 ```
 
-如果需要安装向导，可使用 `pnpm desktop:installer`。
+生成轻量在线安装包：
+
+```bash
+pnpm desktop:installer
+```
+
+准备并生成完整离线安装包：
+
+```bash
+pnpm analysis:offline-bundle
+pnpm desktop:full-installer
+```
+
+离线资源目录 `offline-analysis` 由准备命令生成，不提交到 Git。准备命令需要本机已有一套由 Pitchord 验证通过的分析环境和模型；依赖版本由 `scripts/analysis-lock-win-x64.txt` 固定。
 
 ## 开发版网页预览
 
@@ -46,7 +64,7 @@ pnpm dev
 
 - 字级初始范围是可编辑的时间建议；连续音高使用本地自相关基线，适合人工复核，不等同于最终的歌声专用模型。文字变化时，未变化的首尾字尽量保留其时间；必要时会重新分配时间，需复核。
 - “运行人声分离”直接处理工程内的原始媒体，不会再次要求选择文件。桌面版调用 `scripts/separate-vocals.py`，使用 Demucs 同时生成纯人声和纯伴奏 WAV，并保存到工程的 `analysis/separation-*`。分离音轨用同一个 Web Audio 时钟混音，切换开关或音量不重启音频；人声和伴奏可增益到 200%。也可以使用“导入外部人声结果”载入已有的人声 WAV/MP3。桌面包已内置 FFmpeg/FFprobe，可直接处理 MP4 等视频。
-- 分析环境和模型不写入工程，也不修改系统 Python 或 PATH。Windows 64 位设备可由软件自动下载经过 SHA-256 校验的 CPython 独立运行时；基础 Python 位于 `%LOCALAPPDATA%/Pitchord/base-runtime`，应用依赖位于 `%LOCALAPPDATA%/Pitchord/analysis-runtime/v2`，模型位于 `%LOCALAPPDATA%/Pitchord/models`，供多个工程共用。开发者仍可在“高级：选择已有 Python”中指定环境。当前自动运行时支持 Windows x64，CPU/GPU 环境选择和更多模型包属于后续增强项。
+- 分析环境和模型不写入工程，也不修改系统 Python 或 PATH。Windows 64 位设备可由轻量版自动下载经过 SHA-256 校验的 CPython 独立运行时，也可由完整版直接从安装包内准备。基础 Python 位于 `%LOCALAPPDATA%/Pitchord/base-runtime`，应用依赖位于 `%LOCALAPPDATA%/Pitchord/analysis-runtime/v2`，模型位于 `%LOCALAPPDATA%/Pitchord/models`，供多个工程共用。当前完整环境实测约占 1.31 GiB，后续加入模型时体积会增加。开发者仍可在“高级：选择已有 Python”中指定环境。当前自动运行时支持 Windows x64，CPU/GPU 环境选择和更多模型包属于后续增强项。
 - 当前连续音高是可解释的本地自相关分析；歌声专用音高模型、声区（真声/假声/混声）标注和更强的歌词强制对齐仍属于后续增强项。
 - 分割时间可由播放头指定；未指定时参考句中附近的波形音量低谷。它仍需人工试听确认。
 - LRC 只保存句级起点。完整句界、字界与人工调整保存在 `.pitchord.json` 中。

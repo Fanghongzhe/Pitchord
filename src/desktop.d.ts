@@ -14,7 +14,15 @@ type AnalysisRuntimeStatus = {
   baseRuntimeVersion: string
   baseRuntimePath: string
   baseRuntimeReady: boolean
+  offlineBundleReady: boolean
   busy: boolean
+}
+
+type AnalysisStorageStatus = {
+  root: string
+  locations: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', string>
+  sizes: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', number>
+  total: number
 }
 
 declare global {
@@ -24,6 +32,8 @@ declare global {
       getPython: () => Promise<string | null>
       pickPython: () => Promise<string | null>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
+      analysisStorageStatus: () => Promise<AnalysisStorageStatus>
+      removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: () => Promise<AnalysisRuntimeStatus>

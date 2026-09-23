@@ -20,20 +20,16 @@ const devUrl = process.env.PITCHORD_DEV_URL
 const appRoot = path.resolve(__dirname, '..')
 const distRoot = path.join(appRoot, 'dist')
 const scriptRoot = app.isPackaged ? path.join(process.resourcesPath, 'scripts') : path.join(appRoot, 'scripts')
+const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPath, 'offline-analysis') : path.join(appRoot, 'offline-analysis')
 let mainWindow
 let activeProject = null
 
 const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
 const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
-const analysisRuntimeVersion = '2'
+const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtime-manifest.json'), 'utf8'))
+const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
 const analysisModel = 'htdemucs'
-const baseRuntime = {
-  version: '3.12.14+20260901',
-  archive: 'cpython-3.12.14+20260901-x86_64-pc-windows-msvc-install_only.tar.gz',
-  url: 'https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz',
-  sha256: 'e90c1b6419da3bd812dd73bb3de40287a21abf153438147639ec5e20375ea93f',
-  size: 46184075,
-}
+const baseRuntime = runtimeManifest.baseRuntime
 const localDataRoot = () => process.env.LOCALAPPDATA || app.getPath('userData')
 const analysisRoot = () => path.join(localDataRoot(), 'Pitchord')
 const managedRuntimeRoot = () => path.join(analysisRoot(), 'analysis-runtime', `v${analysisRuntimeVersion}`)
@@ -87,6 +83,7 @@ async function preferredPythonPath() {
   const settings = await readSettings()
   if (settings.runtimePreference === 'custom' && typeof settings.pythonPath === 'string' && fs.existsSync(settings.pythonPath)) return settings.pythonPath
   const managed = managedPythonPath()
+  if (settings.runtimePreference === 'managed') return fs.existsSync(managed) ? managed : null
   if (fs.existsSync(managed)) return managed
   const nearby = nearbyPythonPaths().find(candidate => fs.existsSync(candidate))
   if (nearby) return nearby
@@ -96,7 +93,7 @@ async function preferredPythonPath() {
 }
 
 function analysisEnvironment(pythonPath) {
-  return {
+  const environment = {
     ...process.env,
     PITCHORD_MODEL_HOME: modelRoot(),
     TORCH_HOME: path.join(modelRoot(), 'torch'),
@@ -106,6 +103,15 @@ function analysisEnvironment(pythonPath) {
     PYTHONNOUSERSITE: '1',
     ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
   }
+  if (fs.existsSync(modelMarker())) environment.HF_HUB_OFFLINE = '1'
+  return environment
+}
+
+function offlineBundleAvailable() {
+  return fs.existsSync(path.join(offlineAnalysisRoot(), 'manifest.json')) &&
+    fs.existsSync(path.join(offlineAnalysisRoot(), 'base-runtime', baseRuntime.archive)) &&
+    fs.existsSync(path.join(offlineAnalysisRoot(), 'wheelhouse')) &&
+    fs.existsSync(path.join(offlineAnalysisRoot(), 'models', 'demucs', `${analysisModel}.json`))
 }
 
 function runProcess(command, args, options = {}) {
@@ -155,8 +161,52 @@ async function analysisRuntimeStatus() {
     baseRuntimeVersion: baseRuntime.version,
     baseRuntimePath: baseProbe?.path || basePythonPath(),
     baseRuntimeReady: !!baseProbe,
+    offlineBundleReady: offlineBundleAvailable(),
     busy: !!analysisInstallTask,
   }
+}
+
+async function directorySize(directory) {
+  let total = 0
+  let entries
+  try { entries = await readdir(directory, { withFileTypes: true }) } catch { return 0 }
+  for (const entry of entries) {
+    const full = path.join(directory, entry.name)
+    if (entry.isDirectory()) total += await directorySize(full)
+    else if (entry.isFile()) {
+      try { total += (await fs.promises.stat(full)).size } catch { /* file changed while measuring */ }
+    }
+  }
+  return total
+}
+
+async function analysisStorageStatus() {
+  const locations = {
+    baseRuntime: path.join(analysisRoot(), 'base-runtime'),
+    analysisRuntime: path.join(analysisRoot(), 'analysis-runtime'),
+    models: modelRoot(),
+    cache: path.join(analysisRoot(), 'cache'),
+    downloads: path.join(analysisRoot(), 'downloads'),
+  }
+  const sizes = Object.fromEntries(await Promise.all(Object.entries(locations).map(async ([key, value]) => [key, await directorySize(value)])))
+  return { root: analysisRoot(), locations, sizes, total: Object.values(sizes).reduce((sum, value) => sum + value, 0) }
+}
+
+async function removeManagedAnalysisData(target) {
+  const targets = {
+    runtime: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime')],
+    models: [modelRoot()],
+    cache: [path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads')],
+    all: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), modelRoot(), path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads')],
+  }
+  if (!Object.hasOwn(targets, target)) throw new Error('Invalid analysis cleanup target')
+  for (const directory of targets[target]) {
+    const resolved = path.resolve(directory)
+    const root = path.resolve(analysisRoot())
+    if (!resolved.startsWith(root + path.sep)) throw new Error('Invalid managed analysis path')
+    await fs.promises.rm(resolved, { recursive: true, force: true })
+  }
+  return analysisStorageStatus()
 }
 
 function sendAnalysisProgress(stage, message) {
@@ -231,6 +281,14 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
   await fs.promises.rename(partial, destination)
 }
 
+async function verifyLocalFile(file, expectedHash, expectedSize) {
+  const stat = await fs.promises.stat(file)
+  if (stat.size !== expectedSize) throw new Error(`离线基础运行时大小异常：应为 ${expectedSize} 字节，实际为 ${stat.size} 字节。`)
+  const hash = createHash('sha256')
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk)
+  if (hash.digest('hex') !== expectedHash) throw new Error('离线基础运行时校验失败，请重新下载安装包。')
+}
+
 async function ensureBaseRuntime(force = false) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('当前自动下载基础运行时仅支持 Windows 64 位。')
   if (!force && await probePython(basePythonPath())) return basePythonPath()
@@ -241,7 +299,12 @@ async function ensureBaseRuntime(force = false) {
   await mkdir(downloads, { recursive: true })
   await fs.promises.rm(staging, { recursive: true, force: true })
   await fs.promises.rm(baseRuntimeRoot(), { recursive: true, force: true })
-  await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size)
+  const bundledArchive = path.join(offlineAnalysisRoot(), 'base-runtime', baseRuntime.archive)
+  if (fs.existsSync(bundledArchive)) {
+    sendAnalysisProgress('base-runtime', '正在读取完整版内置 Python…')
+    await verifyLocalFile(bundledArchive, baseRuntime.sha256, baseRuntime.size)
+    await fs.promises.copyFile(bundledArchive, archive)
+  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size)
   sendAnalysisProgress('base-runtime', '下载校验通过，正在解压内置 Python…')
   await mkdir(staging, { recursive: true })
   try {
@@ -398,6 +461,17 @@ app.whenReady().then(() => {
     return analysisRuntimeStatus()
   })
 
+  ipcMain.handle('pitchord:analysis-storage-status', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    return analysisStorageStatus()
+  })
+
+  ipcMain.handle('pitchord:remove-analysis-data', async (event, target) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请完成后再清理。')
+    return removeManagedAnalysisData(target)
+  })
+
   ipcMain.handle('pitchord:prepare-base-runtime', async event => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
@@ -412,7 +486,10 @@ app.whenReady().then(() => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
     analysisInstallTask = (async () => {
-      await requireFreeSpace(fs.existsSync(managedPythonPath()) ? 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024, '安装分析环境')
+      const requiredBytes = fs.existsSync(managedPythonPath())
+        ? 1024 * 1024 * 1024
+        : offlineBundleAvailable() ? 2 * 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024
+      await requireFreeSpace(requiredBytes, '安装分析环境')
       let bootstrap
       if (process.platform === 'win32' && process.arch === 'x64') {
         const executable = await ensureBaseRuntime()
@@ -423,10 +500,18 @@ app.whenReady().then(() => {
       sendAnalysisProgress('runtime', '正在创建 Pitchord 独立分析环境…')
       await runProcess(bootstrap.command, [...bootstrap.prefix, '-m', 'venv', '--clear', managedRuntimeRoot()], { env: process.env })
       const python = managedPythonPath()
-      sendAnalysisProgress('runtime', '正在准备安装工具…')
-      await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], { env: analysisEnvironment(python) })
+      const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
+      const offlineRequirements = path.join(offlineAnalysisRoot(), 'analysis-lock-win-x64.txt')
+      const useOfflineBundle = fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
+      if (!useOfflineBundle) {
+        sendAnalysisProgress('runtime', '正在准备安装工具…')
+        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], { env: analysisEnvironment(python) })
+      }
       sendAnalysisProgress('runtime', '正在安装人声分离和音高模型依赖，这一步可能需要较长时间…')
-      await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--requirement', path.join(scriptRoot, 'analysis-requirements.txt')], {
+      const installArgs = ['-m', 'pip', 'install', '--disable-pip-version-check']
+      if (useOfflineBundle) installArgs.push('--no-index', '--find-links', wheelhouse, '--requirement', offlineRequirements)
+      else installArgs.push('--requirement', path.join(scriptRoot, 'analysis-requirements.txt'))
+      await runProcess(python, installArgs, {
         env: analysisEnvironment(python),
         onOutput: output => {
           const line = output.trim().split(/\r?\n/).at(-1)
@@ -453,15 +538,23 @@ app.whenReady().then(() => {
       if (!probe?.demucs) throw new Error('请先安装或修复分析环境。')
       await mkdir(path.dirname(modelMarker()), { recursive: true })
       sendAnalysisProgress('model', `正在准备 ${analysisModel} 人声分离模型…`)
-      const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(analysisModel)}); print('ready')`
-      await runProcess(python, ['-c', program], {
-        env: analysisEnvironment(python),
-        onOutput: output => {
-          const line = output.trim().split(/\r?\n/).at(-1)
-          if (line) sendAnalysisProgress('model', line.slice(0, 240))
-        },
-      })
-      await writeFile(modelMarker(), JSON.stringify({ model: analysisModel, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      const bundledModels = path.join(offlineAnalysisRoot(), 'models')
+      if (fs.existsSync(bundledModels)) {
+        sendAnalysisProgress('model', '正在从完整版安装人声分离模型…')
+        await fs.promises.cp(bundledModels, modelRoot(), { recursive: true, force: true })
+      } else {
+        const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(analysisModel)}); print('ready')`
+        const downloadEnvironment = analysisEnvironment(python)
+        delete downloadEnvironment.HF_HUB_OFFLINE
+        await runProcess(python, ['-c', program], {
+          env: downloadEnvironment,
+          onOutput: output => {
+            const line = output.trim().split(/\r?\n/).at(-1)
+            if (line) sendAnalysisProgress('model', line.slice(0, 240))
+          },
+        })
+      }
+      await writeFile(modelMarker(), JSON.stringify({ model: analysisModel, preparedAt: new Date().toISOString(), source: fs.existsSync(bundledModels) ? 'offline-bundle' : 'download' }, null, 2), 'utf8')
       sendAnalysisProgress('complete', '人声分离模型已准备完成。')
       return { ...await analysisRuntimeStatus(), busy: false }
     })()

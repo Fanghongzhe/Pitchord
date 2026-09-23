@@ -11,3 +11,13 @@ Pitchord can download an optional standalone Python runtime when the user starts
 
 The distribution contains CPython and third-party components under their own licenses. License files shipped inside the downloaded distribution remain with that runtime. CPython is distributed under the Python Software Foundation License Version 2.
 
+The full offline installer also contains the pinned Python packages listed in `scripts/analysis-lock-win-x64.txt` and the htdemucs model cache. Their license metadata and license files remain in the bundled wheels or installed packages.
+
+## Main analysis components
+
+- Demucs 4.1.0: MIT License, https://github.com/adefossez/demucs
+- PyTorch 2.14.0: BSD-style license, https://pytorch.org
+- TorchAudio 2.11.0: BSD-style license, https://github.com/pytorch/audio
+- TorchCrepe 0.0.24: MIT License, https://github.com/maxrmorrison/torchcrepe
+
+This notice is a summary. The license texts distributed with each component control its use and redistribution.

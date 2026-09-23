@@ -44,7 +44,20 @@ type AnalysisEnvironment = {
   baseRuntimeVersion: string
   baseRuntimePath: string
   baseRuntimeReady: boolean
+  offlineBundleReady: boolean
   busy: boolean
+}
+type AnalysisStorage = {
+  root: string
+  locations: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', string>
+  sizes: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', number>
+  total: number
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 function readDraft(): Draft | null {
@@ -127,6 +140,10 @@ export default function App() {
   const [analysisEnvironment, setAnalysisEnvironment] = useState<AnalysisEnvironment | null>(null)
   const [analysisEnvironmentBusy, setAnalysisEnvironmentBusy] = useState(false)
   const [analysisProgress, setAnalysisProgress] = useState('正在检查分析环境…')
+  const [storageOpen, setStorageOpen] = useState(false)
+  const [analysisStorage, setAnalysisStorage] = useState<AnalysisStorage | null>(null)
+  const [cleanupTarget, setCleanupTarget] = useState<'runtime' | 'models' | 'cache' | 'all' | null>(null)
+  const [cleanupBusy, setCleanupBusy] = useState(false)
   const [separationPromptOpen, setSeparationPromptOpen] = useState(false)
   const [zoom, setZoom] = useState(85)
   const [importOpen, setImportOpen] = useState(false)
@@ -484,6 +501,30 @@ export default function App() {
       setAnalysisProgress('模型准备未完成')
       setNotice(`模型准备失败：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const openStorageManager = async () => {
+    if (!window.pitchordDesktop?.analysisStorageStatus) return
+    setStorageOpen(true)
+    setCleanupTarget(null)
+    try { setAnalysisStorage(await window.pitchordDesktop.analysisStorageStatus()) }
+    catch { setNotice('无法读取分析环境占用空间。') }
+  }
+
+  const removeAnalysisData = async () => {
+    if (!cleanupTarget || !window.pitchordDesktop?.removeAnalysisData) return
+    setCleanupBusy(true)
+    try {
+      const storage = await window.pitchordDesktop.removeAnalysisData(cleanupTarget)
+      setAnalysisStorage(storage)
+      const status = await window.pitchordDesktop.analysisStatus()
+      setAnalysisEnvironment(status)
+      setPythonPath(status.path)
+      setAnalysisProgress(status.runtimeReady ? '分析环境可用' : '分析环境尚未安装')
+      setNotice(cleanupTarget === 'all' ? '已删除 Pitchord 管理的分析环境、模型和缓存。歌词工程未受影响。' : '所选分析数据已删除。')
+      setCleanupTarget(null)
+    } catch (error) { setNotice(`清理失败：${error instanceof Error ? error.message : String(error)}`) }
+    finally { setCleanupBusy(false) }
   }
 
   const seek = (time: number) => {
@@ -1179,7 +1220,7 @@ export default function App() {
               </div>
               {window.pitchordDesktop && <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3" data-analysis-environment>
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">可自动下载内置 Python，独立存放依赖和模型，不修改系统 Python 或 PATH。</p></div></div>
+                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.offlineBundleReady ? '完整版已包含离线环境资源，无需联网准备。' : '可自动下载内置 Python，独立存放依赖和模型，不修改系统 Python 或 PATH。'}</p></div></div>
                   <Badge variant={analysisEnvironment?.runtimeReady ? 'secondary' : 'outline'}>{analysisEnvironment?.runtimeReady ? <CheckCircle2 className="mr-1 size-3" /> : <AlertCircle className="mr-1 size-3" />}{analysisSourceLabel}</Badge>
                 </div>
                 <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 xl:grid-cols-4">
@@ -1193,7 +1234,7 @@ export default function App() {
                   <Button size="sm" variant="secondary" onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '修复独立环境' : '一键安装分析环境'}</Button>
                   <Button size="sm" variant="outline" onClick={() => void prepareBaseRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.baseRuntimeReady ? '检查内置 Python' : '仅下载内置 Python'}</Button>
                   <Button size="sm" variant="outline" onClick={() => void prepareAnalysisModel()} disabled={analysisEnvironmentBusy || !analysisEnvironment?.runtimeReady}>{analysisEnvironment?.modelReady ? '重新检查模型' : '准备人声分离模型'}</Button>
-                  <Button size="sm" variant="ghost" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()} disabled={analysisEnvironmentBusy}><HardDrive />存储位置</Button>
+                  <Button size="sm" variant="ghost" onClick={() => void openStorageManager()} disabled={analysisEnvironmentBusy}><HardDrive />管理存储</Button>
                   <Button size="sm" variant="ghost" onClick={choosePython} disabled={analysisEnvironmentBusy}>高级：选择已有 Python</Button>
                 </div>
               </div>}
@@ -1272,6 +1313,13 @@ export default function App() {
       <Dialog open={shiftConfirmOpen} onOpenChange={setShiftConfirmOpen}><DialogContent><DialogHeader><DialogTitle>歌词即将超出媒体范围</DialogTitle><DialogDescription>目前最{pendingShift > 0 ? '后' : '前'}面的歌词时间已经无法继续整体移动。是否继续压缩最外侧句子，并逐步压缩靠里的句子？</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setShiftConfirmOpen(false)}>取消</Button><Button onClick={() => { setShiftConfirmOpen(false); shiftAll(pendingShift, true) }}>继续移动</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>先处理人声吗？</DialogTitle><DialogDescription>纯人声轨通常更适合歌声音高识别。可以先使用当前原音频，也可以现在处理已导入的媒体。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => { setSeparationPromptOpen(false); void analyzePitch() }}>使用原音频</Button><Button onClick={() => { setSeparationPromptOpen(false); void runSeparation() }}>先进行人声分离</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={storageOpen} onOpenChange={open => { if (!cleanupBusy) { setStorageOpen(open); if (!open) setCleanupTarget(null) } }}><DialogContent className="sm:max-w-xl"><DialogHeader><DialogTitle>存储与环境</DialogTitle><DialogDescription>这里只管理 Pitchord 下载的运行环境、模型和缓存。工程、歌词和用户选择的外部 Python 不会被删除。</DialogDescription></DialogHeader><div className="space-y-3">
+        <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">分析运行环境</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.baseRuntime + analysisStorage.sizes.analysisRuntime) : '正在计算…'}</span></div><p className="mt-1 text-xs text-muted-foreground">内置 Python、Demucs、Torch 和音高依赖</p><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('runtime')} disabled={cleanupBusy || !analysisStorage || analysisStorage.sizes.baseRuntime + analysisStorage.sizes.analysisRuntime === 0}>删除运行环境</Button></div>
+        <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">模型</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.models) : '正在计算…'}</span></div><p className="mt-1 text-xs text-muted-foreground">人声分离及后续分析模型</p><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('models')} disabled={cleanupBusy || !analysisStorage?.sizes.models}>删除模型</Button></div>
+        <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">下载与安装缓存</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.cache + analysisStorage.sizes.downloads) : '正在计算…'}</span></div><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('cache')} disabled={cleanupBusy || !analysisStorage || analysisStorage.sizes.cache + analysisStorage.sizes.downloads === 0}>清理缓存</Button></div>
+        {analysisStorage && <p className="break-all text-xs text-muted-foreground">合计 {formatBytes(analysisStorage.total)} · {analysisStorage.root}</p>}
+        {cleanupTarget && <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3"><p className="text-sm font-medium">确认删除{cleanupTarget === 'runtime' ? '分析运行环境' : cleanupTarget === 'models' ? '模型' : cleanupTarget === 'cache' ? '缓存' : '全部分析数据'}？</p><p className="mt-1 text-xs text-muted-foreground">需要时可以重新下载。工程和歌词不会被删除。</p><div className="mt-3 flex justify-end gap-2"><Button size="sm" variant="outline" onClick={() => setCleanupTarget(null)} disabled={cleanupBusy}>取消</Button><Button size="sm" variant="destructive" onClick={() => void removeAnalysisData()} disabled={cleanupBusy}><Trash2 />{cleanupBusy ? '正在删除…' : '确认删除'}</Button></div></div>}
+      </div><DialogFooter><Button variant="destructive" onClick={() => setCleanupTarget('all')} disabled={cleanupBusy || !analysisStorage?.total}>删除全部分析数据</Button><Button variant="outline" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()}>打开文件夹</Button><Button onClick={() => setStorageOpen(false)} disabled={cleanupBusy}>完成</Button></DialogFooter></DialogContent></Dialog>
 
       {contextMenu && <div className="fixed z-50 min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onPointerDown={event => event.stopPropagation()}><Button variant="ghost" size="sm" className="w-full justify-start" onClick={() => contextAction('add')}><Plus />添加句</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!mergeIndexes} onClick={() => contextAction('merge')}><Merge />合并</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!activeLine || !splitBoundaries.length} onClick={() => contextAction('split')}><Scissors />分割</Button><Button variant="ghost" size="sm" className="w-full justify-start text-destructive hover:text-destructive" disabled={!contextMenu.id && !selectedLineIds.length} onClick={() => contextAction('delete')}><Trash2 />删除</Button></div>}
     </div>
