@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createSegment, getAdjacentSelection, mergeSegments, parseLyrics, replaceText, retimeSegment, splitSegment } from './lyrics'
+import { createSegment, getAdjacentSelection, mergeSegments, parseLyrics, replaceText, retimeSegment, splitSegment, suggestSplitOffset } from './lyrics'
 
 describe('lyric editing invariants', () => {
   it('imports timed LRC, skips metadata, and keeps lines in time order', () => {
@@ -28,6 +28,12 @@ describe('lyric editing invariants', () => {
     expect(left.chars.every(char => char.start >= left.start && char.end <= left.end)).toBe(true)
     expect(right.chars.every(char => char.start >= right.start && char.end <= right.end)).toBe(true)
     expect(splitSegment(original, 5, 2)).toBeNull()
+  })
+
+  it('prefers punctuation and spaces for the suggested text split', () => {
+    expect(suggestSplitOffset('第一段，第二段', [1, 2, 3, 4, 5, 6], 0.5)).toBe(4)
+    expect(suggestSplitOffset('hello world', [5], 0.5)).toBe(5)
+    expect(suggestSplitOffset('天地玄黄', [1, 2, 3], 0.5)).toBe(2)
   })
 
   it('moves the character times with a retimed line', () => {

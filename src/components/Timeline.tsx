@@ -23,7 +23,7 @@ type Props = {
   centerRequest: number
   centerTargetId: string | null
   seekCenterRequest: number
-  splitMarker: number | null
+  guideLine: number | null
   waveformStatus: string
   onSeekAndPlay: (time: number) => void
   onSelect: (id: string, additive: boolean, range: boolean) => void
@@ -42,7 +42,7 @@ type Props = {
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, time: number, id?: string) => void
 }
 
-export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, pitchPoints, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, splitMarker, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
+export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, pitchPoints, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, guideLine, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
   const start = mode === 'chars' && activeSegment ? activeSegment.start : 0
   const end = mode === 'chars' && activeSegment ? activeSegment.end : Math.max(duration, 1)
   const span = Math.max(end - start, 0.2)
@@ -235,6 +235,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   }
 
   const hasNeighborChanges = (preview: ClipPreview[], index: number) => preview.some((clip, clipIndex) => clipIndex !== index && (clip.start !== clips[clipIndex].start || clip.end !== clips[clipIndex].end))
+  const snapBoundary = (value: number) => guideLine !== null && Math.abs(value - guideLine) * scale <= 12 ? guideLine : value
 
   const pointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
@@ -249,8 +250,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       if (drag.mode === 'move') return
       const lowerBound = mode === 'chars' ? start : 0
       const upperBound = mode === 'chars' ? end : duration
-      const nextStart = drag.mode === 'start' ? clamp(drag.start + delta, lowerBound, drag.end - MIN_SPAN) : drag.start
-      const nextEnd = drag.mode === 'end' ? clamp(drag.end + delta, drag.start + MIN_SPAN, upperBound) : drag.end
+      const nextStart = drag.mode === 'start' ? clamp(snapBoundary(drag.start + delta), lowerBound, drag.end - MIN_SPAN) : drag.start
+      const nextEnd = drag.mode === 'end' ? clamp(snapBoundary(drag.end + delta), drag.start + MIN_SPAN, upperBound) : drag.end
       const nextRange = { id: drag.id, start: roundTime(nextStart), end: roundTime(nextEnd) }
       setPreview([nextRange])
       onRangePreview?.(nextRange)
@@ -276,7 +277,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       return
     }
     if (drag.mode === 'start' || drag.mode === 'end') {
-      const target = (drag.mode === 'start' ? drag.start : drag.end) + delta
+      const target = snapBoundary((drag.mode === 'start' ? drag.start : drag.end) + delta)
       if (!drag.detached) {
         const next = boundedResizePreview(drag, drag.mode, target)
         if (directionChanged && drag.preview && hasNeighborChanges(drag.preview, drag.index)) {
@@ -390,7 +391,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
           <div className="pointer-events-none absolute top-0 bottom-0 z-35 w-px bg-amber-400" style={{ left: (rangeDraft.start - start) * scale }}><span className="absolute left-1 top-12 whitespace-nowrap rounded bg-amber-400 px-1.5 py-0.5 text-[10px] font-medium text-amber-950">开始 {formatTime(rangeDraft.start)}</span></div>
           <div className="pointer-events-none absolute top-0 bottom-0 z-35 w-px bg-amber-400" style={{ left: (rangeDraft.end - start) * scale }}><span className="absolute right-1 top-12 whitespace-nowrap rounded bg-amber-400 px-1.5 py-0.5 text-[10px] font-medium text-amber-950">结束 {formatTime(rangeDraft.end)}</span></div>
         </>}
-        {mode === 'lines' && splitMarker !== null && splitMarker >= start && splitMarker <= end && <div data-split-marker className="pointer-events-none absolute top-0 bottom-0 z-30 w-0.5 bg-destructive" style={{ left: (splitMarker - start) * scale }}><span className="absolute left-1 top-24 whitespace-nowrap rounded bg-destructive px-1.5 py-0.5 text-[10px] font-medium text-destructive-foreground">分割点 {formatTime(splitMarker)}</span></div>}
+        {guideLine !== null && guideLine >= start && guideLine <= end && <div data-guide-line className="pointer-events-none absolute top-0 bottom-0 z-30 border-l-2 border-dashed border-foreground/80" style={{ left: (guideLine - start) * scale }}><span className="absolute left-1 top-24 whitespace-nowrap rounded bg-foreground px-1.5 py-0.5 text-[10px] font-medium text-background">辅助线 {formatTime(guideLine)}</span></div>}
         {visiblePlayhead && <div className="timeline-playhead absolute top-0 bottom-0 z-20 w-0.5 bg-primary" style={{ left: (playhead - start) * scale }}><div className="absolute -left-1 top-0 h-3 w-2.5 rounded-b-sm bg-primary" /></div>}
       </div>
     </div>

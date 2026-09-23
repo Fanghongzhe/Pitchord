@@ -16,7 +16,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Timeline } from '@/components/Timeline'
 import {
   clamp, createSegment, formatTime, getAdjacentSelection, lyricUnits, mergeSegments,
-  MIN_SPAN, parseLyrics, parseTime, replaceText, retimeSegment, roundTime, splitSegment,
+  MIN_SPAN, parseLyrics, parseTime, replaceText, retimeSegment, roundTime, splitSegment, suggestSplitOffset,
 } from '@/lib/lyrics'
 import type { LyricSegment } from '@/lib/lyrics'
 import { analyzeAudioBuffer, matchPitchToChars, noteName } from '@/lib/pitch'
@@ -98,7 +98,7 @@ export default function App() {
   const [mediaIsVideo, setMediaIsVideo] = useState(false)
   const [duration, setDuration] = useState(savedDraft?.duration ?? 0)
   const [playhead, setPlayhead] = useState(0)
-  const [splitMarker, setSplitMarker] = useState<number | null>(null)
+  const [guideLine, setGuideLine] = useState<number | null>(null)
   const [playing, setPlaying] = useState(false)
   const [peaks, setPeaks] = useState<number[]>([])
   const [waveformStatus, setWaveformStatus] = useState('导入音频或视频后显示波形')
@@ -137,8 +137,11 @@ export default function App() {
   const mediaToken = useRef(0)
   const auditionRef = useRef<{ start: number; end: number } | null>(null)
   const timelineSeekRef = useRef(false)
+  const lastRangeEdgeRef = useRef<'start' | 'end' | null>(null)
+  const rightEdgeAuditionRef = useRef(false)
   const finishRangeAdjustRef = useRef<() => void>(() => undefined)
   const finishCharRangeAdjustRef = useRef<() => void>(() => undefined)
+  const togglePlaybackRef = useRef<(createGuideOnPause?: boolean) => Promise<void>>(async () => undefined)
   const getMixer = () => mixerRef.current ?? (mixerRef.current = new StemMixer())
   const activeLine = segments.find(segment => selectedLineIds.includes(segment.id)) ?? null
   const editingLocked = rangeAdjusting || charRangeAdjusting || conflictOpen
@@ -167,7 +170,7 @@ export default function App() {
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       const editable = event.target instanceof HTMLElement && !!event.target.closest('input, textarea, [contenteditable="true"]')
-      if (event.key === ' ' && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); void togglePlayback(); return }
+      if (event.key === ' ' && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); void togglePlaybackRef.current(true); return }
       if (editingLocked) return
       if (editable || !(event.ctrlKey || event.metaKey)) return
       if (event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo() }
@@ -189,14 +192,35 @@ export default function App() {
     const adjusting = view === 'lines' ? rangeAdjusting : charRangeAdjusting
     const draft = view === 'lines' ? rangeDraft : charRangeDraft
     const edge = view === 'lines' ? rangeEdge : charRangeEdge
-    if (!adjusting || !draft || !edge) return
-    const start = edge === 'start' ? draft.start : Math.max(draft.start, draft.end - 1)
-    const end = edge === 'start' ? draft.end : draft.end
-    const loopStart = edge === 'end' && draft.end - draft.start < 1 ? draft.start : start
+    if (!adjusting || !draft) {
+      lastRangeEdgeRef.current = null
+      rightEdgeAuditionRef.current = false
+      return
+    }
+    if (!edge) {
+      lastRangeEdgeRef.current = null
+      return
+    }
     const media = mediaRef.current
     if (!media) return
-    auditionRef.current = { start: loopStart, end }
-    media.currentTime = loopStart
+    if (edge === 'end') {
+      const firstMoveInDrag = lastRangeEdgeRef.current !== 'end'
+      lastRangeEdgeRef.current = 'end'
+      rightEdgeAuditionRef.current = true
+      if (!firstMoveInDrag && auditionRef.current) {
+        auditionRef.current = { ...auditionRef.current, end: draft.end }
+        return
+      }
+      const loopStart = Math.max(draft.start, draft.end - 1)
+      auditionRef.current = { start: loopStart, end: draft.end }
+      media.currentTime = loopStart
+      void media.play().catch(() => undefined)
+      return
+    }
+    lastRangeEdgeRef.current = 'start'
+    rightEdgeAuditionRef.current = false
+    auditionRef.current = { start: draft.start, end: draft.end }
+    media.currentTime = draft.start
     void media.play().catch(() => undefined)
   }, [view, rangeAdjusting, rangeDraft, rangeEdge, charRangeAdjusting, charRangeDraft, charRangeEdge])
 
@@ -250,7 +274,7 @@ export default function App() {
     setMediaIsVideo(file.type.startsWith('video/'))
     if (!reconnect) setDuration(0)
     setPlayhead(0)
-    setSplitMarker(null)
+    setGuideLine(null)
     setPlaying(false)
     setPeaks([])
     setPitchPoints([])
@@ -385,6 +409,7 @@ export default function App() {
 
   const seek = (time: number) => {
     auditionRef.current = null
+    rightEdgeAuditionRef.current = false
     const next = clamp(time, 0, duration)
     if (mediaRef.current) mediaRef.current.currentTime = next
     setPlayhead(next)
@@ -393,7 +418,7 @@ export default function App() {
     const focused = view === 'lines' ? rangeDraft : charRangeDraft
     auditionRef.current = editingLocked && focused ? { start: focused.start, end: focused.end } : null
     const next = focused && editingLocked ? clamp(time, focused.start, focused.end) : clamp(time, 0, duration)
-    if (view === 'lines' && !editingLocked) setSplitMarker(next)
+    if (!editingLocked) setGuideLine(next)
     if (mediaRef.current) {
       timelineSeekRef.current = true
       mediaRef.current.currentTime = next
@@ -406,6 +431,7 @@ export default function App() {
     const media = mediaRef.current
     if (!media) { setNotice('请先重新导入原媒体，才能试听。'); return }
     auditionRef.current = null
+    rightEdgeAuditionRef.current = false
     media.currentTime = time
     setPlayhead(time)
     void media.play()
@@ -414,19 +440,32 @@ export default function App() {
   const loopRange = (start: number, end: number, message: string) => {
     const media = mediaRef.current
     if (!media) { setNotice('请先重新导入原媒体，才能试听。'); return }
+    rightEdgeAuditionRef.current = false
+    lastRangeEdgeRef.current = null
     auditionRef.current = { start, end }
     media.currentTime = start
     setPlayhead(start)
     void media.play()
     setNotice(message)
   }
-  async function togglePlayback() {
+  async function togglePlayback(createGuideOnPause = false) {
     const media = mediaRef.current
     if (!media) return
-    auditionRef.current = null
+    if (!editingLocked) {
+      auditionRef.current = null
+      rightEdgeAuditionRef.current = false
+    }
     if (media.paused) { try { await media.play() } catch { setNotice('媒体无法播放，请确认文件格式受支持。') } }
-    else media.pause()
+    else {
+      const pausedAt = roundTime(media.currentTime)
+      media.pause()
+      if (createGuideOnPause) {
+        setGuideLine(pausedAt)
+        setNotice(`已在 ${formatTime(pausedAt)} 设置辅助线。`)
+      }
+    }
   }
+  useEffect(() => { togglePlaybackRef.current = togglePlayback })
 
   const importLyrics = async (content: string, sourceName = 'pasted.txt') => {
     if (!duration) { setNotice('请先导入媒体，获取时长后再导入歌词。'); return }
@@ -505,7 +544,7 @@ export default function App() {
   const openSplit = () => {
     if (editingLocked) return
     if (!activeLine || !splitBoundaries.length) return
-    const markedTime = splitMarker !== null && splitMarker > activeLine.start + MIN_SPAN && splitMarker < activeLine.end - MIN_SPAN ? splitMarker : null
+    const markedTime = guideLine !== null && guideLine > activeLine.start + MIN_SPAN && guideLine < activeLine.end - MIN_SPAN ? guideLine : null
     let time = markedTime ?? (playhead > activeLine.start + MIN_SPAN && playhead < activeLine.end - MIN_SPAN ? playhead : (activeLine.start + activeLine.end) / 2)
     if (markedTime === null && time === (activeLine.start + activeLine.end) / 2 && peaks.length && duration) {
       const center = time
@@ -520,7 +559,7 @@ export default function App() {
       }
     }
     const position = (time - activeLine.start) / (activeLine.end - activeLine.start)
-    const suggestion = splitBoundaries[Math.min(splitBoundaries.length - 1, Math.max(0, Math.round(position * splitBoundaries.length) - 1))]
+    const suggestion = suggestSplitOffset(activeLine.text, splitBoundaries, position) ?? splitBoundaries[0]
     setSplitTimeDraft(formatTime(time))
     setSplitOffset(String(suggestion))
     setSplitOpen(true)
@@ -536,7 +575,7 @@ export default function App() {
     next.splice(index, 1, ...result)
     commit(next)
     setSelectedLineIds([result[0].id])
-    setSplitMarker(null)
+    setGuideLine(null)
     setSplitOpen(false)
     setNotice('已按时间和文字边界分割，左右两句可继续调整。')
   }
@@ -735,7 +774,7 @@ export default function App() {
       setSelectedLineIds(project.segments[0] ? [project.segments[0].id] : [])
       setSelectedCharIds([])
       setPlayhead(0)
-      setSplitMarker(null)
+      setGuideLine(null)
       setPlaying(false)
       setView('lines')
       setNotice(preserveMedia ? '工程及媒体已载入，可以继续编辑和试听。' : '项目已载入。请重新导入同名原媒体以恢复试听。')
@@ -767,7 +806,7 @@ export default function App() {
     setSelectedLineIds([])
     setSelectedCharIds([])
     setPlayhead(0)
-    setSplitMarker(null)
+    setGuideLine(null)
     setPlaying(false)
     setView('lines')
     localStorage.removeItem('pitchord.draft.v1')
@@ -842,8 +881,11 @@ export default function App() {
   const onMediaTimeUpdate = (media: HTMLMediaElement) => {
     const loop = auditionRef.current
     if (loop && media.currentTime >= loop.end - 0.03) {
-      media.currentTime = loop.start
-      setPlayhead(loop.start)
+      const draft = view === 'lines' ? rangeDraft : charRangeDraft
+      const loopStart = rightEdgeAuditionRef.current && draft ? Math.max(draft.start, draft.end - 1) : loop.start
+      if (rightEdgeAuditionRef.current && draft) auditionRef.current = { start: loopStart, end: draft.end }
+      media.currentTime = loopStart
+      setPlayhead(loopStart)
     } else {
       mixerRef.current?.sync(media)
       setPlayhead(media.currentTime)
@@ -877,8 +919,11 @@ export default function App() {
     const loop = auditionRef.current
     const media = mediaRef.current
     if (loop && media) {
-      media.currentTime = loop.start
-      setPlayhead(loop.start)
+      const draft = view === 'lines' ? rangeDraft : charRangeDraft
+      const loopStart = rightEdgeAuditionRef.current && draft ? Math.max(draft.start, draft.end - 1) : loop.start
+      if (rightEdgeAuditionRef.current && draft) auditionRef.current = { start: loopStart, end: draft.end }
+      media.currentTime = loopStart
+      setPlayhead(loopStart)
       void media.play()
       return
     }
@@ -947,8 +992,10 @@ export default function App() {
     setNotice('当前字的时间范围已更新。')
   }
   const cancelCharRangeAdjust = () => { setCharRangeAdjusting(false); setCharRangeEdge(null); setCharRangeDraft(null); setConflictRange(null); setConflictOpen(false); auditionRef.current = null; mediaRef.current?.pause(); setNotice('已放弃本次字范围调整。') }
-  finishRangeAdjustRef.current = finishRangeAdjust
-  finishCharRangeAdjustRef.current = finishCharRangeAdjust
+  useEffect(() => {
+    finishRangeAdjustRef.current = finishRangeAdjust
+    finishCharRangeAdjustRef.current = finishCharRangeAdjust
+  })
   const goLine = (direction: -1 | 1) => {
     if (editingLocked) return
     const next = segments[lineIndex + direction]
@@ -1075,7 +1122,7 @@ export default function App() {
                   <Button size="sm" variant="destructive" onClick={deleteSelected} disabled={!selectedLineIds.length || editingLocked}><Trash2 />删除</Button>
                 </div> : <div className="flex items-center gap-1"><Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button><span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span><Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button></div>}
               </div>
-              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} splitMarker={view === 'lines' ? splitMarker : null} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
+              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>选择多句：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>矩形所指向的音频始终来自原媒体</span></div>
             </section>
 
@@ -1119,7 +1166,7 @@ export default function App() {
 
       <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}><DialogContent><DialogHeader><DialogTitle>新建工程</DialogTitle><DialogDescription>选择名称和存放位置。原媒体、分离结果及歌词标注会保存在同一个工程文件夹中。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">工程名称<Input value={newProjectName} onChange={event => setNewProjectName(event.target.value)} placeholder="例如：歌曲名称" /></label><div className="space-y-2 text-sm"><p>存放位置</p><div className="flex items-center gap-2"><Input value={projectParent} onChange={event => setProjectParent(event.target.value)} className="min-w-0 flex-1" /><Button variant="outline" onClick={async () => { const parent = await window.pitchordDesktop?.pickProjectParent(); if (parent) setProjectParent(parent) }}>选择…</Button></div></div></div><DialogFooter><Button variant="outline" onClick={() => { pendingMediaRef.current = null; setNewProjectOpen(false) }}>取消</Button><Button onClick={() => void createProject()} disabled={!newProjectName.trim() || (window.pitchordDesktop && !projectParent.trim())}>创建工程</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={splitOpen} onOpenChange={setSplitOpen}><DialogContent><DialogHeader><DialogTitle>分割当前歌词</DialogTitle><DialogDescription>先确定音频分割点，再选择文字从哪里断开。左右两句会保留各自的媒体时间范围。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">音频分割时间<Input value={splitTimeDraft} onChange={event => setSplitTimeDraft(event.target.value)} className="font-mono" /></label><div className="space-y-2 text-sm"><label>文字分割位置</label><Select value={splitOffset} onValueChange={setSplitOffset}><SelectTrigger><SelectValue placeholder="选择字界" /></SelectTrigger><SelectContent>{splitBoundaries.map(offset => <SelectItem key={offset} value={String(offset)}>{activeLine?.text.slice(0, offset)} ｜ {activeLine?.text.slice(offset)}</SelectItem>)}</SelectContent></Select></div><div className="rounded-md bg-muted p-3 text-xs text-muted-foreground">点击波形可指定分割时间；未指定时取句中附近的音量低谷。文字边界按时间位置给出建议，请试听确认。</div></div><DialogFooter><Button variant="outline" onClick={() => setSplitOpen(false)}>取消</Button><Button onClick={confirmSplit}>确认分割</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={splitOpen} onOpenChange={setSplitOpen}><DialogContent><DialogHeader><DialogTitle>分割当前歌词</DialogTitle><DialogDescription>先用辅助线确定音频分割位置，再选择文字从哪里断开。左右两句会保留各自的媒体时间范围。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">音频分割时间<Input value={splitTimeDraft} onChange={event => setSplitTimeDraft(event.target.value)} className="font-mono" /></label><div className="space-y-2 text-sm"><label>文字分割位置</label><Select value={splitOffset} onValueChange={setSplitOffset}><SelectTrigger><SelectValue placeholder="选择字界" /></SelectTrigger><SelectContent>{splitBoundaries.map(offset => <SelectItem key={offset} value={String(offset)}>{activeLine?.text.slice(0, offset)} ｜ {activeLine?.text.slice(offset)}</SelectItem>)}</SelectContent></Select></div><div className="rounded-md bg-muted p-3 text-xs text-muted-foreground">点击时间轴或按空格暂停可设置辅助线；没有句内辅助线时取句中附近的音量低谷。文字边界优先参考中英文标点和空格，请试听确认。</div></div><DialogFooter><Button variant="outline" onClick={() => setSplitOpen(false)}>取消</Button><Button onClick={confirmSplit}>确认分割</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={conflictOpen} onOpenChange={() => undefined}><DialogContent><DialogHeader><DialogTitle>{charRangeAdjusting ? '单字范围发生冲突' : '句子范围发生冲突'}</DialogTitle><DialogDescription>新的时间范围与相邻{charRangeAdjusting ? '字' : '歌词'}重叠，请选择处理方式后继续。</DialogDescription></DialogHeader><div className="space-y-2 text-sm"><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" onClick={() => resolveConflict('compress')}>1. 压缩两侧时间块并推动后续块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="outline" onClick={() => resolveConflict('push')}>2. 保持其他时间块形状，只推动相邻块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="ghost" onClick={() => resolveConflict('discard')}>3. 放弃本次修改</Button></div></DialogContent></Dialog>
 
