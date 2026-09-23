@@ -51,6 +51,8 @@ type AnalysisStorage = {
   root: string
   locations: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', string>
   sizes: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', number>
+  legacyRoot: string
+  legacyTotal: number
   total: number
 }
 
@@ -142,7 +144,7 @@ export default function App() {
   const [analysisProgress, setAnalysisProgress] = useState('正在检查分析环境…')
   const [storageOpen, setStorageOpen] = useState(false)
   const [analysisStorage, setAnalysisStorage] = useState<AnalysisStorage | null>(null)
-  const [cleanupTarget, setCleanupTarget] = useState<'runtime' | 'models' | 'cache' | 'all' | null>(null)
+  const [cleanupTarget, setCleanupTarget] = useState<'runtime' | 'models' | 'cache' | 'legacy' | 'all' | null>(null)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [separationPromptOpen, setSeparationPromptOpen] = useState(false)
   const [zoom, setZoom] = useState(85)
@@ -538,7 +540,7 @@ export default function App() {
     const focused = view === 'lines' ? rangeDraft : charRangeDraft
     auditionRef.current = editingLocked && focused ? { start: focused.start, end: focused.end } : null
     const next = focused && editingLocked ? clamp(time, focused.start, focused.end) : clamp(time, 0, duration)
-    if (!editingLocked) setGuideLine(next)
+    setGuideLine(next)
     if (mediaRef.current) {
       timelineSeekRef.current = true
       mediaRef.current.currentTime = next
@@ -630,7 +632,18 @@ export default function App() {
       return additive ? current.includes(id) ? current.filter(item => item !== id) : [...current, id] : [id]
     })
   }
-  const selectChar = (id: string, additive: boolean) => { if (!editingLocked) setSelectedCharIds(current => additive ? current.includes(id) ? current.filter(item => item !== id) : [...current, id] : [id]) }
+  const selectChar = (id: string, additive: boolean, range: boolean) => {
+    if (editingLocked) return
+    const chars = activeLine?.chars ?? []
+    setSelectedCharIds(current => {
+      if (range && current.length) {
+        const anchor = chars.findIndex(char => char.id === current[current.length - 1])
+        const target = chars.findIndex(char => char.id === id)
+        if (anchor >= 0 && target >= 0) return chars.slice(Math.min(anchor, target), Math.max(anchor, target) + 1).map(char => char.id)
+      }
+      return additive ? current.includes(id) ? current.filter(item => item !== id) : [...current, id] : [id]
+    })
+  }
 
   const addLineAt = (at = playhead) => {
     if (editingLocked) return
@@ -1220,7 +1233,7 @@ export default function App() {
               </div>
               {window.pitchordDesktop && <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3" data-analysis-environment>
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.offlineBundleReady ? '完整版已包含离线环境资源，无需联网准备。' : '可自动下载内置 Python，独立存放依赖和模型，不修改系统 Python 或 PATH。'}</p></div></div>
+                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.runtimeReady && analysisEnvironment?.modelReady ? '完整便携环境已就绪，无需安装 Python 或下载模型。' : analysisEnvironment?.offlineBundleReady ? '已包含离线环境资源，可在本机完成准备。' : '可自动下载内置 Python，独立存放依赖和模型，不修改系统 Python 或 PATH。'}</p></div></div>
                   <Badge variant={analysisEnvironment?.runtimeReady ? 'secondary' : 'outline'}>{analysisEnvironment?.runtimeReady ? <CheckCircle2 className="mr-1 size-3" /> : <AlertCircle className="mr-1 size-3" />}{analysisSourceLabel}</Badge>
                 </div>
                 <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 xl:grid-cols-4">
@@ -1238,7 +1251,7 @@ export default function App() {
                   <Button size="sm" variant="ghost" onClick={choosePython} disabled={analysisEnvironmentBusy}>高级：选择已有 Python</Button>
                 </div>
               </div>}
-              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Button size="sm" variant="secondary" onClick={() => void runSeparation()} disabled={!mediaUrl || separationStatus.startsWith('正在') || analysisEnvironmentBusy || (window.pitchordDesktop && !analysisEnvironment?.runtimeReady)}>运行人声分离</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">使用上方已检查的分析环境；首次运行前建议先准备模型，避免在分离过程中等待下载。</p>{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}{separationFiles && <div className="mt-2 space-y-1 text-xs text-muted-foreground"><p className="break-all">纯人声 WAV：{separationFiles.vocals}</p><p className="break-all">纯伴奏 WAV：{separationFiles.accompaniment}</p><p>可通过“工程文件夹”直接用外部播放器核对这两个文件。</p></div>}</div>
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Button size="sm" variant="secondary" onClick={() => void runSeparation()} disabled={!mediaUrl || separationStatus.startsWith('正在') || analysisEnvironmentBusy || (window.pitchordDesktop && !analysisEnvironment?.runtimeReady)}>运行人声分离</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">使用上方已检查的分析环境；完整便携包已经包含人声分离模型，可直接处理当前工程的原始媒体。</p>{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}{separationFiles && <div className="mt-2 space-y-1 text-xs text-muted-foreground"><p className="break-all">纯人声 WAV：{separationFiles.vocals}</p><p className="break-all">纯伴奏 WAV：{separationFiles.accompaniment}</p><p>可通过“工程文件夹”直接用外部播放器核对这两个文件。</p></div>}</div>
               <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><p className="mb-3 text-sm font-medium">试听音轨 <span className="text-xs font-normal text-muted-foreground">可多选叠加，切换时保持同一播放位置</span></p><div className="grid gap-3 sm:grid-cols-3">{(['original', 'vocals', 'accompaniment'] as const).map(kind => {
                 const available = kind === 'original' ? !!mediaUrl : !!stemReady[kind]
                 const label = kind === 'original' ? '原音频' : kind === 'vocals' ? '纯人声' : '纯伴奏'
@@ -1262,8 +1275,8 @@ export default function App() {
                   <Button size="sm" variant="destructive" onClick={deleteSelected} disabled={!selectedLineIds.length || editingLocked}><Trash2 />删除</Button>
                 </div> : <div className="flex items-center gap-1"><Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button><span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span><Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button></div>}
               </div>
-              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>选择多句：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>矩形所指向的音频始终来自原媒体</span></div>
+              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive, range)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{view === 'lines' ? '选择多句' : '选择多个字'}：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>矩形所指向的音频始终来自原媒体</span></div>
             </section>
 
             {activeLine && <section className="rounded-xl border border-border bg-card p-4">
@@ -1313,12 +1326,13 @@ export default function App() {
       <Dialog open={shiftConfirmOpen} onOpenChange={setShiftConfirmOpen}><DialogContent><DialogHeader><DialogTitle>歌词即将超出媒体范围</DialogTitle><DialogDescription>目前最{pendingShift > 0 ? '后' : '前'}面的歌词时间已经无法继续整体移动。是否继续压缩最外侧句子，并逐步压缩靠里的句子？</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setShiftConfirmOpen(false)}>取消</Button><Button onClick={() => { setShiftConfirmOpen(false); shiftAll(pendingShift, true) }}>继续移动</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>先处理人声吗？</DialogTitle><DialogDescription>纯人声轨通常更适合歌声音高识别。可以先使用当前原音频，也可以现在处理已导入的媒体。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => { setSeparationPromptOpen(false); void analyzePitch() }}>使用原音频</Button><Button onClick={() => { setSeparationPromptOpen(false); void runSeparation() }}>先进行人声分离</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={storageOpen} onOpenChange={open => { if (!cleanupBusy) { setStorageOpen(open); if (!open) setCleanupTarget(null) } }}><DialogContent className="sm:max-w-xl"><DialogHeader><DialogTitle>存储与环境</DialogTitle><DialogDescription>这里只管理 Pitchord 下载的运行环境、模型和缓存。工程、歌词和用户选择的外部 Python 不会被删除。</DialogDescription></DialogHeader><div className="space-y-3">
+      <Dialog open={storageOpen} onOpenChange={open => { if (!cleanupBusy) { setStorageOpen(open); if (!open) setCleanupTarget(null) } }}><DialogContent className="sm:max-w-xl"><DialogHeader><DialogTitle>存储与环境</DialogTitle><DialogDescription>这里只管理 Pitchord 的运行环境、模型和缓存。工程、歌词和用户选择的外部 Python 不会被删除。</DialogDescription></DialogHeader><div className="space-y-3">
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">分析运行环境</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.baseRuntime + analysisStorage.sizes.analysisRuntime) : '正在计算…'}</span></div><p className="mt-1 text-xs text-muted-foreground">内置 Python、Demucs、Torch 和音高依赖</p><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('runtime')} disabled={cleanupBusy || !analysisStorage || analysisStorage.sizes.baseRuntime + analysisStorage.sizes.analysisRuntime === 0}>删除运行环境</Button></div>
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">模型</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.models) : '正在计算…'}</span></div><p className="mt-1 text-xs text-muted-foreground">人声分离及后续分析模型</p><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('models')} disabled={cleanupBusy || !analysisStorage?.sizes.models}>删除模型</Button></div>
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">下载与安装缓存</span><span className="text-sm tabular-nums text-muted-foreground">{analysisStorage ? formatBytes(analysisStorage.sizes.cache + analysisStorage.sizes.downloads) : '正在计算…'}</span></div><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('cache')} disabled={cleanupBusy || !analysisStorage || analysisStorage.sizes.cache + analysisStorage.sizes.downloads === 0}>清理缓存</Button></div>
+        {!!analysisStorage?.legacyTotal && <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">旧版本分析数据</span><span className="text-sm tabular-nums text-muted-foreground">{formatBytes(analysisStorage.legacyTotal)}</span></div><p className="mt-1 break-all text-xs text-muted-foreground">{analysisStorage.legacyRoot}</p><Button className="mt-2" size="sm" variant="outline" onClick={() => setCleanupTarget('legacy')} disabled={cleanupBusy}>删除旧版本数据</Button></div>}
         {analysisStorage && <p className="break-all text-xs text-muted-foreground">合计 {formatBytes(analysisStorage.total)} · {analysisStorage.root}</p>}
-        {cleanupTarget && <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3"><p className="text-sm font-medium">确认删除{cleanupTarget === 'runtime' ? '分析运行环境' : cleanupTarget === 'models' ? '模型' : cleanupTarget === 'cache' ? '缓存' : '全部分析数据'}？</p><p className="mt-1 text-xs text-muted-foreground">需要时可以重新下载。工程和歌词不会被删除。</p><div className="mt-3 flex justify-end gap-2"><Button size="sm" variant="outline" onClick={() => setCleanupTarget(null)} disabled={cleanupBusy}>取消</Button><Button size="sm" variant="destructive" onClick={() => void removeAnalysisData()} disabled={cleanupBusy}><Trash2 />{cleanupBusy ? '正在删除…' : '确认删除'}</Button></div></div>}
+        {cleanupTarget && <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3"><p className="text-sm font-medium">确认删除{cleanupTarget === 'runtime' ? '分析运行环境' : cleanupTarget === 'models' ? '模型' : cleanupTarget === 'cache' ? '缓存' : cleanupTarget === 'legacy' ? '旧版本分析数据' : '全部分析数据'}？</p><p className="mt-1 text-xs text-muted-foreground">需要时可以重新准备。工程和歌词不会被删除。</p><div className="mt-3 flex justify-end gap-2"><Button size="sm" variant="outline" onClick={() => setCleanupTarget(null)} disabled={cleanupBusy}>取消</Button><Button size="sm" variant="destructive" onClick={() => void removeAnalysisData()} disabled={cleanupBusy}><Trash2 />{cleanupBusy ? '正在删除…' : '确认删除'}</Button></div></div>}
       </div><DialogFooter><Button variant="destructive" onClick={() => setCleanupTarget('all')} disabled={cleanupBusy || !analysisStorage?.total}>删除全部分析数据</Button><Button variant="outline" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()}>打开文件夹</Button><Button onClick={() => setStorageOpen(false)} disabled={cleanupBusy}>完成</Button></DialogFooter></DialogContent></Dialog>
 
       {contextMenu && <div className="fixed z-50 min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onPointerDown={event => event.stopPropagation()}><Button variant="ghost" size="sm" className="w-full justify-start" onClick={() => contextAction('add')}><Plus />添加句</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!mergeIndexes} onClick={() => contextAction('merge')}><Merge />合并</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!activeLine || !splitBoundaries.length} onClick={() => contextAction('split')}><Scissors />分割</Button><Button variant="ghost" size="sm" className="w-full justify-start text-destructive hover:text-destructive" disabled={!contextMenu.id && !selectedLineIds.length} onClick={() => contextAction('delete')}><Trash2 />删除</Button></div>}

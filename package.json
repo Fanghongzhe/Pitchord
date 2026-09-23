@@ -1,7 +1,7 @@
 {
   "name": "pitchord",
   "private": true,
-  "version": "0.2.0-alpha.3",
+  "version": "0.2.0-alpha.4",
   "productName": "Pitchord",
   "description": "本地歌词时间编辑器",
   "author": "Pitchord",
@@ -14,10 +14,9 @@
     "test": "vitest run",
     "preview": "vite preview",
     "desktop:start": "pnpm build && electron .",
-    "desktop:portable": "pnpm build && electron-builder --win portable",
-    "desktop:installer": "pnpm build && electron-builder --config build/online-builder.cjs",
+    "desktop:bundle": "pnpm build && electron-builder --config build/portable-builder.cjs --dir && node scripts/archive-portable-bundle.mjs",
     "analysis:offline-bundle": "node scripts/prepare-offline-analysis.mjs",
-    "desktop:full-installer": "pnpm build && electron-builder --config build/full-builder.cjs"
+    "desktop:package": "pnpm analysis:offline-bundle && pnpm desktop:bundle"
   },
   "build": {
     "appId": "com.pitchord.editor",
@@ -58,14 +57,6 @@
     },
     "portable": {
       "artifactName": "Pitchord-${version}-${arch}-portable.${ext}"
-    },
-    "nsis": {
-      "artifactName": "Pitchord-${version}-${arch}-online-setup.${ext}",
-      "oneClick": false,
-      "perMachine": false,
-      "allowElevation": false,
-      "allowToChangeInstallationDirectory": true,
-      "include": "build/installer.nsh"
     }
   },
   "dependencies": {

@@ -24,22 +24,6 @@ const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPa
 let mainWindow
 let activeProject = null
 
-const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
-const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
-const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtime-manifest.json'), 'utf8'))
-const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
-const analysisModel = 'htdemucs'
-const baseRuntime = runtimeManifest.baseRuntime
-const localDataRoot = () => process.env.LOCALAPPDATA || app.getPath('userData')
-const analysisRoot = () => path.join(localDataRoot(), 'Pitchord')
-const managedRuntimeRoot = () => path.join(analysisRoot(), 'analysis-runtime', `v${analysisRuntimeVersion}`)
-const managedPythonPath = () => path.join(managedRuntimeRoot(), process.platform === 'win32' ? 'Scripts' : 'bin', pythonExecutable)
-const baseRuntimeRoot = () => path.join(analysisRoot(), 'base-runtime', `cpython-${baseRuntime.version}`)
-const basePythonPath = () => path.join(baseRuntimeRoot(), 'python', pythonExecutable)
-const modelRoot = () => path.join(analysisRoot(), 'models')
-const modelMarker = () => path.join(modelRoot(), 'demucs', `${analysisModel}.json`)
-let analysisInstallTask = null
-
 function applicationDirectory() {
   if (!app.isPackaged) return appRoot
   const portableDir = process.env.PORTABLE_EXECUTABLE_DIR
@@ -48,6 +32,25 @@ function applicationDirectory() {
   if (portableFile && path.isAbsolute(portableFile) && fs.existsSync(portableFile)) return path.dirname(portableFile)
   return path.dirname(process.execPath)
 }
+
+const portableDataRoot = () => path.join(applicationDirectory(), 'data')
+if (app.isPackaged) app.setPath('userData', path.join(portableDataRoot(), 'app-state'))
+
+const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
+const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
+const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtime-manifest.json'), 'utf8'))
+const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
+const analysisModel = 'htdemucs'
+const baseRuntime = runtimeManifest.baseRuntime
+const legacyAnalysisRoot = () => path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'Pitchord')
+const analysisRoot = () => app.isPackaged ? path.join(applicationDirectory(), 'environment') : legacyAnalysisRoot()
+const baseRuntimeRoot = () => path.join(analysisRoot(), 'base-runtime', `cpython-${baseRuntime.version}`)
+const basePythonPath = () => path.join(baseRuntimeRoot(), 'python', pythonExecutable)
+const managedRuntimeRoot = () => baseRuntimeRoot()
+const managedPythonPath = () => basePythonPath()
+const modelRoot = () => path.join(analysisRoot(), 'models')
+const modelMarker = () => path.join(modelRoot(), 'demucs', `${analysisModel}.json`)
+let analysisInstallTask = null
 
 function nearbyPythonPaths() {
   const applicationDir = applicationDirectory()
@@ -189,21 +192,26 @@ async function analysisStorageStatus() {
     downloads: path.join(analysisRoot(), 'downloads'),
   }
   const sizes = Object.fromEntries(await Promise.all(Object.entries(locations).map(async ([key, value]) => [key, await directorySize(value)])))
-  return { root: analysisRoot(), locations, sizes, total: Object.values(sizes).reduce((sum, value) => sum + value, 0) }
+  const legacyRoot = path.resolve(legacyAnalysisRoot()) === path.resolve(analysisRoot()) ? '' : legacyAnalysisRoot()
+  const legacyTotal = legacyRoot ? await directorySize(legacyRoot) : 0
+  return { root: analysisRoot(), locations, sizes, legacyRoot, legacyTotal, total: Object.values(sizes).reduce((sum, value) => sum + value, legacyTotal) }
 }
 
 async function removeManagedAnalysisData(target) {
+  const legacyTargets = path.resolve(legacyAnalysisRoot()) === path.resolve(analysisRoot()) ? [] : [legacyAnalysisRoot()]
   const targets = {
     runtime: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime')],
     models: [modelRoot()],
     cache: [path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads')],
-    all: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), modelRoot(), path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads')],
+    legacy: legacyTargets,
+    all: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), modelRoot(), path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads'), ...legacyTargets],
   }
   if (!Object.hasOwn(targets, target)) throw new Error('Invalid analysis cleanup target')
   for (const directory of targets[target]) {
     const resolved = path.resolve(directory)
     const root = path.resolve(analysisRoot())
-    if (!resolved.startsWith(root + path.sep)) throw new Error('Invalid managed analysis path')
+    const legacyRoot = path.resolve(legacyAnalysisRoot())
+    if (!resolved.startsWith(root + path.sep) && resolved !== legacyRoot) throw new Error('Invalid managed analysis path')
     await fs.promises.rm(resolved, { recursive: true, force: true })
   }
   return analysisStorageStatus()
@@ -214,7 +222,8 @@ function sendAnalysisProgress(stage, message) {
 }
 
 async function requireFreeSpace(bytes, label) {
-  await mkdir(analysisRoot(), { recursive: true })
+  try { await mkdir(analysisRoot(), { recursive: true }) }
+  catch { throw new Error(`无法写入安装目录 ${applicationDirectory()}。请将 Pitchord 安装到当前用户可写的目录后重试。`) }
   const stats = fs.statfsSync(analysisRoot())
   const available = Number(stats.bavail) * Number(stats.bsize)
   if (Number.isFinite(available) && available < bytes) {
@@ -490,16 +499,10 @@ app.whenReady().then(() => {
         ? 1024 * 1024 * 1024
         : offlineBundleAvailable() ? 2 * 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024
       await requireFreeSpace(requiredBytes, '安装分析环境')
-      let bootstrap
-      if (process.platform === 'win32' && process.arch === 'x64') {
-        const executable = await ensureBaseRuntime()
-        bootstrap = { command: executable, prefix: [], executable }
-      } else bootstrap = await findBootstrapPython()
-      if (!bootstrap) throw new Error('未找到可用于创建独立环境的 Python 3。')
-      await mkdir(path.dirname(managedRuntimeRoot()), { recursive: true })
-      sendAnalysisProgress('runtime', '正在创建 Pitchord 独立分析环境…')
-      await runProcess(bootstrap.command, [...bootstrap.prefix, '-m', 'venv', '--clear', managedRuntimeRoot()], { env: process.env })
-      const python = managedPythonPath()
+      let python
+      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime()
+      else python = (await findBootstrapPython())?.executable
+      if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
       const offlineRequirements = path.join(offlineAnalysisRoot(), 'analysis-lock-win-x64.txt')
       const useOfflineBundle = fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
@@ -520,7 +523,7 @@ app.whenReady().then(() => {
       })
       const probe = await probePython(python)
       if (!probe?.demucs || !probe?.torchcrepe) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
-      await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify({ version: analysisRuntimeVersion, createdAt: new Date().toISOString(), bootstrap: bootstrap.executable }, null, 2), 'utf8')
+      await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify({ version: analysisRuntimeVersion, createdAt: new Date().toISOString(), python }, null, 2), 'utf8')
       await preferManagedRuntime()
       sendAnalysisProgress('complete', '分析环境已准备完成。')
       return { ...await analysisRuntimeStatus(), busy: false }

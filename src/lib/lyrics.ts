@@ -140,15 +140,18 @@ const CLOSING_PUNCTUATION = /[”’」』】）》〉]/u
 
 export function suggestSplitOffset(text: string, boundaries: number[], position: number) {
   if (!boundaries.length) return null
-  const target = clamp(position, 0, 1) * text.length
-  return boundaries.reduce((best, offset) => {
+  const firstNaturalBreak = boundaries.find(offset => {
     const previous = text[offset - 1] ?? ''
     const beforePrevious = text[offset - 2] ?? ''
     const next = text[offset] ?? ''
-    const punctuationBreak = BREAK_PUNCTUATION.test(previous) || (CLOSING_PUNCTUATION.test(previous) && BREAK_PUNCTUATION.test(beforePrevious))
-    const whitespaceBreak = /\s/u.test(previous) || /\s/u.test(next)
-    const bonus = punctuationBreak ? text.length * 0.28 : whitespaceBreak ? text.length * 0.2 : 0
-    const score = Math.abs(offset - target) - bonus
+    return BREAK_PUNCTUATION.test(previous) ||
+      (CLOSING_PUNCTUATION.test(previous) && BREAK_PUNCTUATION.test(beforePrevious)) ||
+      /\s/u.test(previous) || /\s/u.test(next)
+  })
+  if (firstNaturalBreak !== undefined) return firstNaturalBreak
+  const target = clamp(position, 0, 1) * text.length
+  return boundaries.reduce((best, offset) => {
+    const score = Math.abs(offset - target)
     return score < best.score ? { offset, score } : best
   }, { offset: boundaries[0], score: Number.POSITIVE_INFINITY }).offset
 }

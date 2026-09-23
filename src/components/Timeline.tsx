@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent } from 'react'
 import { formatTime, MIN_SPAN, roundTime, clamp } from '@/lib/lyrics'
 import type { CharSpan, LyricSegment } from '@/lib/lyrics'
@@ -52,6 +52,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   const activeClipId = mode === 'lines' ? activeSegment?.id : selectedIds[0]
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const previousGeometryRef = useRef({ scale, start })
+  const seenCenterRequestRef = useRef(0)
   const seenSeekRequestRef = useRef(0)
   const dragRef = useRef<Drag | null>(null)
   const clickSequenceRef = useRef<{ id: string; startedSelected: boolean; lastPointerAt: number } | null>(null)
@@ -67,13 +69,28 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   useEffect(() => {
     const viewport = scrollRef.current
     const target = clips.find(clip => clip.id === centerTargetId)
-    if (!viewport || !target || centerRequest <= 0) return
+    if (!viewport || !target || centerRequest <= seenCenterRequestRef.current) return
+    seenCenterRequestRef.current = centerRequest
     const targetCenter = ((target.start + target.end) / 2 - start) * scale
     viewport.scrollTo({
       left: clamp(targetCenter - viewport.clientWidth / 2, 0, viewport.scrollWidth - viewport.clientWidth),
       behavior: 'smooth',
     })
   }, [centerTargetId, centerRequest, clips, start, scale])
+
+  useLayoutEffect(() => {
+    const viewport = scrollRef.current
+    const previous = previousGeometryRef.current
+    if (!viewport || previous.scale === scale && previous.start === start) return
+    const oldScrollLeft = viewport.scrollLeft
+    const guideVisible = guideLine !== null && guideLine >= start && guideLine <= end
+    const anchorTime = guideVisible
+      ? guideLine
+      : previous.start + (oldScrollLeft + viewport.clientWidth / 2) / previous.scale
+    const anchorViewportX = (anchorTime - previous.start) * previous.scale - oldScrollLeft
+    viewport.scrollLeft = clamp((anchorTime - start) * scale - anchorViewportX, 0, Math.max(0, viewport.scrollWidth - viewport.clientWidth))
+    previousGeometryRef.current = { scale, start }
+  }, [scale, start, end, guideLine])
 
   useEffect(() => {
     const viewport = scrollRef.current

@@ -22,6 +22,8 @@ type AnalysisStorageStatus = {
   root: string
   locations: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', string>
   sizes: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', number>
+  legacyRoot: string
+  legacyTotal: number
   total: number
 }
 
@@ -33,7 +35,7 @@ declare global {
       pickPython: () => Promise<string | null>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
-      removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'all') => Promise<AnalysisStorageStatus>
+      removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: () => Promise<AnalysisRuntimeStatus>

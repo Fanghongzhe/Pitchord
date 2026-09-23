@@ -33,6 +33,7 @@ describe('lyric editing invariants', () => {
   it('prefers punctuation and spaces for the suggested text split', () => {
     expect(suggestSplitOffset('第一段，第二段', [1, 2, 3, 4, 5, 6], 0.5)).toBe(4)
     expect(suggestSplitOffset('hello world', [5], 0.5)).toBe(5)
+    expect(suggestSplitOffset('第一段，第二段，第三段', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9)).toBe(4)
     expect(suggestSplitOffset('天地玄黄', [1, 2, 3], 0.5)).toBe(2)
   })
 

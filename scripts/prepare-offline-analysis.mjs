@@ -19,9 +19,9 @@ const models = path.join(localRoot, 'models')
 if (!existsSync(managedPython)) throw new Error('请先在 Pitchord 中安装并验证当前分析环境。')
 if (!existsSync(path.join(models, 'demucs', 'htdemucs.json'))) throw new Error('请先在 Pitchord 中准备并验证 htdemucs 模型。')
 
-function run(command, args) {
+function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: projectRoot, windowsHide: true, stdio: 'inherit' })
+    const child = spawn(command, args, { cwd: projectRoot, windowsHide: true, stdio: 'inherit', ...options })
     child.on('error', reject)
     child.on('close', code => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`)))
   })
@@ -35,6 +35,10 @@ async function sha256(file) {
 }
 
 async function download(url, destination) {
+  if (process.platform === 'win32') {
+    await run('curl.exe', ['-L', '--fail', '--retry', '3', '--output', destination, url])
+    return
+  }
   const response = await fetch(url, { redirect: 'follow' })
   if (!response.ok || !response.body) throw new Error(`Download failed: HTTP ${response.status}`)
   await pipeline(Readable.fromWeb(response.body), createWriteStream(destination))
@@ -59,6 +63,23 @@ await cp(lockFile, path.join(output, 'analysis-lock-win-x64.txt'))
 
 console.log('Copying verified model cache...')
 await cp(models, path.join(output, 'models'), { recursive: true, force: true })
+
+console.log('Building the ready-to-use portable analysis environment...')
+const prepared = path.join(output, 'prepared-analysis')
+const preparedBaseRoot = path.join(prepared, 'base-runtime', `cpython-${runtimeManifest.baseRuntime.version}`)
+await mkdir(preparedBaseRoot, { recursive: true })
+await run('tar.exe', ['-xzf', archive, '-C', preparedBaseRoot])
+const preparedPython = path.join(preparedBaseRoot, 'python', 'python.exe')
+await run(preparedPython, [
+  '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location', '--ignore-installed', '--no-index',
+  '--find-links', path.join(output, 'wheelhouse'), '--requirement', lockFile,
+], { env: { ...process.env, PYTHONNOUSERSITE: '1' } })
+await writeFile(path.join(preparedBaseRoot, 'pitchord-runtime.json'), JSON.stringify({
+  version: runtimeManifest.analysisRuntimeVersion,
+  createdAt: new Date().toISOString(),
+  python: 'portable',
+}, null, 2), 'utf8')
+await cp(models, path.join(prepared, 'models'), { recursive: true, force: true })
 
 const manifest = {
   schemaVersion: 1,
