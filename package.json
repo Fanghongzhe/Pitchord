@@ -1,7 +1,7 @@
 {
   "name": "pitchord",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "productName": "Pitchord",
   "description": "本地歌词时间编辑器",
   "author": "Pitchord",
