@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import {
-  AudioLines, ChevronLeft, ChevronRight, Download, FileAudio2, FilePlus2, FileText, Merge,
-  FolderOpen, Pause, Play, Plus, Redo2, Save, Scissors, Trash2, Undo2, Upload, Video,
+  AlertCircle, AudioLines, CheckCircle2, ChevronLeft, ChevronRight, Download, FileAudio2, FilePlus2, FileText, Merge,
+  FolderOpen, HardDrive, Pause, Play, Plus, Redo2, Save, Scissors, Settings2, Trash2, Undo2, Upload, Video,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -30,6 +30,19 @@ type Draft = { segments: LyricSegment[]; mediaName: string; duration: number; pi
 type TrackKind = 'original' | 'vocals' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
 type ContextState = { x: number; y: number; id?: string; time?: number }
+type AnalysisEnvironment = {
+  runtimeVersion: string
+  source: 'managed' | 'portable' | 'custom' | 'missing'
+  path: string
+  pythonVersion: string
+  packages: { demucs: boolean; torchcrepe: boolean; pip: boolean }
+  runtimeReady: boolean
+  model: string
+  modelReady: boolean
+  runtimeDirectory: string
+  modelDirectory: string
+  busy: boolean
+}
 
 function readDraft(): Draft | null {
   try {
@@ -108,6 +121,9 @@ export default function App() {
   const [vocalTrackReady, setVocalTrackReady] = useState(false)
   const [separationStatus, setSeparationStatus] = useState('未运行')
   const [pythonPath, setPythonPath] = useState('')
+  const [analysisEnvironment, setAnalysisEnvironment] = useState<AnalysisEnvironment | null>(null)
+  const [analysisEnvironmentBusy, setAnalysisEnvironmentBusy] = useState(false)
+  const [analysisProgress, setAnalysisProgress] = useState('正在检查分析环境…')
   const [separationPromptOpen, setSeparationPromptOpen] = useState(false)
   const [zoom, setZoom] = useState(85)
   const [importOpen, setImportOpen] = useState(false)
@@ -149,6 +165,7 @@ export default function App() {
   const splitBoundaries = useMemo(() => activeLine ? lyricUnits(activeLine.text).slice(0, -1).map(unit => unit.endOffset) : [], [activeLine])
   const pitchMatches = useMemo(() => matchPitchToChars(segments, pitchPoints), [segments, pitchPoints])
   const voicedPitchPoints = useMemo(() => pitchPoints.filter(point => point.voiced && point.hz > 0), [pitchPoints])
+  const analysisSourceLabel = analysisEnvironment?.source === 'managed' ? 'Pitchord 独立环境' : analysisEnvironment?.source === 'portable' ? '便携包环境' : analysisEnvironment?.source === 'custom' ? '自选环境' : '未找到环境'
 
   const commit = useCallback((next: LyricSegment[]) => {
     setHistory(current => {
@@ -237,8 +254,14 @@ export default function App() {
 
   useEffect(() => {
     if (!window.pitchordDesktop?.getPython) return
-    void window.pitchordDesktop.getPython().then(path => { if (path) setPythonPath(path) }).catch(() => undefined)
+    void window.pitchordDesktop.analysisStatus().then(status => {
+      setAnalysisEnvironment(status)
+      setPythonPath(status.path)
+      setAnalysisProgress(status.runtimeReady ? '分析环境可用' : '分析环境尚未准备完整')
+    }).catch(() => setAnalysisProgress('无法检查分析环境'))
+    const removeProgress = window.pitchordDesktop.onAnalysisProgress(progress => setAnalysisProgress(progress.message))
     void window.pitchordDesktop.projectDefaults().then(defaults => { setProjectParent(defaults.parent); setNewProjectName(defaults.suggestedName) }).catch(() => undefined)
+    return removeProgress
   }, [])
 
   useEffect(() => () => { if (mediaUrl) URL.revokeObjectURL(mediaUrl) }, [mediaUrl])
@@ -381,7 +404,7 @@ export default function App() {
     setSeparationStatus('正在分离…')
     try {
       const source = await mediaFileRef.current.arrayBuffer()
-      const result = await window.pitchordDesktop.separateVocals({ name: mediaFileRef.current.name, data: source, pythonPath: pythonPath || undefined })
+      const result = await window.pitchordDesktop.separateVocals({ name: mediaFileRef.current.name, data: source })
       if (!result) { setSeparationStatus('已取消'); return }
       // Copy into a plain ArrayBuffer so the browser File constructor accepts
       // the bytes under TypeScript's stricter SharedArrayBuffer definitions.
@@ -394,6 +417,7 @@ export default function App() {
       setTrackEnabled({ original: false, vocals: true, accompaniment: false })
       setSeparationStatus('已生成纯人声和纯伴奏')
       setSeparationFiles({ vocals: result.vocals.path, accompaniment: result.accompaniment.path })
+      void window.pitchordDesktop.analysisStatus().then(setAnalysisEnvironment)
     } catch (error) {
       setSeparationStatus('运行失败')
       setNotice(`人声分离失败：${error instanceof Error ? error.message : '请检查 Demucs 和模型配置。'}`)
@@ -403,8 +427,45 @@ export default function App() {
     if (!window.pitchordDesktop?.pickPython) { setNotice('选择 Python 运行时需要桌面版。'); return }
     try {
       const path = await window.pitchordDesktop.pickPython()
-      if (path) { setPythonPath(path); setNotice(`已选择 Python 运行时：${path}`) }
+      if (path) {
+        setPythonPath(path)
+        const status = await window.pitchordDesktop.analysisStatus()
+        setAnalysisEnvironment(status)
+        setAnalysisProgress(status.runtimeReady ? '所选环境可用' : '所选环境缺少必要组件')
+        setNotice(`已选择 Python 运行时：${path}`)
+      }
     } catch { setNotice('无法选择 Python 运行时。') }
+  }
+
+  const installAnalysisRuntime = async () => {
+    if (!window.pitchordDesktop?.installAnalysisRuntime) return
+    setAnalysisEnvironmentBusy(true)
+    setAnalysisProgress('正在启动环境安装…')
+    try {
+      const status = await window.pitchordDesktop.installAnalysisRuntime()
+      setAnalysisEnvironment(status)
+      setPythonPath(status.path)
+      setAnalysisProgress('独立分析环境已准备完成')
+      setNotice('Pitchord 独立分析环境已安装。接下来可准备人声分离模型。')
+    } catch (error) {
+      setAnalysisProgress('环境安装未完成')
+      setNotice(`分析环境安装失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const prepareAnalysisModel = async () => {
+    if (!window.pitchordDesktop?.prepareAnalysisModel) return
+    setAnalysisEnvironmentBusy(true)
+    setAnalysisProgress('正在启动模型准备…')
+    try {
+      const status = await window.pitchordDesktop.prepareAnalysisModel()
+      setAnalysisEnvironment(status)
+      setAnalysisProgress(`${status.model} 模型已准备完成`)
+      setNotice('人声分离模型已保存到 Pitchord 的模型目录。')
+    } catch (error) {
+      setAnalysisProgress('模型准备未完成')
+      setNotice(`模型准备失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
   }
 
   const seek = (time: number) => {
@@ -1098,7 +1159,25 @@ export default function App() {
                 <div><h2 className="font-semibold">音频处理与分析</h2><p className="mt-1 text-xs text-muted-foreground">先处理人声，再从纯人声轨识别连续音高，提升后续歌词匹配的稳定性。</p></div>
                 <Badge variant={pitchPoints.length ? 'secondary' : 'outline'}>{pitchStatus}</Badge>
               </div>
-              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Button size="sm" variant="secondary" onClick={() => void runSeparation()} disabled={!mediaUrl || separationStatus.startsWith('正在')}>运行人声分离</Button><Button size="sm" variant="outline" onClick={choosePython}>选择 Python 环境</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">自动查找程序目录及附近目录的 .venv-analysis、.venv、venv。当前选择：{pythonPath || '未找到可用 Python'}</p>{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}{separationFiles && <div className="mt-2 space-y-1 text-xs text-muted-foreground"><p className="break-all">纯人声 WAV：{separationFiles.vocals}</p><p className="break-all">纯伴奏 WAV：{separationFiles.accompaniment}</p><p>可通过“工程文件夹”直接用外部播放器核对这两个文件。</p></div>}</div>
+              {window.pitchordDesktop && <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3" data-analysis-environment>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-start gap-2"><Settings2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">分析环境</p><p className="mt-1 text-xs text-muted-foreground">独立存放 Python 依赖和模型，不修改系统 Python 或 PATH。</p></div></div>
+                  <Badge variant={analysisEnvironment?.runtimeReady ? 'secondary' : 'outline'}>{analysisEnvironment?.runtimeReady ? <CheckCircle2 className="mr-1 size-3" /> : <AlertCircle className="mr-1 size-3" />}{analysisSourceLabel}</Badge>
+                </div>
+                <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+                  <span>Python：{analysisEnvironment?.pythonVersion || '未检测到'}</span>
+                  <span>组件：{analysisEnvironment?.runtimeReady ? 'Demucs 与音高依赖已就绪' : '需要安装或修复'}</span>
+                  <span>模型：{analysisEnvironment?.modelReady ? `${analysisEnvironment.model} 已就绪` : `${analysisEnvironment?.model || 'htdemucs'} 尚未预下载`}</span>
+                </div>
+                <p className="mt-2 break-all text-xs text-muted-foreground">{analysisProgress}{pythonPath ? ` · ${pythonPath}` : ''}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '修复独立环境' : '安装独立环境'}</Button>
+                  <Button size="sm" variant="outline" onClick={() => void prepareAnalysisModel()} disabled={analysisEnvironmentBusy || !analysisEnvironment?.runtimeReady}>{analysisEnvironment?.modelReady ? '重新检查模型' : '准备人声分离模型'}</Button>
+                  <Button size="sm" variant="ghost" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()} disabled={analysisEnvironmentBusy}><HardDrive />存储位置</Button>
+                  <Button size="sm" variant="ghost" onClick={choosePython} disabled={analysisEnvironmentBusy}>高级：选择已有 Python</Button>
+                </div>
+              </div>}
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Button size="sm" variant="secondary" onClick={() => void runSeparation()} disabled={!mediaUrl || separationStatus.startsWith('正在') || analysisEnvironmentBusy || (window.pitchordDesktop && !analysisEnvironment?.runtimeReady)}>运行人声分离</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">使用上方已检查的分析环境；首次运行前建议先准备模型，避免在分离过程中等待下载。</p>{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}{separationFiles && <div className="mt-2 space-y-1 text-xs text-muted-foreground"><p className="break-all">纯人声 WAV：{separationFiles.vocals}</p><p className="break-all">纯伴奏 WAV：{separationFiles.accompaniment}</p><p>可通过“工程文件夹”直接用外部播放器核对这两个文件。</p></div>}</div>
               <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><p className="mb-3 text-sm font-medium">试听音轨 <span className="text-xs font-normal text-muted-foreground">可多选叠加，切换时保持同一播放位置</span></p><div className="grid gap-3 sm:grid-cols-3">{(['original', 'vocals', 'accompaniment'] as const).map(kind => {
                 const available = kind === 'original' ? !!mediaUrl : !!stemReady[kind]
                 const label = kind === 'original' ? '原音频' : kind === 'vocals' ? '纯人声' : '纯伴奏'

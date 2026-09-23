@@ -33,7 +33,8 @@
         "from": "scripts",
         "to": "scripts",
         "filter": [
-          "separate-vocals.py"
+          "separate-vocals.py",
+          "analysis-requirements.txt"
         ]
       }
     ],

@@ -4,6 +4,15 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   saveText: (name, content) => ipcRenderer.invoke('pitchord:save-text', { name, content }),
   getPython: () => ipcRenderer.invoke('pitchord:get-python'),
   pickPython: () => ipcRenderer.invoke('pitchord:pick-python'),
+  analysisStatus: () => ipcRenderer.invoke('pitchord:analysis-status'),
+  installAnalysisRuntime: () => ipcRenderer.invoke('pitchord:install-analysis-runtime'),
+  prepareAnalysisModel: () => ipcRenderer.invoke('pitchord:prepare-analysis-model'),
+  openAnalysisFolder: () => ipcRenderer.invoke('pitchord:open-analysis-folder'),
+  onAnalysisProgress: callback => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on('pitchord:analysis-progress', listener)
+    return () => ipcRenderer.removeListener('pitchord:analysis-progress', listener)
+  },
   projectDefaults: () => ipcRenderer.invoke('pitchord:project-defaults'),
   pickProjectParent: () => ipcRenderer.invoke('pitchord:pick-project-parent'),
   createProject: (name, parent) => ipcRenderer.invoke('pitchord:create-project', { name, parent }),

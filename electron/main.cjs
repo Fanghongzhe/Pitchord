@@ -25,6 +25,15 @@ let activeProject = null
 
 const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
 const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
+const analysisRuntimeVersion = '1'
+const analysisModel = 'htdemucs'
+const localDataRoot = () => process.env.LOCALAPPDATA || app.getPath('userData')
+const analysisRoot = () => path.join(localDataRoot(), 'Pitchord')
+const managedRuntimeRoot = () => path.join(analysisRoot(), 'analysis-runtime', `v${analysisRuntimeVersion}`)
+const managedPythonPath = () => path.join(managedRuntimeRoot(), process.platform === 'win32' ? 'Scripts' : 'bin', pythonExecutable)
+const modelRoot = () => path.join(analysisRoot(), 'models')
+const modelMarker = () => path.join(modelRoot(), 'demucs', `${analysisModel}.json`)
+let analysisInstallTask = null
 
 function applicationDirectory() {
   if (!app.isPackaged) return appRoot
@@ -49,15 +58,107 @@ async function savedPythonPath() {
   } catch { return null }
 }
 
+async function readSettings() {
+  try { return JSON.parse(await readFile(settingsFile(), 'utf8')) } catch { return {} }
+}
+
 async function rememberPythonPath(pythonPath) {
-  await writeFile(settingsFile(), JSON.stringify({ pythonPath }), 'utf8')
+  const settings = await readSettings()
+  await mkdir(path.dirname(settingsFile()), { recursive: true })
+  await writeFile(settingsFile(), JSON.stringify({ ...settings, pythonPath, runtimePreference: 'custom' }, null, 2), 'utf8')
+}
+
+async function preferManagedRuntime() {
+  const settings = await readSettings()
+  await mkdir(path.dirname(settingsFile()), { recursive: true })
+  await writeFile(settingsFile(), JSON.stringify({ ...settings, runtimePreference: 'managed' }, null, 2), 'utf8')
 }
 
 async function preferredPythonPath() {
+  const settings = await readSettings()
+  if (settings.runtimePreference === 'custom' && typeof settings.pythonPath === 'string' && fs.existsSync(settings.pythonPath)) return settings.pythonPath
+  const managed = managedPythonPath()
+  if (fs.existsSync(managed)) return managed
   const nearby = nearbyPythonPaths().find(candidate => fs.existsSync(candidate))
   if (nearby) return nearby
   const saved = await savedPythonPath()
   if (saved) return saved
+  return null
+}
+
+function analysisEnvironment(pythonPath) {
+  return {
+    ...process.env,
+    PITCHORD_MODEL_HOME: modelRoot(),
+    TORCH_HOME: path.join(modelRoot(), 'torch'),
+    HF_HOME: path.join(modelRoot(), 'huggingface'),
+    XDG_CACHE_HOME: path.join(modelRoot(), 'cache'),
+    PYTHONNOUSERSITE: '1',
+    ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
+  }
+}
+
+function runProcess(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, ...options })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', chunk => { stdout += String(chunk); options.onOutput?.(String(chunk)) })
+    child.stderr?.on('data', chunk => { stderr += String(chunk); options.onOutput?.(String(chunk)) })
+    child.on('error', reject)
+    child.on('close', code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error((stderr || stdout).slice(-4000) || `${command} exited with ${code}`)))
+  })
+}
+
+async function probePython(pythonPath) {
+  if (!pythonPath || (!fs.existsSync(pythonPath) && path.isAbsolute(pythonPath))) return null
+  const program = [
+    'import json, platform, importlib.util',
+    "print(json.dumps({'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'pip': bool(importlib.util.find_spec('pip'))}))",
+  ].join(';')
+  try {
+    const result = await runProcess(pythonPath, ['-c', program], { env: analysisEnvironment(pythonPath) })
+    const detail = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1))
+    return { path: pythonPath, ...detail }
+  } catch { return null }
+}
+
+async function analysisRuntimeStatus() {
+  const managedPath = managedPythonPath()
+  const selectedPath = await preferredPythonPath()
+  const probe = await probePython(selectedPath)
+  const source = selectedPath === managedPath ? 'managed' : selectedPath && nearbyPythonPaths().includes(selectedPath) ? 'portable' : selectedPath ? 'custom' : 'missing'
+  let modelReady = false
+  try { modelReady = JSON.parse(await readFile(modelMarker(), 'utf8')).model === analysisModel } catch { /* not prepared by Pitchord */ }
+  return {
+    runtimeVersion: analysisRuntimeVersion,
+    source,
+    path: probe?.path || selectedPath || '',
+    pythonVersion: probe?.version || '',
+    packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, pip: !!probe?.pip },
+    runtimeReady: !!(probe?.demucs && probe?.torchcrepe),
+    model: analysisModel,
+    modelReady,
+    runtimeDirectory: managedRuntimeRoot(),
+    modelDirectory: modelRoot(),
+    busy: !!analysisInstallTask,
+  }
+}
+
+function sendAnalysisProgress(stage, message) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('pitchord:analysis-progress', { stage, message })
+}
+
+async function findBootstrapPython() {
+  const candidates = [...nearbyPythonPaths(), await savedPythonPath(), process.env.PITCHORD_PYTHON, process.platform === 'win32' ? 'py' : 'python3', 'python'].filter(Boolean)
+  for (const candidate of [...new Set(candidates)]) {
+    if (candidate === managedPythonPath()) continue
+    const args = path.basename(candidate).toLowerCase() === 'py.exe' || candidate === 'py' ? ['-3', '-c', 'import sys; print(sys.executable)'] : ['-c', 'import sys; print(sys.executable)']
+    try {
+      const result = await runProcess(candidate, args, { env: process.env })
+      return { command: candidate, prefix: args[0] === '-3' ? ['-3'] : [], executable: result.stdout.trim().split(/\r?\n/).at(-1) }
+    } catch { /* try next candidate */ }
+  }
   return null
 }
 
@@ -187,6 +288,71 @@ app.whenReady().then(() => {
     return preferredPythonPath()
   })
 
+  ipcMain.handle('pitchord:analysis-status', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    return analysisRuntimeStatus()
+  })
+
+  ipcMain.handle('pitchord:install-analysis-runtime', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
+    analysisInstallTask = (async () => {
+      const bootstrap = await findBootstrapPython()
+      if (!bootstrap) throw new Error('未找到可用于创建独立环境的 Python 3。请先在“高级选项”选择已有 Python；后续版本将支持直接下载基础运行时。')
+      await mkdir(path.dirname(managedRuntimeRoot()), { recursive: true })
+      sendAnalysisProgress('runtime', '正在创建 Pitchord 独立分析环境…')
+      await runProcess(bootstrap.command, [...bootstrap.prefix, '-m', 'venv', '--clear', managedRuntimeRoot()], { env: process.env })
+      const python = managedPythonPath()
+      sendAnalysisProgress('runtime', '正在准备安装工具…')
+      await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], { env: analysisEnvironment(python) })
+      sendAnalysisProgress('runtime', '正在安装人声分离和音高模型依赖，这一步可能需要较长时间…')
+      await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--requirement', path.join(scriptRoot, 'analysis-requirements.txt')], {
+        env: analysisEnvironment(python),
+        onOutput: output => {
+          const line = output.trim().split(/\r?\n/).at(-1)
+          if (line) sendAnalysisProgress('runtime', line.slice(0, 240))
+        },
+      })
+      const probe = await probePython(python)
+      if (!probe?.demucs || !probe?.torchcrepe) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
+      await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify({ version: analysisRuntimeVersion, createdAt: new Date().toISOString(), bootstrap: bootstrap.executable }, null, 2), 'utf8')
+      await preferManagedRuntime()
+      sendAnalysisProgress('complete', '分析环境已准备完成。')
+      return { ...await analysisRuntimeStatus(), busy: false }
+    })()
+    try { return await analysisInstallTask } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:prepare-analysis-model', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
+    analysisInstallTask = (async () => {
+      const python = await preferredPythonPath()
+      const probe = await probePython(python)
+      if (!probe?.demucs) throw new Error('请先安装或修复分析环境。')
+      await mkdir(path.dirname(modelMarker()), { recursive: true })
+      sendAnalysisProgress('model', `正在准备 ${analysisModel} 人声分离模型…`)
+      const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(analysisModel)}); print('ready')`
+      await runProcess(python, ['-c', program], {
+        env: analysisEnvironment(python),
+        onOutput: output => {
+          const line = output.trim().split(/\r?\n/).at(-1)
+          if (line) sendAnalysisProgress('model', line.slice(0, 240))
+        },
+      })
+      await writeFile(modelMarker(), JSON.stringify({ model: analysisModel, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      sendAnalysisProgress('complete', '人声分离模型已准备完成。')
+      return { ...await analysisRuntimeStatus(), busy: false }
+    })()
+    try { return await analysisInstallTask } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:open-analysis-folder', async event => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    await mkdir(analysisRoot(), { recursive: true })
+    return shell.openPath(analysisRoot())
+  })
+
   ipcMain.handle('pitchord:pick-python', async event => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     const nearby = await preferredPythonPath()
@@ -310,7 +476,7 @@ app.whenReady().then(() => {
     const workDir = path.join(project.directory, 'analysis', `separation-${new Date().toISOString().replace(/[:.]/g, '-')}`)
     await mkdir(workDir, { recursive: true })
     const script = path.join(scriptRoot, 'separate-vocals.py')
-    const localPython = sourceData.pythonPath || process.env.PITCHORD_PYTHON || await preferredPythonPath() || pythonExecutable
+    const localPython = await preferredPythonPath() || pythonExecutable
     const python = fs.existsSync(localPython) ? localPython : 'python'
     const resolveBundledBinary = (binaryPath, packageName) => {
       if (!app.isPackaged || !binaryPath) return binaryPath
@@ -320,7 +486,7 @@ app.whenReady().then(() => {
     }
     const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
     const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
-    const childEnv = { ...process.env }
+    const childEnv = analysisEnvironment(python)
     const binaryDirs = [bundledFfmpeg, bundledFfprobe].filter(binary => binary && fs.existsSync(binary)).map(binary => path.dirname(binary))
     if (binaryDirs.length) childEnv.PATH = `${[...new Set(binaryDirs)].join(path.delimiter)}${path.delimiter}${childEnv.PATH || ''}`
     const source = project.assets.media ? projectAssetPath(project, project.assets.media) : path.join(project.directory, 'media', safeAssetName(sourceData.name))
@@ -355,6 +521,8 @@ app.whenReady().then(() => {
     if (!vocals || !accompaniment) throw new Error('Demucs did not produce vocals.wav and no_vocals.wav')
     project.assets.vocals = path.relative(project.directory, vocals)
     project.assets.accompaniment = path.relative(project.directory, accompaniment)
+    await mkdir(path.dirname(modelMarker()), { recursive: true })
+    await writeFile(modelMarker(), JSON.stringify({ model: analysisModel, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
     await saveProjectAssets(project)
     return { vocals: { name: path.basename(vocals), path: vocals, data: await readFile(vocals) }, accompaniment: { name: path.basename(accompaniment), path: accompaniment, data: await readFile(accompaniment) } }
   })
