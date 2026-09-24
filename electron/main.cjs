@@ -55,12 +55,38 @@ const managedRuntimeRoot = () => baseRuntimeRoot()
 const managedPythonPath = () => basePythonPath()
 const modelRoot = () => path.join(analysisRoot(), 'models')
 const modelMarker = (modelId = analysisModel) => path.join(modelRoot(), 'demucs', `${modelId}.json`)
+const customModelRegistry = () => path.join(modelRoot(), 'custom', 'registry.json')
 let analysisInstallTask = null
 
+function readCustomModels() {
+  try {
+    const value = JSON.parse(fs.readFileSync(customModelRegistry(), 'utf8'))
+    return Array.isArray(value.models) ? value.models : []
+  } catch { return [] }
+}
+
+async function writeCustomModels(models) {
+  await mkdir(path.dirname(customModelRegistry()), { recursive: true })
+  await writeFile(customModelRegistry(), JSON.stringify({ version: 1, models }, null, 2), 'utf8')
+}
+
 function separationModel(modelId) {
-  const model = separationModelCatalog.find(item => item.id === modelId)
+  const model = [...separationModelCatalog, ...readCustomModels()].find(item => item.id === modelId)
   if (!model) throw new Error('不支持的人声分离模型。')
+  if (model.runnable === false) throw new Error('这个模型已纳入 Pitchord 环境，但当前还没有与它匹配的推理提供者或配置。')
   return model
+}
+
+async function listFilesRecursive(directory) {
+  const result = []
+  let entries = []
+  try { entries = await readdir(directory, { withFileTypes: true }) } catch { return result }
+  for (const entry of entries) {
+    const full = path.join(directory, entry.name)
+    if (entry.isDirectory()) result.push(...await listFilesRecursive(full))
+    else if (entry.isFile()) result.push(path.relative(modelRoot(), full))
+  }
+  return result
 }
 
 function resolveBundledBinary(binaryPath, packageName) {
@@ -170,8 +196,10 @@ async function analysisRuntimeStatus() {
   const models = await Promise.all(separationModelCatalog.map(async model => {
     let ready = false
     try { ready = JSON.parse(await readFile(modelMarker(model.id), 'utf8')).model === model.id } catch { /* not prepared by Pitchord */ }
-    return { ...model, ready }
+    return { ...model, ready, runnable: true, source: 'recommended', canDelete: !model.bundled, provider: 'demucs' }
   }))
+  const customModels = readCustomModels()
+  for (const model of customModels.filter(item => item.kind !== 'pitch')) models.push({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })
   const modelReady = !!models.find(model => model.id === analysisModel)?.ready
   const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
   const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
@@ -189,6 +217,7 @@ async function analysisRuntimeStatus() {
       { id: 'pyin', label: 'pYIN', ready: !!probe?.librosa, description: '概率 YIN 与时间连续性平滑，适合干净纯人声。' },
       { id: 'torchcrepe', label: 'TorchCrepe', ready: !!probe?.torchcrepe, description: '神经网络音高识别，适合复杂唱法和弱基频。' },
       { id: 'rmvpe', label: 'RMVPE', ready: false, description: '人声专用模型；等待可再分发权重和推理环境后加入。' },
+      ...customModels.filter(item => item.kind === 'pitch').map(model => ({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })),
     ],
     alignment: { manual: true, pitchMatching: true, forcedAlignment: false },
     model: analysisModel,
@@ -491,7 +520,7 @@ app.whenReady().then(() => {
     const result = await dialog.showSaveDialog(mainWindow, {
       title: '保存文件',
       defaultPath: safeName,
-      filters: name.endsWith('.lrc') ? [{ name: 'LRC 歌词', extensions: ['lrc'] }] : [{ name: 'Pitchord 项目', extensions: ['json'] }],
+      filters: name.endsWith('.lrc') ? [{ name: 'LRC 歌词', extensions: ['lrc'] }] : name.endsWith('.ass') ? [{ name: 'ASS 字幕', extensions: ['ass'] }] : name.endsWith('.json') ? [{ name: 'JSON 数据', extensions: ['json'] }] : [{ name: '文本文件', extensions: ['txt'] }],
     })
     if (result.canceled || !result.filePath) return false
     await writeFile(result.filePath, content, 'utf8')
@@ -573,6 +602,7 @@ app.whenReady().then(() => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
     const selectedModel = separationModel(requestedModel)
+    if (selectedModel.source === 'custom') return { ...await analysisRuntimeStatus(), busy: false }
     analysisInstallTask = (async () => {
       await requireFreeSpace(1024 * 1024 * 1024, '准备人声分离模型')
       const python = await preferredPythonPath()
@@ -582,6 +612,7 @@ app.whenReady().then(() => {
       sendAnalysisProgress('model', `正在准备 ${selectedModel.label} 人声分离模型…`)
       sendTaskProgress('environment-model', '准备人声分离模型', 'running', `正在准备 ${selectedModel.label}…`)
       const bundledModels = path.join(offlineAnalysisRoot(), 'models')
+      const beforeFiles = new Set(await listFilesRecursive(modelRoot()))
       if (selectedModel.bundled && fs.existsSync(bundledModels)) {
         sendAnalysisProgress('model', '正在从完整版安装人声分离模型…')
         await fs.promises.cp(bundledModels, modelRoot(), { recursive: true, force: true })
@@ -600,7 +631,8 @@ app.whenReady().then(() => {
           },
         })
       }
-      await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source: selectedModel.bundled && fs.existsSync(bundledModels) ? 'offline-bundle' : 'download' }, null, 2), 'utf8')
+      const files = (await listFilesRecursive(modelRoot())).filter(file => !beforeFiles.has(file) && file !== path.relative(modelRoot(), modelMarker(selectedModel.id)))
+      await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source: selectedModel.bundled && fs.existsSync(bundledModels) ? 'offline-bundle' : 'download', files }, null, 2), 'utf8')
       sendAnalysisProgress('complete', '人声分离模型已准备完成。')
       sendTaskProgress('environment-model', '准备人声分离模型', 'success', `${selectedModel.label} 已准备完成`, 1)
       return { ...await analysisRuntimeStatus(), busy: false }
@@ -610,6 +642,73 @@ app.whenReady().then(() => {
       sendTaskProgress('environment-model', '准备人声分离模型', 'error', error instanceof Error ? error.message : String(error))
       throw error
     } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:import-analysis-model', async (event, kind = 'separation') => {
+    if (event.sender !== mainWindow?.webContents || !['separation', 'pitch'].includes(kind)) throw new Error('Invalid model import request')
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: kind === 'separation' ? '选择人声分离模型及配套配置' : '选择音高模型及配套配置',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: '模型与配置', extensions: ['th', 'ckpt', 'pt', 'onnx', 'yaml', 'yml', 'json'] }],
+    })
+    if (picked.canceled || !picked.filePaths.length) return null
+    const digest = createHash('sha256').update(picked.filePaths.join('|')).update(String(Date.now())).digest('hex').slice(0, 10)
+    const id = `custom-${digest}`
+    const directory = path.join(modelRoot(), 'custom', id)
+    await mkdir(directory, { recursive: true })
+    for (const file of picked.filePaths) await fs.promises.copyFile(file, path.join(directory, safeAssetName(path.basename(file))))
+    const names = picked.filePaths.map(file => path.basename(file))
+    const yaml = names.find(name => /\.ya?ml$/i.test(name))
+    const demucsWeights = names.find(name => /\.th$/i.test(name))
+    const checkpoint = names.find(name => /\.ckpt$/i.test(name))
+    const provider = kind === 'separation' && demucsWeights ? 'demucs-local' : checkpoint ? 'msst' : kind === 'pitch' ? 'custom-pitch' : 'unknown'
+    const runnable = provider === 'demucs-local'
+    const modelName = (yaml || demucsWeights || names[0]).replace(/\.[^.]+$/, '').replace(/-[a-f0-9]{8}$/i, '')
+    const model = {
+      id,
+      label: names.length === 1 ? names[0] : `${names[0]} 等 ${names.length} 个文件`,
+      description: runnable ? '用户导入的 Demucs 本地模型；文件已复制到 Pitchord 环境。' : provider === 'msst' ? 'MSST 权重已复制到 Pitchord 环境；需要匹配的模型架构、YAML 配置和 MSST 推理提供者后才能运行。' : '模型文件已复制到 Pitchord 环境；当前版本尚无可识别的推理提供者。',
+      bundled: false,
+      ready: true,
+      runnable,
+      source: 'custom',
+      canDelete: true,
+      provider,
+      kind,
+      modelName,
+      directory,
+      files: names,
+      importedAt: new Date().toISOString(),
+    }
+    const models = readCustomModels().filter(item => item.id !== id)
+    models.push(model)
+    await writeCustomModels(models)
+    return analysisRuntimeStatus()
+  })
+
+  ipcMain.handle('pitchord:remove-analysis-model', async (event, modelId) => {
+    if (event.sender !== mainWindow?.webContents || typeof modelId !== 'string') throw new Error('Invalid model removal request')
+    const custom = readCustomModels()
+    const customEntry = custom.find(model => model.id === modelId)
+    if (customEntry) {
+      const directory = path.resolve(customEntry.directory)
+      const customRoot = path.resolve(modelRoot(), 'custom')
+      if (!directory.startsWith(customRoot + path.sep)) throw new Error('Invalid custom model path')
+      await fs.promises.rm(directory, { recursive: true, force: true })
+      await writeCustomModels(custom.filter(model => model.id !== modelId))
+      return analysisRuntimeStatus()
+    }
+    const model = separationModelCatalog.find(item => item.id === modelId)
+    if (!model) throw new Error('没有找到这个模型。')
+    if (model.bundled) throw new Error('完整包内置的默认模型不能单独删除；可以在“存储与环境”中删除全部模型。')
+    let marker = null
+    try { marker = JSON.parse(await readFile(modelMarker(modelId), 'utf8')) } catch { /* already absent */ }
+    for (const relative of marker?.files || []) {
+      const file = path.resolve(modelRoot(), relative)
+      if (file.startsWith(path.resolve(modelRoot()) + path.sep)) await fs.promises.rm(file, { force: true })
+    }
+    await fs.promises.rm(modelMarker(modelId), { force: true })
+    return analysisRuntimeStatus()
   })
 
   ipcMain.handle('pitchord:open-analysis-folder', async event => {
@@ -756,7 +855,9 @@ app.whenReady().then(() => {
     }
     sendTaskProgress('separation', '人声分离', 'running', `正在使用 ${selectedModel.label} 处理 ${path.basename(source)}…`, 0.03)
     try { await new Promise((resolve, reject) => {
-      const child = spawn(python, [script, source, '--output', workDir, '--model', selectedModel.id], { windowsHide: true, env: childEnv })
+      const args = [script, source, '--output', workDir, '--model', selectedModel.modelName || selectedModel.id]
+      if (selectedModel.provider === 'demucs-local') args.push('--repo', selectedModel.directory)
+      const child = spawn(python, args, { windowsHide: true, env: childEnv })
       let stderr = ''
       const relay = chunk => {
         const output = String(chunk)
@@ -827,6 +928,70 @@ app.whenReady().then(() => {
       return { algorithm, path: output, points: result.points }
     } catch (error) {
       sendTaskProgress('pitch', '连续音高识别', 'error', error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  })
+
+  ipcMain.handle('pitchord:read-analysis-file', async (event, file) => {
+    if (event.sender !== mainWindow?.webContents || typeof file !== 'string') throw new Error('Invalid analysis file request')
+    const project = requireProject()
+    const absolute = path.resolve(file)
+    const analysisDirectory = path.resolve(project.directory, 'analysis')
+    if (!absolute.startsWith(analysisDirectory + path.sep)) throw new Error('只能读取当前工程的分析结果。')
+    return readFile(absolute)
+  })
+
+  ipcMain.handle('pitchord:activate-separation-result', async (event, result) => {
+    if (event.sender !== mainWindow?.webContents || typeof result?.vocals !== 'string' || typeof result?.accompaniment !== 'string') throw new Error('Invalid separation result')
+    const project = requireProject()
+    const analysisDirectory = path.resolve(project.directory, 'analysis')
+    const vocals = path.resolve(result.vocals)
+    const accompaniment = path.resolve(result.accompaniment)
+    if (!vocals.startsWith(analysisDirectory + path.sep) || !accompaniment.startsWith(analysisDirectory + path.sep) || !fs.existsSync(vocals) || !fs.existsSync(accompaniment)) throw new Error('这个分离结果文件已经不存在。')
+    project.assets.vocals = path.relative(project.directory, vocals)
+    project.assets.accompaniment = path.relative(project.directory, accompaniment)
+    await saveProjectAssets(project)
+    return true
+  })
+
+  ipcMain.handle('pitchord:burn-subtitles', async (event, request) => {
+    if (event.sender !== mainWindow?.webContents || typeof request?.ass !== 'string' || request.ass.length > 50_000_000 || typeof request?.outputName !== 'string') throw new Error('Invalid subtitle render request')
+    const project = requireProject()
+    if (!project.assets.media) throw new Error('当前工程没有原始媒体。')
+    const source = projectAssetPath(project, project.assets.media)
+    if (!/\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(source)) throw new Error('嵌入字幕需要视频源；当前工程导入的是音频。')
+    const ffmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
+    if (!ffmpeg || !fs.existsSync(ffmpeg)) throw new Error('当前安装包缺少 FFmpeg，无法嵌入字幕。')
+    const exportsDirectory = path.join(project.directory, 'exports')
+    await mkdir(exportsDirectory, { recursive: true })
+    const base = safeAssetName(request.outputName).replace(/\.(mp4|ass)$/i, '') || 'Pitchord-subtitled'
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const subtitle = path.join(exportsDirectory, `${base}-${stamp}.ass`)
+    const video = path.join(exportsDirectory, `${base}-${stamp}.mp4`)
+    await writeFile(subtitle, request.ass, 'utf8')
+    let projectDuration = 0
+    try { projectDuration = Number(JSON.parse(await readFile(path.join(project.directory, 'project.pitchord.json'), 'utf8')).duration) || 0 } catch { /* progress remains indeterminate */ }
+    const filterPath = subtitle.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '$1\\:').replace(/'/g, "\\'")
+    sendTaskProgress('subtitle-render', '嵌入视频字幕', 'running', '正在启动视频渲染…', 0.01)
+    try {
+      await new Promise((resolve, reject) => {
+        const child = spawn(ffmpeg, ['-y', '-i', source, '-vf', `ass='${filterPath}'`, '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-c:a', 'aac', '-b:a', '192k', '-progress', 'pipe:1', '-nostats', video], { windowsHide: true })
+        let stderr = ''
+        child.stdout.on('data', chunk => {
+          const output = String(chunk)
+          const match = output.match(/out_time_(?:ms|us)=(\d+)/)
+          const seconds = match ? Number(match[1]) / 1_000_000 : 0
+          if (projectDuration > 0 && seconds > 0) sendTaskProgress('subtitle-render', '嵌入视频字幕', 'running', `正在渲染 ${Math.min(projectDuration, seconds).toFixed(1)} / ${projectDuration.toFixed(1)} 秒`, Math.min(0.98, seconds / projectDuration))
+        })
+        child.stderr.on('data', chunk => { stderr += String(chunk) })
+        child.on('error', reject)
+        child.on('close', code => code === 0 ? resolve(undefined) : reject(new Error(stderr.slice(-4000) || `FFmpeg exited with ${code}`)))
+      })
+      sendTaskProgress('subtitle-render', '嵌入视频字幕', 'success', '带字幕视频已保存到工程 exports 文件夹', 1)
+      return { video, subtitle }
+    } catch (error) {
+      await fs.promises.rm(video, { force: true })
+      sendTaskProgress('subtitle-render', '嵌入视频字幕', 'error', error instanceof Error ? error.message : String(error))
       throw error
     }
   })

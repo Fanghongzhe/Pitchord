@@ -9,8 +9,8 @@ type AnalysisRuntimeStatus = {
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; pip: boolean }
   runtimeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
-  separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean }>
-  pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean }>
+  separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
+  pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean }
   model: string
   modelReady: boolean
@@ -44,6 +44,8 @@ declare global {
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
+      importAnalysisModel: (kind: 'separation' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
+      removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
       onAnalysisProgress: (callback: (progress: { stage: string; message: string }) => void) => () => void
       onTaskProgress: (callback: (progress: { id: string; title: string; status: 'running' | 'success' | 'error'; message: string; progress?: number }) => void) => () => void
@@ -60,6 +62,9 @@ declare global {
       openProjectFolder: () => Promise<string>
       separateVocals: (source: { name: string; data: ArrayBuffer; model?: string }) => Promise<{ vocals: { name: string; path: string; data: Uint8Array }; accompaniment: { name: string; path: string; data: Uint8Array } } | null>
       analyzePitch: (algorithm: 'pyin' | 'torchcrepe') => Promise<{ algorithm: string; path: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
+      readAnalysisFile: (file: string) => Promise<Uint8Array>
+      activateSeparationResult: (result: { vocals: string; accompaniment: string }) => Promise<boolean>
+      burnSubtitles: (request: { ass: string; outputName: string }) => Promise<{ video: string; subtitle: string }>
     }
   }
 }

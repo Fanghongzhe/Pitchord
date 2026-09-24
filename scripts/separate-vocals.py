@@ -18,12 +18,14 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path, default=Path("analysis-output"))
     parser.add_argument("--model", default="htdemucs")
+    parser.add_argument("--repo", type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    demucs.separate.main([
-        "--two-stems", "vocals", "-n", args.model,
-        "--out", str(args.output), str(args.input),
-    ])
+    command = ["--two-stems", "vocals", "-n", args.model]
+    if args.repo:
+        command.extend(["--repo", str(args.repo)])
+    command.extend(["--out", str(args.output), str(args.input)])
+    demucs.separate.main(command)
 
 
 if __name__ == "__main__":

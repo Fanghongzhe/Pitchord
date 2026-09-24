@@ -1,7 +1,7 @@
 {
   "name": "pitchord",
   "private": true,
-  "version": "0.2.0-alpha.5",
+  "version": "0.2.0-alpha.6",
   "productName": "Pitchord",
   "description": "本地歌词时间编辑器",
   "author": "Pitchord",
@@ -12,6 +12,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test": "vitest run",
+    "test:subtitles": "node scripts/smoke-subtitles.mjs",
     "preview": "vite preview",
     "desktop:start": "pnpm build && electron .",
     "desktop:bundle": "pnpm build && electron-builder --config build/portable-builder.cjs --dir && node scripts/archive-portable-bundle.mjs",
