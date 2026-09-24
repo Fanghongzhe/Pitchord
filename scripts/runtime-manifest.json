@@ -11,7 +11,23 @@
   "models": [
     {
       "id": "htdemucs",
-      "provider": "demucs"
+      "provider": "demucs",
+      "bundled": true
+    },
+    {
+      "id": "htdemucs_ft",
+      "provider": "demucs",
+      "bundled": false
+    },
+    {
+      "id": "mdx_extra_q",
+      "provider": "demucs",
+      "bundled": false
     }
+  ],
+  "pitchMethods": [
+    { "id": "pyin", "provider": "librosa", "bundled": true },
+    { "id": "torchcrepe", "provider": "torchcrepe", "bundled": true },
+    { "id": "rmvpe", "provider": "pending", "bundled": false }
   ]
 }

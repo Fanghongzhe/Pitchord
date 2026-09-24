@@ -9,12 +9,17 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   removeAnalysisData: target => ipcRenderer.invoke('pitchord:remove-analysis-data', target),
   prepareBaseRuntime: () => ipcRenderer.invoke('pitchord:prepare-base-runtime'),
   installAnalysisRuntime: () => ipcRenderer.invoke('pitchord:install-analysis-runtime'),
-  prepareAnalysisModel: () => ipcRenderer.invoke('pitchord:prepare-analysis-model'),
+  prepareAnalysisModel: model => ipcRenderer.invoke('pitchord:prepare-analysis-model', model),
   openAnalysisFolder: () => ipcRenderer.invoke('pitchord:open-analysis-folder'),
   onAnalysisProgress: callback => {
     const listener = (_event, progress) => callback(progress)
     ipcRenderer.on('pitchord:analysis-progress', listener)
     return () => ipcRenderer.removeListener('pitchord:analysis-progress', listener)
+  },
+  onTaskProgress: callback => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on('pitchord:task-progress', listener)
+    return () => ipcRenderer.removeListener('pitchord:task-progress', listener)
   },
   projectDefaults: () => ipcRenderer.invoke('pitchord:project-defaults'),
   pickProjectParent: () => ipcRenderer.invoke('pitchord:pick-project-parent'),
@@ -27,5 +32,6 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   storeAsset: (kind, name, data) => ipcRenderer.invoke('pitchord:store-asset', { kind, name, data }),
   readProjectAsset: kind => ipcRenderer.invoke('pitchord:read-project-asset', kind),
   openProjectFolder: () => ipcRenderer.invoke('pitchord:open-project-folder'),
-  separateVocals: (source) => ipcRenderer.invoke('pitchord:separate-vocals', source),
+  separateVocals: source => ipcRenderer.invoke('pitchord:separate-vocals', source),
+  analyzePitch: algorithm => ipcRenderer.invoke('pitchord:analyze-pitch', algorithm),
 })

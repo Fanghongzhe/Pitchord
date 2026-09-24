@@ -1,7 +1,7 @@
 {
   "name": "pitchord",
   "private": true,
-  "version": "0.2.0-alpha.4",
+  "version": "0.2.0-alpha.5",
   "productName": "Pitchord",
   "description": "本地歌词时间编辑器",
   "author": "Pitchord",
@@ -35,6 +35,7 @@
         "to": "scripts",
         "filter": [
           "separate-vocals.py",
+          "analyze-pitch.py",
           "analysis-requirements.txt",
           "runtime-manifest.json"
         ]

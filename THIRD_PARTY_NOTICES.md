@@ -1,6 +1,6 @@
 # Third-party runtime notices
 
-Pitchord can download an optional standalone Python runtime when the user starts analysis environment installation.
+Pitchord ships or prepares a private Python analysis environment inside the portable application directory.
 
 ## python-build-standalone
 
@@ -11,7 +11,7 @@ Pitchord can download an optional standalone Python runtime when the user starts
 
 The distribution contains CPython and third-party components under their own licenses. License files shipped inside the downloaded distribution remain with that runtime. CPython is distributed under the Python Software Foundation License Version 2.
 
-The full offline installer also contains the pinned Python packages listed in `scripts/analysis-lock-win-x64.txt` and the htdemucs model cache. Their license metadata and license files remain in the bundled wheels or installed packages.
+The complete portable bundle contains the pinned Python packages listed in `scripts/analysis-lock-win-x64.txt` and the htdemucs model cache. Their license metadata and license files remain in the bundled wheels or installed packages.
 
 ## Main analysis components
 
@@ -19,5 +19,8 @@ The full offline installer also contains the pinned Python packages listed in `s
 - PyTorch 2.14.0: BSD-style license, https://pytorch.org
 - TorchAudio 2.11.0: BSD-style license, https://github.com/pytorch/audio
 - TorchCrepe 0.0.24: MIT License, https://github.com/maxrmorrison/torchcrepe
+- librosa 1.0.0: ISC License, https://github.com/librosa/librosa
+
+Pitchord uses `librosa.pyin` for the pYIN option. The optional RMVPE entry is a capability placeholder only; no RMVPE implementation or model weights are currently distributed.
 
 This notice is a summary. The license texts distributed with each component control its use and redistribution.
