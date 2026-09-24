@@ -29,5 +29,9 @@
     { "id": "pyin", "provider": "librosa", "bundled": true },
     { "id": "torchcrepe", "provider": "torchcrepe", "bundled": true },
     { "id": "rmvpe", "provider": "pending", "bundled": false }
+  ],
+  "alignmentModels": [
+    { "id": "small", "provider": "faster-whisper", "bundled": true },
+    { "id": "base", "provider": "faster-whisper", "bundled": false }
   ]
 }

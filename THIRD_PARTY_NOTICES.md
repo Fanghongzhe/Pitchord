@@ -20,6 +20,12 @@ The complete portable bundle contains the pinned Python packages listed in `scri
 - TorchAudio 2.11.0: BSD-style license, https://github.com/pytorch/audio
 - TorchCrepe 0.0.24: MIT License, https://github.com/maxrmorrison/torchcrepe
 - librosa 1.0.0: ISC License, https://github.com/librosa/librosa
+- faster-whisper 1.2.1: MIT License, https://github.com/SYSTRAN/faster-whisper
+- Music Source Separation Training (MSST): MIT License, https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI
+
+Pitchord includes an inference-only copy of MSST model and utility modules. Imports used only by training and spectrogram drawing are optional in this copy; the upstream license is included at `vendor/msst/LICENSE`.
+
+The lyric timestamp matcher was independently implemented from the alignment approach documented by ComfyUI Audio SRT Aligner (MIT): https://github.com/ahkimkoo/ComfyUI-Audio-Srt-Aligner. Pitchord uses faster-whisper timestamps, monotonic unique-token anchors, sequence matching between anchors, and interpolation for unmatched lyric units.
 
 Pitchord uses `librosa.pyin` for the pYIN option. The optional RMVPE entry is a capability placeholder only; no RMVPE implementation or model weights are currently distributed.
 

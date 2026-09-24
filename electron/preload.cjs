@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   prepareBaseRuntime: () => ipcRenderer.invoke('pitchord:prepare-base-runtime'),
   installAnalysisRuntime: () => ipcRenderer.invoke('pitchord:install-analysis-runtime'),
   prepareAnalysisModel: model => ipcRenderer.invoke('pitchord:prepare-analysis-model', model),
+  prepareAlignmentModel: model => ipcRenderer.invoke('pitchord:prepare-alignment-model', model),
+  removeAlignmentModel: model => ipcRenderer.invoke('pitchord:remove-alignment-model', model),
   importAnalysisModel: kind => ipcRenderer.invoke('pitchord:import-analysis-model', kind),
   removeAnalysisModel: model => ipcRenderer.invoke('pitchord:remove-analysis-model', model),
   openAnalysisFolder: () => ipcRenderer.invoke('pitchord:open-analysis-folder'),
@@ -36,7 +38,9 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   openProjectFolder: () => ipcRenderer.invoke('pitchord:open-project-folder'),
   separateVocals: source => ipcRenderer.invoke('pitchord:separate-vocals', source),
   analyzePitch: algorithm => ipcRenderer.invoke('pitchord:analyze-pitch', algorithm),
+  alignLyrics: request => ipcRenderer.invoke('pitchord:align-lyrics', request),
   readAnalysisFile: file => ipcRenderer.invoke('pitchord:read-analysis-file', file),
   activateSeparationResult: result => ipcRenderer.invoke('pitchord:activate-separation-result', result),
+  activateVocalResult: result => ipcRenderer.invoke('pitchord:activate-vocal-result', result),
   burnSubtitles: request => ipcRenderer.invoke('pitchord:burn-subtitles', request),
 })

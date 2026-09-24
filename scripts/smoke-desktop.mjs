@@ -26,8 +26,12 @@ const result = await new Promise((resolve, reject) => {
         save: typeof window.pitchordDesktop?.saveText,
         analysisStatus: typeof window.pitchordDesktop?.analysisStatus,
         burnSubtitles: typeof window.pitchordDesktop?.burnSubtitles,
+        alignLyrics: typeof window.pitchordDesktop?.alignLyrics,
+        prepareAlignmentModel: typeof window.pitchordDesktop?.prepareAlignmentModel,
         importModel: typeof window.pitchordDesktop?.importAnalysisModel,
         wordSubtitles: document.body.textContent?.includes('字级字幕与视频'),
+        lyricAlignment: document.body.textContent?.includes('歌词时间戳匹配'),
+        appMenu: document.body.textContent?.includes('文件') && document.body.textContent?.includes('设置'),
         analysisCard: document.querySelector('[data-analysis-environment]') !== null,
         media: document.querySelector('input[type="file"][accept="audio/*,video/*"]') !== null })`,
       returnByValue: true,
@@ -36,7 +40,7 @@ const result = await new Promise((resolve, reject) => {
 })
 socket.close()
 const state = JSON.parse(result ?? 'null')
-if (state?.heading !== 'Pitchord' || !state.lines || !state.chars || state.save !== 'function' || state.analysisStatus !== 'function' || state.burnSubtitles !== 'function' || state.importModel !== 'function' || !state.wordSubtitles || !state.analysisCard || !state.media) {
+if (state?.heading !== 'Pitchord' || !state.lines || !state.chars || state.save !== 'function' || state.analysisStatus !== 'function' || state.burnSubtitles !== 'function' || state.alignLyrics !== 'function' || state.prepareAlignmentModel !== 'function' || state.importModel !== 'function' || !state.wordSubtitles || !state.lyricAlignment || !state.appMenu || !state.analysisCard || !state.media) {
   throw new Error(`Desktop UI is incomplete: ${JSON.stringify(state)}`)
 }
 console.log('Desktop UI loaded:', JSON.stringify(state))

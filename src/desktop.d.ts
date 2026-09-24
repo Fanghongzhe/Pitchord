@@ -6,12 +6,12 @@ type AnalysisRuntimeStatus = {
   path: string
   pythonVersion: string
   root: string
-  packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; pip: boolean }
+  packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
   runtimeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
   separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
-  alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean }
+  alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean; models: Array<{ id: string; label: string; description: string; ready: boolean }> }
   model: string
   modelReady: boolean
   runtimeDirectory: string
@@ -44,6 +44,8 @@ declare global {
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
+      prepareAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
+      removeAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
       importAnalysisModel: (kind: 'separation' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
       removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
@@ -62,8 +64,10 @@ declare global {
       openProjectFolder: () => Promise<string>
       separateVocals: (source: { name: string; data: ArrayBuffer; model?: string }) => Promise<{ vocals: { name: string; path: string; data: Uint8Array }; accompaniment: { name: string; path: string; data: Uint8Array } } | null>
       analyzePitch: (algorithm: 'pyin' | 'torchcrepe') => Promise<{ algorithm: string; path: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
+      alignLyrics: (request: { segments: import('./lib/lyrics').LyricSegment[]; duration: number; model: string; language: string; vocals?: string }) => Promise<{ segments: import('./lib/lyrics').LyricSegment[]; coverage: number; matchedTokens: number; referenceTokens: number; recognizedTokens: number; model: string; language?: string; path: string; input: string }>
       readAnalysisFile: (file: string) => Promise<Uint8Array>
       activateSeparationResult: (result: { vocals: string; accompaniment: string }) => Promise<boolean>
+      activateVocalResult: (result: { vocals: string }) => Promise<boolean>
       burnSubtitles: (request: { ass: string; outputName: string }) => Promise<{ video: string; subtitle: string }>
     }
   }

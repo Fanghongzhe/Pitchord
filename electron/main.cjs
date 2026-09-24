@@ -20,6 +20,7 @@ const devUrl = process.env.PITCHORD_DEV_URL
 const appRoot = path.resolve(__dirname, '..')
 const distRoot = path.join(appRoot, 'dist')
 const scriptRoot = app.isPackaged ? path.join(process.resourcesPath, 'scripts') : path.join(appRoot, 'scripts')
+const msstRoot = app.isPackaged ? path.join(process.resourcesPath, 'vendor', 'msst') : path.join(appRoot, 'vendor', 'msst')
 const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPath, 'offline-analysis') : path.join(appRoot, 'offline-analysis')
 let mainWindow
 let activeProject = null
@@ -46,6 +47,10 @@ const separationModelCatalog = [
   { id: 'htdemucs_ft', label: 'HTDemucs FT', description: '微调高质量方案，速度较慢，需要另行准备模型。', bundled: false },
   { id: 'mdx_extra_q', label: 'MDX Extra Q', description: '体积较小、速度较快的量化方案，需要另行准备模型。', bundled: false },
 ]
+const alignmentModelCatalog = [
+  { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。' },
+  { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。' },
+]
 const baseRuntime = runtimeManifest.baseRuntime
 const legacyAnalysisRoot = () => path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'Pitchord')
 const analysisRoot = () => app.isPackaged ? path.join(applicationDirectory(), 'environment') : legacyAnalysisRoot()
@@ -55,13 +60,31 @@ const managedRuntimeRoot = () => baseRuntimeRoot()
 const managedPythonPath = () => basePythonPath()
 const modelRoot = () => path.join(analysisRoot(), 'models')
 const modelMarker = (modelId = analysisModel) => path.join(modelRoot(), 'demucs', `${modelId}.json`)
+const alignmentModelRoot = () => path.join(modelRoot(), 'whisper')
+const alignmentModelDirectory = modelId => path.join(alignmentModelRoot(), modelId)
+const alignmentModelMarker = modelId => path.join(alignmentModelDirectory(modelId), 'pitchord-model.json')
 const customModelRegistry = () => path.join(modelRoot(), 'custom', 'registry.json')
 let analysisInstallTask = null
 
 function readCustomModels() {
   try {
     const value = JSON.parse(fs.readFileSync(customModelRegistry(), 'utf8'))
-    return Array.isArray(value.models) ? value.models : []
+    if (!Array.isArray(value.models)) return []
+    return value.models.map(model => {
+      if (model.provider !== 'msst') return model
+      const files = Array.isArray(model.files) ? model.files : []
+      const checkpointName = files.find(name => /\.ckpt$/i.test(name))
+      const configName = files.find(name => /\.ya?ml$/i.test(name))
+      const modelType = model.modelType || inferMsstModelType(files)
+      const config = model.config || (configName ? path.join(model.directory, configName) : null)
+      return {
+        ...model,
+        modelType,
+        checkpoint: model.checkpoint || (checkpointName ? path.join(model.directory, checkpointName) : null),
+        config,
+        runnable: !!(checkpointName && configName && modelType && config && msstConfigSupportsVocals(config) && fs.existsSync(path.join(msstRoot, 'inference.py'))),
+      }
+    })
   } catch { return [] }
 }
 
@@ -75,6 +98,17 @@ function separationModel(modelId) {
   if (!model) throw new Error('不支持的人声分离模型。')
   if (model.runnable === false) throw new Error('这个模型已纳入 Pitchord 环境，但当前还没有与它匹配的推理提供者或配置。')
   return model
+}
+
+function inferMsstModelType(files) {
+  const names = files.join(' ').toLowerCase()
+  if (/bs[_-]?roformer|model_bs_|bs-resurrection|resurrection/.test(names)) return 'bs_roformer'
+  if (/mel[_-]?band|melband|kimmel|kim\.ckpt|big_beta|inst_v1e|kar_gabox|aspiration|denoise|bleed/.test(names)) return 'mel_band_roformer'
+  return null
+}
+
+function msstConfigSupportsVocals(configPath) {
+  try { return /\bvocals\b/i.test(fs.readFileSync(configPath, 'utf8')) } catch { return false }
 }
 
 async function listFilesRecursive(directory) {
@@ -149,6 +183,9 @@ function analysisEnvironment(pythonPath) {
     PIP_CACHE_DIR: path.join(analysisRoot(), 'cache', 'pip'),
     PYTHONNOUSERSITE: '1',
     PYTHONUTF8: '1',
+    HF_HUB_DISABLE_TELEMETRY: '1',
+    HF_HUB_DISABLE_IMPLICIT_TOKEN: '1',
+    HF_HUB_VERBOSITY: 'error',
     ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
   }
   if (fs.existsSync(modelMarker())) environment.HF_HUB_OFFLINE = '1'
@@ -159,7 +196,8 @@ function offlineBundleAvailable() {
   return fs.existsSync(path.join(offlineAnalysisRoot(), 'manifest.json')) &&
     fs.existsSync(path.join(offlineAnalysisRoot(), 'base-runtime', baseRuntime.archive)) &&
     fs.existsSync(path.join(offlineAnalysisRoot(), 'wheelhouse')) &&
-    fs.existsSync(path.join(offlineAnalysisRoot(), 'models', 'demucs', `${analysisModel}.json`))
+    fs.existsSync(path.join(offlineAnalysisRoot(), 'models', 'demucs', `${analysisModel}.json`)) &&
+    fs.existsSync(path.join(offlineAnalysisRoot(), 'models', 'whisper', 'small', 'model.bin'))
 }
 
 function runProcess(command, args, options = {}) {
@@ -174,11 +212,20 @@ function runProcess(command, args, options = {}) {
   })
 }
 
+function readableModelError(error) {
+  const raw = error instanceof Error ? error.message : String(error)
+  const cleaned = raw.split(/\r?\n/).filter(line => !/unauthenticated requests|HF_TOKEN/i.test(line)).join('\n').trim()
+  if (/429|rate limit|too many requests/i.test(cleaned)) return '模型服务当前限制了下载频率，请稍后重试。Pitchord 不要求填写账号 Token。'
+  if (/401|403|unauthorized|forbidden/i.test(cleaned)) return '模型服务拒绝了本次下载请求，请检查网络后重试。Pitchord 不要求填写账号 Token。'
+  if (/connection|connect|timed?\s*out|network|dns/i.test(cleaned)) return '模型下载连接失败，请检查网络后重试。已经下载的文件会保留并用于续传。'
+  return cleaned || '模型准备失败，请检查网络后重试。'
+}
+
 async function probePython(pythonPath) {
   if (!pythonPath || (!fs.existsSync(pythonPath) && path.isAbsolute(pythonPath))) return null
   const program = [
     'import json, platform, importlib.util',
-    "print(json.dumps({'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'pip': bool(importlib.util.find_spec('pip'))}))",
+    "print(json.dumps({'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'fasterWhisper': bool(importlib.util.find_spec('faster_whisper')), 'pip': bool(importlib.util.find_spec('pip'))}))",
   ].join(';')
   try {
     const result = await runProcess(pythonPath, ['-c', program], { env: analysisEnvironment(pythonPath) })
@@ -203,13 +250,17 @@ async function analysisRuntimeStatus() {
   const modelReady = !!models.find(model => model.id === analysisModel)?.ready
   const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
   const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
+  const alignmentModels = alignmentModelCatalog.map(model => ({
+    ...model,
+    ready: fs.existsSync(alignmentModelMarker(model.id)) && fs.existsSync(path.join(alignmentModelDirectory(model.id), 'model.bin')),
+  }))
   return {
     runtimeVersion: analysisRuntimeVersion,
     source,
     path: probe?.path || selectedPath || '',
     pythonVersion: probe?.version || '',
     root: analysisRoot(),
-    packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, librosa: !!probe?.librosa, pip: !!probe?.pip },
+    packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, librosa: !!probe?.librosa, fasterWhisper: !!probe?.fasterWhisper, pip: !!probe?.pip },
     runtimeReady: !!(probe?.demucs && probe?.torchcrepe && probe?.librosa),
     mediaTools: { ffmpeg: !!(bundledFfmpeg && fs.existsSync(bundledFfmpeg)), ffprobe: !!(bundledFfprobe && fs.existsSync(bundledFfprobe)) },
     separationModels: models,
@@ -219,7 +270,7 @@ async function analysisRuntimeStatus() {
       { id: 'rmvpe', label: 'RMVPE', ready: false, description: '人声专用模型；等待可再分发权重和推理环境后加入。' },
       ...customModels.filter(item => item.kind === 'pitch').map(model => ({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })),
     ],
-    alignment: { manual: true, pitchMatching: true, forcedAlignment: false },
+    alignment: { manual: true, pitchMatching: true, forcedAlignment: !!probe?.fasterWhisper && alignmentModels.some(model => model.ready), models: alignmentModels },
     model: analysisModel,
     modelReady,
     runtimeDirectory: managedRuntimeRoot(),
@@ -589,7 +640,7 @@ app.whenReady().then(() => {
         },
       })
       const probe = await probePython(python)
-      if (!probe?.demucs || !probe?.torchcrepe || !probe?.librosa) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
+      if (!probe?.demucs || !probe?.torchcrepe || !probe?.librosa || !probe?.fasterWhisper) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
       await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify({ version: analysisRuntimeVersion, createdAt: new Date().toISOString(), python }, null, 2), 'utf8')
       await preferManagedRuntime()
       sendAnalysisProgress('complete', '分析环境已准备完成。')
@@ -624,7 +675,7 @@ app.whenReady().then(() => {
           env: downloadEnvironment,
           onOutput: output => {
             const line = output.trim().split(/\r?\n/).at(-1)
-            if (line) {
+            if (line && !/unauthenticated requests|HF_TOKEN/i.test(line)) {
               sendAnalysisProgress('model', line.slice(0, 240))
               sendTaskProgress('environment-model', '准备人声分离模型', 'running', line.slice(0, 240))
             }
@@ -639,9 +690,61 @@ app.whenReady().then(() => {
     })()
     try { return await analysisInstallTask }
     catch (error) {
-      sendTaskProgress('environment-model', '准备人声分离模型', 'error', error instanceof Error ? error.message : String(error))
-      throw error
+      const message = readableModelError(error)
+      sendTaskProgress('environment-model', '准备人声分离模型', 'error', message)
+      throw new Error(message)
     } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:prepare-alignment-model', async (event, requestedModel = 'small') => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
+    const selectedModel = alignmentModelCatalog.find(model => model.id === requestedModel)
+    if (!selectedModel) throw new Error('不支持的歌词对齐模型。')
+    analysisInstallTask = (async () => {
+      await requireFreeSpace(requestedModel === 'small' ? 1024 * 1024 * 1024 : 512 * 1024 * 1024, '准备歌词对齐模型')
+      const python = await preferredPythonPath()
+      const probe = await probePython(python)
+      if (!python || !probe?.fasterWhisper) throw new Error('歌词对齐组件尚未安装，请先检查或修复分析环境。')
+      const output = alignmentModelDirectory(requestedModel)
+      await mkdir(output, { recursive: true })
+      const environment = analysisEnvironment(python)
+      delete environment.HF_HUB_OFFLINE
+      sendAnalysisProgress('alignment-model', `正在准备 ${selectedModel.label}…`)
+      sendTaskProgress('alignment-model', '准备歌词对齐模型', 'running', `正在下载 ${selectedModel.label} 到 Pitchord/environment/models…`, 0.02)
+      await runProcess(python, [path.join(scriptRoot, 'prepare-aligner.py'), '--model', requestedModel, '--output', output], {
+        env: environment,
+        onOutput: outputText => {
+          for (const line of outputText.split(/\r?\n/)) {
+            if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
+            const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
+            const message = progress?.[2] || line.slice(-240)
+            sendAnalysisProgress('alignment-model', message)
+            sendTaskProgress('alignment-model', '准备歌词对齐模型', 'running', message, progress ? Number(progress[1]) : undefined)
+          }
+        },
+      })
+      if (!fs.existsSync(path.join(output, 'model.bin'))) throw new Error('下载结束，但没有找到完整的歌词对齐模型文件。')
+      await writeFile(alignmentModelMarker(requestedModel), JSON.stringify({ model: requestedModel, provider: 'faster-whisper', preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      sendTaskProgress('alignment-model', '准备歌词对齐模型', 'success', `${selectedModel.label} 已准备完成`, 1)
+      sendAnalysisProgress('complete', '歌词对齐模型已准备完成。')
+      return { ...await analysisRuntimeStatus(), busy: false }
+    })()
+    try { return await analysisInstallTask }
+    catch (error) {
+      const message = readableModelError(error)
+      sendTaskProgress('alignment-model', '准备歌词对齐模型', 'error', message)
+      throw new Error(message)
+    } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:remove-alignment-model', async (event, modelId) => {
+    if (event.sender !== mainWindow?.webContents || !alignmentModelCatalog.some(model => model.id === modelId)) throw new Error('Invalid alignment model removal request')
+    const directory = path.resolve(alignmentModelDirectory(modelId))
+    const root = path.resolve(alignmentModelRoot())
+    if (!directory.startsWith(root + path.sep)) throw new Error('Invalid alignment model path')
+    await fs.promises.rm(directory, { recursive: true, force: true })
+    return analysisRuntimeStatus()
   })
 
   ipcMain.handle('pitchord:import-analysis-model', async (event, kind = 'separation') => {
@@ -662,12 +765,15 @@ app.whenReady().then(() => {
     const demucsWeights = names.find(name => /\.th$/i.test(name))
     const checkpoint = names.find(name => /\.ckpt$/i.test(name))
     const provider = kind === 'separation' && demucsWeights ? 'demucs-local' : checkpoint ? 'msst' : kind === 'pitch' ? 'custom-pitch' : 'unknown'
-    const runnable = provider === 'demucs-local'
+    const modelType = provider === 'msst' ? inferMsstModelType(names) : null
+    const copiedConfig = yaml ? path.join(directory, safeAssetName(yaml)) : null
+    const supportsVocals = !!copiedConfig && msstConfigSupportsVocals(copiedConfig)
+    const runnable = provider === 'demucs-local' || (provider === 'msst' && !!yaml && !!modelType && supportsVocals && fs.existsSync(path.join(msstRoot, 'inference.py')))
     const modelName = (yaml || demucsWeights || names[0]).replace(/\.[^.]+$/, '').replace(/-[a-f0-9]{8}$/i, '')
     const model = {
       id,
       label: names.length === 1 ? names[0] : `${names[0]} 等 ${names.length} 个文件`,
-      description: runnable ? '用户导入的 Demucs 本地模型；文件已复制到 Pitchord 环境。' : provider === 'msst' ? 'MSST 权重已复制到 Pitchord 环境；需要匹配的模型架构、YAML 配置和 MSST 推理提供者后才能运行。' : '模型文件已复制到 Pitchord 环境；当前版本尚无可识别的推理提供者。',
+      description: provider === 'msst' && runnable ? `用户导入的 MSST ${modelType} 人声模型；权重与 YAML 已复制到 Pitchord 环境。` : runnable ? '用户导入的 Demucs 本地模型；文件已复制到 Pitchord 环境。' : provider === 'msst' && yaml && modelType && !supportsVocals ? '这个 MSST 配置不包含 vocals 输出，不能用于 Pitchord 的人声分离步骤。' : provider === 'msst' ? 'MSST 权重已复制到 Pitchord 环境；还需要配套 YAML，且文件名需能识别 MelBandRoformer 或 BSRoformer 架构。' : '模型文件已复制到 Pitchord 环境；当前版本尚无可识别的推理提供者。',
       bundled: false,
       ready: true,
       runnable,
@@ -676,6 +782,9 @@ app.whenReady().then(() => {
       provider,
       kind,
       modelName,
+      modelType,
+      checkpoint: checkpoint ? path.join(directory, safeAssetName(checkpoint)) : null,
+      config: copiedConfig,
       directory,
       files: names,
       importedAt: new Date().toISOString(),
@@ -855,8 +964,26 @@ app.whenReady().then(() => {
     }
     sendTaskProgress('separation', '人声分离', 'running', `正在使用 ${selectedModel.label} 处理 ${path.basename(source)}…`, 0.03)
     try { await new Promise((resolve, reject) => {
-      const args = [script, source, '--output', workDir, '--model', selectedModel.modelName || selectedModel.id]
-      if (selectedModel.provider === 'demucs-local') args.push('--repo', selectedModel.directory)
+      let args
+      if (selectedModel.provider === 'msst') {
+        const inputDirectory = path.join(workDir, 'input')
+        fs.mkdirSync(inputDirectory, { recursive: true })
+        fs.copyFileSync(source, path.join(inputDirectory, safeAssetName(path.basename(source))))
+        args = [
+          path.join(msstRoot, 'inference.py'),
+          '--model_type', selectedModel.modelType,
+          '--config_path', selectedModel.config,
+          '--start_check_point', selectedModel.checkpoint,
+          '--input_folder', inputDirectory,
+          '--store_dir', workDir,
+          '--extract_instrumental',
+          '--force_cpu',
+          '--disable_detailed_pbar',
+        ]
+      } else {
+        args = [script, source, '--output', workDir, '--model', selectedModel.modelName || selectedModel.id]
+        if (selectedModel.provider === 'demucs-local') args.push('--repo', selectedModel.directory)
+      }
       const child = spawn(python, args, { windowsHide: true, env: childEnv })
       let stderr = ''
       const relay = chunk => {
@@ -872,9 +999,9 @@ app.whenReady().then(() => {
       child.on('close', code => {
         if (code === 0) return resolve(undefined)
         const detail = stderr.slice(-3000)
-        if (/No module named ['"]demucs['"]/.test(detail)) return reject(new Error('当前分析环境缺少 Demucs。请先使用“修复分析环境”。'))
+        if (/No module named ['"](?:demucs|omegaconf|ml_collections|beartype|rotary_embedding_torch)['"]/.test(detail)) return reject(new Error('当前分析环境缺少所选分离模型需要的推理组件，请先使用“检查或修复环境”。'))
         if (/ffmpeg|ffprobe/i.test(detail)) return reject(new Error('处理视频需要 FFmpeg，但当前运行环境无法使用它。请重新安装包含 FFmpeg 的桌面版本。'))
-        if (/checkpoint|download|connection|model/i.test(detail)) return reject(new Error(`Demucs 模型或下载失败：${detail}`))
+        if (/checkpoint|download|connection|model/i.test(detail)) return reject(new Error(`分离模型加载或下载失败：${detail}`))
         reject(new Error(detail || `Demucs exited with ${code}`))
       })
     }) } catch (error) {
@@ -889,9 +1016,14 @@ app.whenReady().then(() => {
       }
       return null
     }
-    const vocals = await findVocals(workDir, 'vocals.wav')
-    const accompaniment = await findVocals(workDir, 'no_vocals.wav')
-    if (!vocals || !accompaniment) throw new Error('Demucs did not produce vocals.wav and no_vocals.wav')
+    const generatedVocals = await findVocals(workDir, 'vocals.wav')
+    const generatedAccompaniment = await findVocals(workDir, selectedModel.provider === 'msst' ? 'instrumental.wav' : 'no_vocals.wav')
+    if (!generatedVocals || !generatedAccompaniment) throw new Error('人声分离没有生成预期的纯人声与纯伴奏文件。')
+    const resultSuffix = safeAssetName(selectedModel.id).replace(/\.[^.]+$/, '')
+    const vocals = path.join(workDir, `vocals-${resultSuffix}.wav`)
+    const accompaniment = path.join(workDir, `accompaniment-${resultSuffix}.wav`)
+    await fs.promises.rename(generatedVocals, vocals)
+    await fs.promises.rename(generatedAccompaniment, accompaniment)
     project.assets.vocals = path.relative(project.directory, vocals)
     project.assets.accompaniment = path.relative(project.directory, accompaniment)
     await mkdir(path.dirname(modelMarker(selectedModel.id)), { recursive: true })
@@ -932,6 +1064,53 @@ app.whenReady().then(() => {
     }
   })
 
+  ipcMain.handle('pitchord:align-lyrics', async (event, request) => {
+    if (event.sender !== mainWindow?.webContents || !request || !Array.isArray(request.segments) || !Number.isFinite(request.duration)) throw new Error('Invalid lyric alignment request')
+    const selectedModel = alignmentModelCatalog.find(model => model.id === (request.model || 'small'))
+    if (!selectedModel) throw new Error('不支持的歌词对齐模型。')
+    if (!fs.existsSync(alignmentModelMarker(selectedModel.id))) throw new Error(`请先在模型管理中准备 ${selectedModel.label}。`)
+    const project = requireProject()
+    const analysisDirectory = path.resolve(project.directory, 'analysis')
+    let vocals = request.vocals ? path.resolve(request.vocals) : project.assets.vocals ? projectAssetPath(project, project.assets.vocals) : ''
+    if (!vocals || !fs.existsSync(vocals)) throw new Error('请选择一条仍然存在的纯人声分离结果。')
+    if (!vocals.startsWith(analysisDirectory + path.sep)) throw new Error('歌词对齐只能读取当前工程的纯人声结果。')
+    const suffix = `${selectedModel.id}-${new Date().toISOString().replace(/[:.]/g, '-')}`
+    const input = path.join(analysisDirectory, `alignment-input-${suffix}.json`)
+    const output = path.join(analysisDirectory, `lyrics-alignment-${suffix}.json`)
+    await writeFile(input, JSON.stringify({ segments: request.segments, duration: request.duration }, null, 2), 'utf8')
+    const python = await preferredPythonPath()
+    const probe = await probePython(python)
+    if (!python || !probe?.fasterWhisper) throw new Error('歌词对齐组件尚未安装，请先检查或修复分析环境。')
+    sendTaskProgress('alignment', '歌词时间戳匹配', 'running', `正在使用 ${selectedModel.label} 识别人声音轨…`, 0.02)
+    try {
+      await runProcess(python, [
+        path.join(scriptRoot, 'align-lyrics.py'), vocals,
+        '--lyrics', input,
+        '--output', output,
+        '--model', selectedModel.id,
+        '--language', typeof request.language === 'string' ? request.language : 'zh',
+        '--model-root', alignmentModelRoot(),
+      ], {
+        env: analysisEnvironment(python),
+        onOutput: outputText => {
+          for (const line of outputText.split(/\r?\n/)) {
+            if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
+            const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
+            if (progress) sendTaskProgress('alignment', '歌词时间戳匹配', 'running', progress[2], Number(progress[1]))
+          }
+        },
+      })
+      const result = JSON.parse(await readFile(output, 'utf8'))
+      if (!Array.isArray(result.segments) || !Number.isFinite(result.coverage)) throw new Error('歌词对齐结果格式无效。')
+      sendTaskProgress('alignment', '歌词时间戳匹配', 'success', `匹配完成，歌词覆盖率 ${Math.round(result.coverage * 100)}%`, 1)
+      return { ...result, path: output, input: vocals }
+    } catch (error) {
+      const message = readableModelError(error)
+      sendTaskProgress('alignment', '歌词时间戳匹配', 'error', message)
+      throw new Error(message)
+    }
+  })
+
   ipcMain.handle('pitchord:read-analysis-file', async (event, file) => {
     if (event.sender !== mainWindow?.webContents || typeof file !== 'string') throw new Error('Invalid analysis file request')
     const project = requireProject()
@@ -950,6 +1129,17 @@ app.whenReady().then(() => {
     if (!vocals.startsWith(analysisDirectory + path.sep) || !accompaniment.startsWith(analysisDirectory + path.sep) || !fs.existsSync(vocals) || !fs.existsSync(accompaniment)) throw new Error('这个分离结果文件已经不存在。')
     project.assets.vocals = path.relative(project.directory, vocals)
     project.assets.accompaniment = path.relative(project.directory, accompaniment)
+    await saveProjectAssets(project)
+    return true
+  })
+
+  ipcMain.handle('pitchord:activate-vocal-result', async (event, result) => {
+    if (event.sender !== mainWindow?.webContents || typeof result?.vocals !== 'string') throw new Error('Invalid vocal result')
+    const project = requireProject()
+    const analysisDirectory = path.resolve(project.directory, 'analysis')
+    const vocals = path.resolve(result.vocals)
+    if (!vocals.startsWith(analysisDirectory + path.sep) || !fs.existsSync(vocals)) throw new Error('这个纯人声结果文件已经不存在。')
+    project.assets.vocals = path.relative(project.directory, vocals)
     await saveProjectAssets(project)
     return true
   })

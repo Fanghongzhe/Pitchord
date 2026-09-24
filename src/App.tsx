@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Slider } from '@/components/ui/slider'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Timeline } from '@/components/Timeline'
 import {
   clamp, createSegment, formatTime, getAdjacentSelection, lyricUnits, mergeSegments,
@@ -31,7 +32,8 @@ type History = { present: LyricSegment[]; past: LyricSegment[][]; future: LyricS
 type View = 'lines' | 'chars'
 type SeparationResult = { id: string; modelId: string; modelLabel: string; createdAt: string; vocals: string; accompaniment: string }
 type PitchResult = { id: string; algorithm: PitchAlgorithm; label: string; createdAt: string; path?: string; points: PitchPoint[]; separationResultId?: string }
-type Draft = { segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string }
+type AlignmentResult = { id: string; modelId: string; modelLabel: string; createdAt: string; inputResultId?: string; path?: string; coverage: number; segments: LyricSegment[] }
+type Draft = { segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; activeVocalResultId?: string; activeAccompanimentResultId?: string; pitchInputResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string; alignmentInputResultId?: string; alignmentResults?: AlignmentResult[]; activeAlignmentResultId?: string }
 type TrackKind = 'original' | 'vocals' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
 type ContextState = { x: number; y: number; id?: string; time?: number }
@@ -41,12 +43,12 @@ type AnalysisEnvironment = {
   path: string
   pythonVersion: string
   root: string
-  packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; pip: boolean }
+  packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
   runtimeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
   separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
-  alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean }
+  alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean; models: Array<{ id: string; label: string; description: string; ready: boolean }> }
   model: string
   modelReady: boolean
   runtimeDirectory: string
@@ -166,10 +168,20 @@ export default function App() {
   const [pitchAlgorithm, setPitchAlgorithm] = useState<PitchAlgorithm>('pyin')
   const [separationResults, setSeparationResults] = useState<SeparationResult[]>(savedDraft?.separationResults ?? [])
   const [activeSeparationResultId, setActiveSeparationResultId] = useState(savedDraft?.activeSeparationResultId ?? '')
+  const [activeVocalResultId, setActiveVocalResultId] = useState(savedDraft?.activeVocalResultId ?? savedDraft?.activeSeparationResultId ?? '')
+  const [activeAccompanimentResultId, setActiveAccompanimentResultId] = useState(savedDraft?.activeAccompanimentResultId ?? savedDraft?.activeSeparationResultId ?? '')
+  const [pitchInputResultId, setPitchInputResultId] = useState(savedDraft?.pitchInputResultId ?? savedDraft?.activeVocalResultId ?? savedDraft?.activeSeparationResultId ?? '')
   const [pitchResults, setPitchResults] = useState<PitchResult[]>(savedDraft?.pitchResults ?? [])
   const [activePitchResultId, setActivePitchResultId] = useState(savedDraft?.activePitchResultId ?? '')
+  const [alignmentModel, setAlignmentModel] = useState('small')
+  const [alignmentLanguage, setAlignmentLanguage] = useState('zh')
+  const [alignmentInputResultId, setAlignmentInputResultId] = useState(savedDraft?.alignmentInputResultId ?? savedDraft?.pitchInputResultId ?? savedDraft?.activeVocalResultId ?? '')
+  const [alignmentResults, setAlignmentResults] = useState<AlignmentResult[]>(savedDraft?.alignmentResults ?? [])
+  const [activeAlignmentResultId, setActiveAlignmentResultId] = useState(savedDraft?.activeAlignmentResultId ?? '')
+  const [alignmentStatus, setAlignmentStatus] = useState('尚未匹配')
   const [subtitleOpen, setSubtitleOpen] = useState(false)
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(defaultSubtitleStyle)
+  const [rerunPrompt, setRerunPrompt] = useState<'separation' | 'pitch' | 'alignment' | null>(null)
   const [workItems, setWorkItems] = useState<WorkItem[]>([])
   const [workCenterOpen, setWorkCenterOpen] = useState(false)
   const [zoom, setZoom] = useState(85)
@@ -181,7 +193,6 @@ export default function App() {
   const [projectName, setProjectName] = useState('')
   const [projectParent, setProjectParent] = useState('')
   const [newProjectName, setNewProjectName] = useState('')
-  const [separationFiles, setSeparationFiles] = useState<{ vocals: string; accompaniment: string } | null>(null)
   const [splitTimeDraft, setSplitTimeDraft] = useState('')
   const [splitOffset, setSplitOffset] = useState('')
   const [textDraft, setTextDraft] = useState('')
@@ -314,7 +325,7 @@ export default function App() {
     void window.pitchordDesktop.analysisStatus().then(status => {
       setAnalysisEnvironment(status)
       setAnalysisProgress(status.runtimeReady ? '分析环境可用' : '分析环境尚未准备完整')
-      const readyCount = [status.mediaTools.ffmpeg && status.mediaTools.ffprobe, status.separationModels.some(model => model.ready), status.pitchMethods.some(method => method.ready), status.alignment.manual && status.alignment.pitchMatching].filter(Boolean).length
+      const readyCount = [status.mediaTools.ffmpeg && status.mediaTools.ffprobe, status.separationModels.some(model => model.ready), status.pitchMethods.some(method => method.ready), status.alignment.forcedAlignment].filter(Boolean).length
       updateWork('environment-check', '分析环境检测', status.runtimeReady && readyCount >= 4 ? 'success' : 'error', `已完成 4 类检查，${readyCount} 类可用`, 1)
     }).catch(error => {
       setAnalysisProgress('无法检查分析环境')
@@ -335,16 +346,16 @@ export default function App() {
   useEffect(() => () => { if (mediaUrl) URL.revokeObjectURL(mediaUrl) }, [mediaUrl])
   useEffect(() => () => { void mixerRef.current?.close() }, [])
   useEffect(() => {
-    if (mediaName && duration) localStorage.setItem('pitchord.draft.v1', JSON.stringify({ segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, pitchResults, activePitchResultId }))
-  }, [segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, pitchResults, activePitchResultId])
+    if (mediaName && duration) localStorage.setItem('pitchord.draft.v1', JSON.stringify({ segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId }))
+  }, [segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId])
 
   useEffect(() => {
     if (!projectDirectory || !window.pitchordDesktop) return
     const timer = window.setTimeout(() => {
-      void window.pitchordDesktop?.saveProject(JSON.stringify({ version: 1, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, pitchResults, activePitchResultId })).catch(error => setNotice(`工程自动保存失败：${error instanceof Error ? error.message : String(error)}`))
+      void window.pitchordDesktop?.saveProject(JSON.stringify({ version: 1, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId })).catch(error => setNotice(`工程自动保存失败：${error instanceof Error ? error.message : String(error)}`))
     }, 600)
     return () => window.clearTimeout(timer)
-  }, [projectDirectory, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, pitchResults, activePitchResultId])
+  }, [projectDirectory, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId])
 
   const loadMedia = async (file: File, persist = true) => {
     if (!file.type.startsWith('audio/') && !file.type.startsWith('video/')) { setNotice('请选择音频或视频文件。'); updateWork('media-import', '导入媒体', 'error', '文件不是可识别的音频或视频'); return }
@@ -375,7 +386,6 @@ export default function App() {
     setPitchPoints([])
     setPitchStatus('尚未分析音高')
     setSeparationStatus('未运行')
-    setSeparationFiles(null)
     audioBufferRef.current = null
     setAudioReady(false)
     setVocalTrackReady(false)
@@ -383,8 +393,15 @@ export default function App() {
     if (!reconnect) {
       setSeparationResults([])
       setActiveSeparationResultId('')
+      setActiveVocalResultId('')
+      setActiveAccompanimentResultId('')
+      setPitchInputResultId('')
       setPitchResults([])
       setActivePitchResultId('')
+      setAlignmentInputResultId('')
+      setAlignmentResults([])
+      setActiveAlignmentResultId('')
+      setAlignmentStatus('尚未匹配')
       setHistory({ present: [], past: [], future: [] })
       setSelectedLineIds([])
       setSelectedCharIds([])
@@ -452,7 +469,7 @@ export default function App() {
       const result: PitchResult = {
         id: crypto.randomUUID(), algorithm: pitchAlgorithm, label: algorithmLabel,
         createdAt: new Date().toISOString(), path: desktopResult?.path, points,
-        separationResultId: activeSeparationResultId || undefined,
+        separationResultId: pitchInputResultId || undefined,
       }
       setPitchResults(current => [result, ...current])
       setActivePitchResultId(result.id)
@@ -468,6 +485,7 @@ export default function App() {
   }
   const requestPitchAnalysis = () => {
     if (!vocalTrackReady) { if (window.pitchordDesktop?.separateVocals) setSeparationPromptOpen(true); else setNotice('请先导入纯人声轨。'); return }
+    if (pitchResults.length && !pitchResults.some(result => result.algorithm === pitchAlgorithm)) { setRerunPrompt('pitch'); return }
     void analyzePitch()
   }
 
@@ -520,9 +538,12 @@ export default function App() {
       }
       setSeparationResults(current => [savedResult, ...current])
       setActiveSeparationResultId(savedResult.id)
+      setActiveVocalResultId(savedResult.id)
+      setActiveAccompanimentResultId(savedResult.id)
+      setPitchInputResultId(savedResult.id)
+      setAlignmentInputResultId(savedResult.id)
       setTrackEnabled({ original: false, vocals: true, accompaniment: false })
       setSeparationStatus(`${selectedSeparationModel?.label || separationModel} 已生成纯人声和纯伴奏`)
-      setSeparationFiles({ vocals: result.vocals.path, accompaniment: result.accompaniment.path })
       void window.pitchordDesktop.analysisStatus().then(setAnalysisEnvironment)
     } catch (error) {
       setSeparationStatus('运行失败')
@@ -531,25 +552,40 @@ export default function App() {
     }
   }
 
-  const selectSeparationResult = async (id: string) => {
+  const requestSeparation = () => {
+    if (separationResults.length && !separationResults.some(result => result.modelId === separationModel)) { setRerunPrompt('separation'); return }
+    void runSeparation()
+  }
+
+  const selectStemResult = async (kind: 'vocals' | 'accompaniment', id: string, useForPitch = false) => {
     const result = separationResults.find(item => item.id === id)
     if (!result || !window.pitchordDesktop?.readAnalysisFile) return
     try {
-      const [vocalData, accompanimentData] = await Promise.all([
-        window.pitchordDesktop.readAnalysisFile(result.vocals),
-        window.pitchordDesktop.readAnalysisFile(result.accompaniment),
-      ])
-      const vocalBytes = new Uint8Array(vocalData.byteLength); vocalBytes.set(vocalData)
-      const accompanimentBytes = new Uint8Array(accompanimentData.byteLength); accompanimentBytes.set(accompanimentData)
-      await loadVocalTrack(new File([vocalBytes.buffer], result.vocals.split(/[\\/]/).at(-1) || 'vocals.wav', { type: 'audio/wav' }), false, false)
-      await loadAccompanimentTrack(new File([accompanimentBytes.buffer], result.accompaniment.split(/[\\/]/).at(-1) || 'accompaniment.wav', { type: 'audio/wav' }), false)
-      await window.pitchordDesktop.activateSeparationResult({ vocals: result.vocals, accompaniment: result.accompaniment })
-      setActiveSeparationResultId(id)
-      setSeparationFiles({ vocals: result.vocals, accompaniment: result.accompaniment })
-      setTrackEnabled({ original: false, vocals: true, accompaniment: false })
-      setSeparationStatus(`当前使用 ${result.modelLabel} 的分离结果`)
-      setNotice('已切换人声和伴奏结果；之后的音高识别会使用这条纯人声轨。')
+      const file = kind === 'vocals' ? result.vocals : result.accompaniment
+      const data = await window.pitchordDesktop.readAnalysisFile(file)
+      const bytes = new Uint8Array(data.byteLength); bytes.set(data)
+      if (kind === 'vocals') {
+        await loadVocalTrack(new File([bytes.buffer], file.split(/[\\/]/).at(-1) || 'vocals.wav', { type: 'audio/wav' }), false, false)
+        setActiveVocalResultId(id)
+        if (useForPitch) setPitchInputResultId(id)
+        await window.pitchordDesktop.activateVocalResult({ vocals: result.vocals })
+      } else {
+        await loadAccompanimentTrack(new File([bytes.buffer], file.split(/[\\/]/).at(-1) || 'accompaniment.wav', { type: 'audio/wav' }), false)
+        setActiveAccompanimentResultId(id)
+      }
+      setActiveSeparationResultId(kind === 'vocals' ? id : activeSeparationResultId)
+      setSeparationStatus(`已为${kind === 'vocals' ? '纯人声' : '纯伴奏'}选择 ${result.modelLabel}`)
+      setNotice(kind === 'vocals' && useForPitch ? '已切换音高识别输入和纯人声试听轨。' : `已切换${kind === 'vocals' ? '纯人声' : '纯伴奏'}试听结果。`)
     } catch (error) { setNotice(`切换分离结果失败：${error instanceof Error ? error.message : String(error)}`) }
+  }
+
+  const selectPitchInput = async (id: string) => {
+    await selectStemResult('vocals', id, true)
+  }
+
+  const selectAlignmentInput = async (id: string) => {
+    setAlignmentInputResultId(id)
+    await selectStemResult('vocals', id)
   }
 
   const selectPitchResult = (id: string) => {
@@ -559,6 +595,48 @@ export default function App() {
     setPitchPoints(result.points)
     setPitchStatus(`当前使用 ${result.label} 的 ${result.points.length} 个音高时间点`)
     setNotice('已切换音高识别结果，字级匹配和字幕将立即使用该结果。')
+  }
+
+  const runLyricAlignment = async () => {
+    if (!window.pitchordDesktop?.alignLyrics || !projectDirectory) { setNotice('歌词时间戳匹配需要先创建工程并使用桌面版。'); return }
+    if (!segments.length) { setNotice('请先导入或粘贴歌词。'); return }
+    const input = separationResults.find(result => result.id === alignmentInputResultId)
+    if (!input) { setNotice('请选择歌词匹配所用的纯人声结果。'); return }
+    setAlignmentStatus('正在识别人声并匹配歌词…')
+    updateWork('alignment', '歌词时间戳匹配', 'running', '正在准备带字词时间戳的语音识别…', 0.01)
+    try {
+      const result = await window.pitchordDesktop.alignLyrics({ segments, duration, model: alignmentModel, language: alignmentLanguage, vocals: input.vocals })
+      const modelLabel = analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel
+      const saved: AlignmentResult = {
+        id: crypto.randomUUID(), modelId: alignmentModel, modelLabel, createdAt: new Date().toISOString(),
+        inputResultId: alignmentInputResultId, path: result.path, coverage: result.coverage, segments: result.segments,
+      }
+      setAlignmentResults(current => [saved, ...current])
+      setActiveAlignmentResultId(saved.id)
+      commit(result.segments)
+      setSelectedLineIds([])
+      setSelectedCharIds([])
+      setAlignmentStatus(`${modelLabel} 已匹配，覆盖率 ${Math.round(result.coverage * 100)}%`)
+      setNotice('歌词时间建议已应用到句级和字级时间块。可立即人工复核；撤回会恢复应用前的时间。')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setAlignmentStatus(`匹配失败：${message}`)
+      updateWork('alignment', '歌词时间戳匹配', 'error', message)
+    }
+  }
+
+  const requestLyricAlignment = () => {
+    if (alignmentResults.length && !alignmentResults.some(result => result.modelId === alignmentModel)) { setRerunPrompt('alignment'); return }
+    void runLyricAlignment()
+  }
+
+  const selectAlignmentResult = (id: string) => {
+    const result = alignmentResults.find(item => item.id === id)
+    if (!result) return
+    setActiveAlignmentResultId(id)
+    commit(result.segments)
+    setAlignmentStatus(`${result.modelLabel} 的历史匹配结果已应用，覆盖率 ${Math.round(result.coverage * 100)}%`)
+    setNotice('已切换并应用歌词时间戳匹配结果，可通过撤回返回切换前的时间。')
   }
 
   const installAnalysisRuntime = async () => {
@@ -593,6 +671,31 @@ export default function App() {
       setAnalysisProgress('模型准备未完成')
       setNotice(`模型准备失败：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const prepareAlignmentModel = async (modelId = alignmentModel) => {
+    if (!window.pitchordDesktop?.prepareAlignmentModel) return
+    setAnalysisEnvironmentBusy(true)
+    setAnalysisProgress('正在准备歌词对齐模型…')
+    try {
+      const model = analysisEnvironment?.alignment.models.find(item => item.id === modelId)
+      const status = await window.pitchordDesktop.prepareAlignmentModel(modelId)
+      setAnalysisEnvironment(status)
+      setAnalysisProgress(`${model?.label || modelId} 已准备完成`)
+      setNotice(`${model?.label || modelId} 已保存在 Pitchord/environment/models/whisper。`)
+    } catch (error) {
+      setAnalysisProgress('歌词对齐模型准备未完成')
+      setNotice(`歌词对齐模型准备失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const removeAlignmentModel = async (id: string) => {
+    if (!window.pitchordDesktop?.removeAlignmentModel) return
+    try {
+      setAnalysisEnvironment(await window.pitchordDesktop.removeAlignmentModel(id))
+      setPendingModelRemoval(null)
+      setNotice('歌词对齐模型已从 Pitchord 环境中删除。')
+    } catch (error) { setNotice(`删除模型失败：${error instanceof Error ? error.message : String(error)}`) }
   }
 
   const importAnalysisModel = async (kind: 'separation' | 'pitch' = 'separation') => {
@@ -1005,7 +1108,7 @@ export default function App() {
   }
   const exportProject = async () => {
     try {
-      const content = JSON.stringify({ version: 1, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, pitchResults, activePitchResultId }, null, 2)
+      const content = JSON.stringify({ version: 1, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId }, null, 2)
       if (projectDirectory && window.pitchordDesktop) {
         const file = await window.pitchordDesktop.saveProject(content)
         setNotice(`工程已保存：${file}`)
@@ -1020,6 +1123,7 @@ export default function App() {
       const importedPitch = Array.isArray(project.pitchPoints) && project.pitchPoints.every(point => typeof point.time === 'number' && typeof point.hz === 'number' && typeof point.confidence === 'number' && typeof point.rms === 'number' && typeof point.voiced === 'boolean') ? project.pitchPoints : []
       const importedSeparationResults = Array.isArray(project.separationResults) ? project.separationResults : []
       const importedPitchResults = Array.isArray(project.pitchResults) ? project.pitchResults : []
+      const importedAlignmentResults = Array.isArray(project.alignmentResults) ? project.alignmentResults : []
       if (!preserveMedia) {
         mediaRef.current?.pause()
         mediaToken.current++
@@ -1035,8 +1139,15 @@ export default function App() {
       setPitchPoints(importedPitch)
       setSeparationResults(importedSeparationResults)
       setActiveSeparationResultId(project.activeSeparationResultId || importedSeparationResults[0]?.id || '')
+      setActiveVocalResultId(project.activeVocalResultId || project.activeSeparationResultId || importedSeparationResults[0]?.id || '')
+      setActiveAccompanimentResultId(project.activeAccompanimentResultId || project.activeSeparationResultId || importedSeparationResults[0]?.id || '')
+      setPitchInputResultId(project.pitchInputResultId || project.activeVocalResultId || project.activeSeparationResultId || importedSeparationResults[0]?.id || '')
       setPitchResults(importedPitchResults)
       setActivePitchResultId(project.activePitchResultId || importedPitchResults[0]?.id || '')
+      setAlignmentInputResultId(project.alignmentInputResultId || project.pitchInputResultId || project.activeVocalResultId || importedSeparationResults[0]?.id || '')
+      setAlignmentResults(importedAlignmentResults)
+      setActiveAlignmentResultId(project.activeAlignmentResultId || importedAlignmentResults[0]?.id || '')
+      setAlignmentStatus(importedAlignmentResults.length ? `已载入 ${importedAlignmentResults.length} 个歌词匹配结果` : '尚未匹配')
       setPitchStatus(importedPitch.length ? `已载入 ${importedPitch.length} 个音高时间点` : '尚未分析音高')
       if (!preserveMedia) {
         setSeparationStatus('未运行')
@@ -1074,9 +1185,15 @@ export default function App() {
     setActivePitchResultId('')
     setSeparationResults([])
     setActiveSeparationResultId('')
+    setActiveVocalResultId('')
+    setActiveAccompanimentResultId('')
+    setPitchInputResultId('')
+    setAlignmentInputResultId('')
+    setAlignmentResults([])
+    setActiveAlignmentResultId('')
+    setAlignmentStatus('尚未匹配')
     setPitchStatus('尚未分析音高')
     setSeparationStatus('未运行')
-    setSeparationFiles(null)
     audioBufferRef.current = null
     setAudioReady(false)
     setVocalTrackReady(false)
@@ -1323,6 +1440,10 @@ export default function App() {
 
   return <TooltipProvider delayDuration={250}>
     <div className="min-h-screen bg-background text-foreground">
+      <nav className="flex h-9 items-center gap-1 border-b border-border bg-card px-2" aria-label="应用菜单">
+        <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="h-7 px-3 font-normal">文件</Button></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuLabel>工程</DropdownMenuLabel><DropdownMenuItem onSelect={() => void showNewProject()}><FilePlus2 />新建项目</DropdownMenuItem><DropdownMenuItem onSelect={() => void openProject()}><FolderOpen />打开项目</DropdownMenuItem><DropdownMenuItem onSelect={() => void exportProject()} disabled={!projectDirectory && !segments.length}><Save />保存项目</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => mediaInputRef.current?.click()}><Upload />导入媒体</DropdownMenuItem><DropdownMenuItem onSelect={() => lyricInputRef.current?.click()} disabled={!mediaUrl}><FileText />导入 LRC</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => void exportLrc()} disabled={!segments.length}><Download />导出句级 LRC</DropdownMenuItem><DropdownMenuItem onSelect={() => setSubtitleOpen(true)} disabled={!segments.some(segment => segment.chars.length)}><Video />字级字幕与视频</DropdownMenuItem><DropdownMenuSeparator />{projectDirectory && <DropdownMenuItem onSelect={() => void window.pitchordDesktop?.openProjectFolder()}><FolderOpen />打开工程文件夹</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu>
+        <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="h-7 px-3 font-normal">设置</Button></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuItem onSelect={() => setModelManagerOpen(true)}><Settings2 />模型管理</DropdownMenuItem><DropdownMenuItem onSelect={() => setRepairEnvironmentOpen(true)}><Activity />分析环境</DropdownMenuItem><DropdownMenuItem onSelect={() => void openStorageManager()}><HardDrive />存储与环境</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+      </nav>
       <header className="flex min-h-16 flex-wrap items-center justify-between gap-4 border-b border-border bg-card px-6 py-3">
         <div className="flex items-center gap-3">
           <div className="flex size-9 items-center justify-center rounded-lg bg-primary/15 text-primary"><AudioLines className="size-5" /></div>
@@ -1389,7 +1510,7 @@ export default function App() {
                     { label: '媒体音轨提取', ready: !!analysisEnvironment?.mediaTools.ffmpeg && !!analysisEnvironment?.mediaTools.ffprobe, detail: 'FFmpeg / FFprobe' },
                     { label: '人声分离', ready: !!analysisEnvironment?.packages.demucs && !!analysisEnvironment?.separationModels.some(model => model.ready), detail: analysisEnvironment?.separationModels.filter(model => model.ready).map(model => model.label).join('、') || '没有可用模型' },
                     { label: '音高识别', ready: !!analysisEnvironment?.pitchMethods.some(method => method.ready), detail: analysisEnvironment?.pitchMethods.filter(method => method.ready).map(method => method.label).join('、') || '没有可用算法' },
-                    { label: '歌词时间对齐', ready: !!analysisEnvironment?.alignment.manual && !!analysisEnvironment?.alignment.pitchMatching, detail: analysisEnvironment?.alignment.forcedAlignment ? '自动对齐已就绪' : '人工校准与音高匹配已就绪' },
+                    { label: '歌词时间对齐', ready: !!analysisEnvironment?.alignment.forcedAlignment, detail: analysisEnvironment?.alignment.forcedAlignment ? `自动对齐已就绪：${analysisEnvironment.alignment.models.filter(model => model.ready).map(model => model.label).join('、')}` : analysisEnvironment?.packages.fasterWhisper ? '组件已安装，尚未准备对齐模型' : '需要补齐 faster-whisper 组件与对齐模型' },
                   ].map(check => <div key={check.label} className="rounded-md border border-border bg-background p-2"><div className="flex items-center justify-between gap-2"><span className="text-xs font-medium">{check.label}</span>{check.ready ? <CheckCircle2 className="size-4 text-primary" /> : <AlertCircle className="size-4 text-destructive" />}</div><p className="mt-1 text-[11px] text-muted-foreground">{check.detail}</p></div>)}
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">{analysisProgress}</p>
@@ -1401,13 +1522,15 @@ export default function App() {
                   <Button size="sm" variant="ghost" onClick={() => setModelManagerOpen(true)} disabled={analysisEnvironmentBusy}><Settings2 />模型管理</Button>
                 </div>
               </div>}
-              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Select value={separationModel} onValueChange={setSeparationModel}><SelectTrigger className="w-52"><SelectValue placeholder="选择已安装模型" /></SelectTrigger><SelectContent>{analysisEnvironment?.separationModels.filter(model => model.ready && model.runnable !== false).map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select><Button size="sm" variant="secondary" onClick={() => void runSeparation()} disabled={!mediaUrl || !selectedSeparationModel?.ready || selectedSeparationModel?.runnable === false || separationStatus.startsWith('正在') || analysisEnvironmentBusy || (window.pitchordDesktop && !analysisEnvironment?.runtimeReady)}>运行人声分离</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">{selectedSeparationModel?.description || '请先在模型管理中准备或导入模型。'}</p>{separationResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">当前分离结果</span><Select value={activeSeparationResultId} onValueChange={value => void selectSeparationResult(value)}><SelectTrigger className="w-64"><SelectValue /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={result.id} value={result.id}>{result.modelLabel} · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">选择后同步切换纯人声、纯伴奏和后续音高输入</span></div>}{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}{separationFiles && <div className="mt-2 space-y-1 text-xs text-muted-foreground"><p className="break-all">纯人声 WAV：{separationFiles.vocals}</p><p className="break-all">纯伴奏 WAV：{separationFiles.accompaniment}</p></div>}</div>
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">1. 人声分离</span><Select value={separationModel} onValueChange={setSeparationModel}><SelectTrigger className="w-52"><SelectValue placeholder="选择已安装模型" /></SelectTrigger><SelectContent>{analysisEnvironment?.separationModels.filter(model => model.ready && model.runnable !== false).map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select><Button size="sm" variant="secondary" onClick={requestSeparation} disabled={!mediaUrl || !selectedSeparationModel?.ready || selectedSeparationModel?.runnable === false || separationStatus.startsWith('正在') || analysisEnvironmentBusy || (window.pitchordDesktop && !analysisEnvironment?.runtimeReady)}>运行人声分离</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button><Button size="sm" variant="ghost" onClick={() => vocalInputRef.current?.click()} disabled={!mediaUrl}>导入外部人声结果</Button><span className="text-xs text-muted-foreground">{separationStatus}</span></div><p className="mt-2 text-xs text-muted-foreground">{selectedSeparationModel?.description || '请先在模型管理中准备或导入模型。'}</p>{separationResults.length > 0 && <p className="mt-2 text-xs text-muted-foreground">已保留 {separationResults.length} 组分离结果。纯人声与纯伴奏可在下方分别选择，不要求来自同一个模型。</p>}{projectDirectory && <p className="mt-2 break-all text-xs text-muted-foreground">工程：{projectDirectory}</p>}</div>
               <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><p className="mb-3 text-sm font-medium">试听音轨 <span className="text-xs font-normal text-muted-foreground">可多选叠加，切换时保持同一播放位置</span></p><div className="grid gap-3 sm:grid-cols-3">{(['original', 'vocals', 'accompaniment'] as const).map(kind => {
                 const available = kind === 'original' ? !!mediaUrl : !!stemReady[kind]
                 const label = kind === 'original' ? '原音频' : kind === 'vocals' ? '纯人声' : '纯伴奏'
-                return <div key={kind} className="rounded-md border border-border bg-background p-2"><Button size="sm" className="w-full" variant={trackEnabled[kind] ? 'secondary' : 'outline'} aria-pressed={trackEnabled[kind]} onClick={() => toggleTrack(kind)} disabled={!available}>{label} · {trackEnabled[kind] ? '开' : '关'}</Button><div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"><Slider min={0} max={kind === 'original' ? 100 : 200} step={5} value={[trackVolume[kind]]} onValueChange={values => setTrackVolume(current => ({ ...current, [kind]: values[0] }))} disabled={!available} aria-label={`${label}音量`} /><span className="w-9 text-right tabular-nums">{trackVolume[kind]}%</span></div></div>
+                const selectedResultId = kind === 'vocals' ? activeVocalResultId : activeAccompanimentResultId
+                return <div key={kind} className="rounded-md border border-border bg-background p-2"><Button size="sm" className="w-full" variant={trackEnabled[kind] ? 'secondary' : 'outline'} aria-pressed={trackEnabled[kind]} onClick={() => toggleTrack(kind)} disabled={!available}>{label} · {trackEnabled[kind] ? '开' : '关'}</Button>{kind !== 'original' && separationResults.length > 0 && <Select value={selectedResultId} onValueChange={value => void selectStemResult(kind, value)}><SelectTrigger className="mt-2 h-8 w-full text-xs"><SelectValue placeholder={`选择${label}结果`} /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`${kind}-${result.id}`} value={result.id}>{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"><Slider min={0} max={kind === 'original' ? 100 : 200} step={5} value={[trackVolume[kind]]} onValueChange={values => setTrackVolume(current => ({ ...current, [kind]: values[0] }))} disabled={!available} aria-label={`${label}音量`} /><span className="w-9 text-right tabular-nums">{trackVolume[kind]}%</span></div></div>
               })}</div></div>
-              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">2. 音高识别</span><Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe'].includes(method.id)}>{method.label}{method.ready && method.runnable !== false ? ' · 已就绪' : ' · 尚未可用'}</SelectItem>)}</SelectContent></Select><Button size="sm" variant="secondary" onClick={requestPitchAnalysis} disabled={!mediaUrl || !vocalTrackReady || !audioReady || pitchStatus.startsWith('正在')} >识别连续音高</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button><span className="text-xs text-muted-foreground">仅使用当前纯人声结果：{vocalTrackReady ? '已准备' : '请先分离或导入'}</span></div><p className="mt-2 text-xs text-muted-foreground">{analysisEnvironment?.pitchMethods.find(method => method.id === pitchAlgorithm)?.description || '浏览器预览使用基础自相关分析。'} RMVPE 已进入算法目录，待可再分发模型权重确认后启用。</p>{pitchResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">当前音高结果</span><Select value={activePitchResultId} onValueChange={selectPitchResult}><SelectTrigger className="w-64"><SelectValue /></SelectTrigger><SelectContent>{pitchResults.map(result => <SelectItem key={result.id} value={result.id}>{result.label} · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">字级匹配和字幕实时使用所选结果</span></div>}</div>
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">2. 音高识别</span><Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe'].includes(method.id)}>{method.label}{method.ready && method.runnable !== false ? ' · 已就绪' : ' · 尚未可用'}</SelectItem>)}</SelectContent></Select>{separationResults.length > 0 && <Select value={pitchInputResultId} onValueChange={value => void selectPitchInput(value)}><SelectTrigger className="w-64"><SelectValue placeholder="选择音高识别所用纯人声" /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`pitch-input-${result.id}`} value={result.id}>输入：{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<Button size="sm" variant="secondary" onClick={requestPitchAnalysis} disabled={!mediaUrl || !vocalTrackReady || !audioReady || pitchStatus.startsWith('正在')} >识别连续音高</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div><p className="mt-2 text-xs text-muted-foreground">音高识别只读取上面明确选择的纯人声结果。{analysisEnvironment?.pitchMethods.find(method => method.id === pitchAlgorithm)?.description || '浏览器预览使用基础自相关分析。'}</p>{pitchResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">当前音高结果</span><Select value={activePitchResultId} onValueChange={selectPitchResult}><SelectTrigger className="w-64"><SelectValue /></SelectTrigger><SelectContent>{pitchResults.map(result => <SelectItem key={result.id} value={result.id}>{result.label} · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">字级匹配和字幕实时使用所选结果</span></div>}</div>
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">3. 歌词时间戳匹配</span><Select value={alignmentModel} onValueChange={setAlignmentModel}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.alignment.models.map(model => <SelectItem key={model.id} value={model.id} disabled={!model.ready}>{model.label}{model.ready ? ' · 已就绪' : ' · 未准备'}</SelectItem>)}</SelectContent></Select><Select value={alignmentLanguage} onValueChange={setAlignmentLanguage}><SelectTrigger className="w-32"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="zh">中文</SelectItem><SelectItem value="en">英语</SelectItem><SelectItem value="ja">日语</SelectItem><SelectItem value="ko">韩语</SelectItem></SelectContent></Select>{separationResults.length > 0 && <Select value={alignmentInputResultId} onValueChange={value => void selectAlignmentInput(value)}><SelectTrigger className="w-64"><SelectValue placeholder="选择歌词匹配所用纯人声" /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`alignment-input-${result.id}`} value={result.id}>输入：{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<Button size="sm" variant="secondary" onClick={requestLyricAlignment} disabled={!segments.length || !alignmentInputResultId || !analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.ready || alignmentStatus.startsWith('正在')}>自动匹配歌词时间</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div><p className="mt-2 text-xs text-muted-foreground">输入歌词作为最终文本；模型只从所选纯人声中取得字词时间戳，再以单调文本匹配生成句级和字级时间建议。结果应用后仍可撤回和人工调整。</p><p className="mt-2 text-xs text-muted-foreground">{alignmentStatus}</p>{alignmentResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">已保留结果</span><Select value={activeAlignmentResultId} onValueChange={selectAlignmentResult}><SelectTrigger className="w-72"><SelectValue /></SelectTrigger><SelectContent>{alignmentResults.map(result => <SelectItem key={result.id} value={result.id}>{result.modelLabel} · {Math.round(result.coverage * 100)}% · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">选择后应用该版本，可撤回</span></div>}</div>
               {pitchPoints.length > 0 && <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3"><span>有声比例：{Math.round(voicedPitchPoints.length / pitchPoints.length * 100)}%</span><span>音高范围：{voicedPitchPoints.length ? `${Math.round(Math.min(...voicedPitchPoints.map(point => point.hz)))}–${Math.round(Math.max(...voicedPitchPoints.map(point => point.hz)))} Hz` : '无有声帧'}</span><span>当前字匹配：{Object.keys(pitchMatches).length} 个</span></div>}
             </section>
 
@@ -1475,18 +1598,20 @@ export default function App() {
 
       <Dialog open={shiftConfirmOpen} onOpenChange={setShiftConfirmOpen}><DialogContent><DialogHeader><DialogTitle>歌词即将超出媒体范围</DialogTitle><DialogDescription>目前最{pendingShift > 0 ? '后' : '前'}面的歌词时间已经无法继续整体移动。是否继续压缩最外侧句子，并逐步压缩靠里的句子？</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setShiftConfirmOpen(false)}>取消</Button><Button onClick={() => { setShiftConfirmOpen(false); shiftAll(pendingShift, true) }}>继续移动</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>先处理人声吗？</DialogTitle><DialogDescription>纯人声轨通常更适合歌声音高识别。可以先使用当前原音频，也可以现在处理已导入的媒体。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => { setSeparationPromptOpen(false); void analyzePitch() }}>使用原音频</Button><Button onClick={() => { setSeparationPromptOpen(false); void runSeparation() }}>先进行人声分离</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady ? '检查并修复分析环境' : '准备分析环境'}</DialogTitle><DialogDescription>Pitchord 将检查自己的 environment 文件夹，并补齐人声分离与音高识别所需组件。</DialogDescription></DialogHeader><div className="space-y-3 text-sm"><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">会执行的操作</p><p className="mt-1 text-xs text-muted-foreground">校验内置 Python、安装缺失的依赖并再次检测四类能力。完整包优先使用随包文件；文件缺失时可能需要联网下载。</p></div><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">不会影响系统环境</p><p className="mt-1 text-xs text-muted-foreground">只写入 {analysisEnvironment?.root || 'Pitchord/environment'}，不会修改系统 Python、PATH 或其他软件的模型目录。</p></div></div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>取消</Button><Button onClick={() => { setRepairEnvironmentOpen(false); void installAnalysisRuntime() }}>{analysisEnvironment?.runtimeReady ? '开始检查与修复' : '开始准备'}</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>需要先完成人声分离</DialogTitle><DialogDescription>音高识别和歌词时间戳匹配只读取纯人声结果。Pitchord 会直接处理当前工程中已经导入的媒体，不需要再次选择文件。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setSeparationPromptOpen(false)}>取消</Button><Button onClick={() => { setSeparationPromptOpen(false); requestSeparation() }}>进行人声分离</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady && analysisEnvironment?.packages.fasterWhisper ? '检查并修复分析环境' : '准备分析环境'}</DialogTitle><DialogDescription>Pitchord 将检查自己的 environment 文件夹，并补齐人声分离、音高识别与歌词对齐所需组件。</DialogDescription></DialogHeader><div className="space-y-3 text-sm"><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">会执行的操作</p><p className="mt-1 text-xs text-muted-foreground">校验内置 Python、安装缺失的依赖并再次检测四类能力。完整包优先使用随包文件；文件缺失时可能需要联网下载。</p></div><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">不会影响系统环境</p><p className="mt-1 text-xs text-muted-foreground">只写入 {analysisEnvironment?.root || 'Pitchord/environment'}，不会修改系统 Python、PATH 或其他软件的模型目录。</p></div></div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>取消</Button><Button onClick={() => { setRepairEnvironmentOpen(false); void installAnalysisRuntime() }}>{analysisEnvironment?.runtimeReady && analysisEnvironment?.packages.fasterWhisper ? '开始检查与修复' : '开始准备'}</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={modelManagerOpen} onOpenChange={setModelManagerOpen}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>模型管理</DialogTitle><DialogDescription>功能页只显示已经安装且可以运行的模型。这里可以准备推荐模型，或把自己的模型复制到 Pitchord 环境中统一管理。</DialogDescription></DialogHeader><div className="space-y-3">
-        <p className="text-sm font-medium">人声分离模型</p>{analysisEnvironment?.separationModels.map(model => <div key={model.id} className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{model.label}</p><Badge variant={model.ready ? 'secondary' : 'outline'}>{model.ready ? model.runnable === false ? '已纳入，暂不可运行' : '已安装' : '未安装'}</Badge><Badge variant="outline">{model.source === 'custom' ? '用户模型' : '推荐模型'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{model.description}</p>{!model.bundled && model.source !== 'custom' && <p className="mt-1 text-xs text-muted-foreground">准备此模型需要联网下载，文件保存在 Pitchord/environment/models。</p>}{model.provider === 'msst' && <p className="mt-1 text-xs text-muted-foreground">.ckpt 不是通用格式；还需要匹配的模型架构、YAML 配置和 MSST 推理提供者。</p>}</div><div className="flex shrink-0 gap-2">{!model.ready && model.source !== 'custom' && <Button size="sm" onClick={() => setPendingModelDownload(model.id)} disabled={!analysisEnvironment.runtimeReady}>准备</Button>}{model.canDelete && model.ready && <Button size="sm" variant="outline" onClick={() => setPendingModelRemoval(model.id)}>删除</Button>}</div></div></div>)}
+        <p className="text-sm font-medium">人声分离模型</p>{analysisEnvironment?.separationModels.map(model => <div key={model.id} className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{model.label}</p><Badge variant={model.ready ? 'secondary' : 'outline'}>{model.ready ? model.runnable === false ? '已纳入，暂不可运行' : '已安装' : '未安装'}</Badge><Badge variant="outline">{model.source === 'custom' ? '用户模型' : '推荐模型'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{model.description}</p>{!model.bundled && model.source !== 'custom' && <p className="mt-1 text-xs text-muted-foreground">准备此模型需要联网下载，文件保存在 Pitchord/environment/models。</p>}{model.provider === 'msst' && <p className="mt-1 text-xs text-muted-foreground">MSST `.ckpt` 必须与配套 YAML 一起导入。当前可直接运行 MelBandRoformer 与 BSRoformer，架构会按常见模型文件名识别。</p>}</div><div className="flex shrink-0 gap-2">{!model.ready && model.source !== 'custom' && <Button size="sm" onClick={() => setPendingModelDownload(model.id)} disabled={!analysisEnvironment.runtimeReady}>准备</Button>}{model.canDelete && model.ready && <Button size="sm" variant="outline" onClick={() => setPendingModelRemoval(model.id)}>删除</Button>}</div></div></div>)}
         {!analysisEnvironment?.separationModels.length && <p className="py-6 text-center text-sm text-muted-foreground">正在读取模型目录…</p>}
-        <div className="rounded-lg border border-dashed border-border p-3"><p className="text-sm font-medium">导入自己的人声分离模型</p><p className="mt-1 text-xs text-muted-foreground">可一次选择权重和配套 YAML。文件会复制到 environment/models/custom，之后删除 Pitchord 中的副本不会影响原文件。当前可直接运行 Demucs .th；MSST .ckpt 会先安全纳入，待对应推理提供者就绪后启用。</p><Button className="mt-3" size="sm" variant="outline" onClick={() => void importAnalysisModel('separation')}>选择模型文件…</Button></div>
+        <div className="rounded-lg border border-dashed border-border p-3"><p className="text-sm font-medium">导入自己的人声分离模型</p><p className="mt-1 text-xs text-muted-foreground">请一次选择 MSST `.ckpt` 权重和配套 YAML；也兼容 Demucs `.th`。文件会复制到 environment/models/custom，之后删除 Pitchord 中的副本不会影响原文件。可识别的 MelBandRoformer 与 BSRoformer 会立即出现在功能页。</p><Button className="mt-3" size="sm" variant="outline" onClick={() => void importAnalysisModel('separation')}>选择模型文件…</Button></div>
         <p className="pt-2 text-sm font-medium">音高识别模型与算法</p>{analysisEnvironment?.pitchMethods.map(method => <div key={method.id} className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-start justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{method.label}</p><Badge variant={method.ready && method.runnable !== false ? 'secondary' : 'outline'}>{method.ready && method.runnable !== false ? '可运行' : method.ready ? '已纳入，暂不可运行' : '尚未加入'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{method.description}</p></div>{method.canDelete && <Button size="sm" variant="outline" onClick={() => setPendingModelRemoval(method.id)}>删除</Button>}</div></div>)}<div className="rounded-lg border border-dashed border-border p-3"><p className="text-sm font-medium">导入自己的音高模型</p><p className="mt-1 text-xs text-muted-foreground">权重会复制到 Pitchord 环境。只有识别到匹配的推理提供者后才会出现在可运行算法中。</p><Button className="mt-3" size="sm" variant="outline" onClick={() => void importAnalysisModel('pitch')}>选择音高模型…</Button></div>
+        <p className="pt-2 text-sm font-medium">歌词时间戳匹配模型</p>{analysisEnvironment?.alignment.models.map(model => <div key={`alignment-${model.id}`} className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-start justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{model.label}</p><Badge variant={model.ready ? 'secondary' : 'outline'}>{model.ready ? '已安装' : '未安装'}</Badge><Badge variant="outline">faster-whisper</Badge></div><p className="mt-1 text-xs text-muted-foreground">{model.description}</p><p className="mt-1 text-xs text-muted-foreground">模型只保存在 Pitchord/environment/models/whisper，不写入系统目录。首次准备需要联网。</p></div><div className="flex shrink-0 gap-2">{!model.ready ? <Button size="sm" onClick={() => setPendingModelDownload(`alignment:${model.id}`)} disabled={!analysisEnvironment.packages.fasterWhisper}>准备</Button> : <Button size="sm" variant="outline" onClick={() => setPendingModelRemoval(`alignment:${model.id}`)}>删除</Button>}</div></div></div>)}
       </div><DialogFooter><Button variant="outline" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()}>打开模型目录</Button><Button onClick={() => setModelManagerOpen(false)}>完成</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={!!pendingModelDownload} onOpenChange={open => { if (!open) setPendingModelDownload(null) }}><DialogContent><DialogHeader><DialogTitle>准备模型</DialogTitle><DialogDescription>将从模型提供方联网下载所需权重，并保存到 Pitchord 自己的 environment/models 中。不会写入系统模型目录。</DialogDescription></DialogHeader><p className="text-sm">模型：{analysisEnvironment?.separationModels.find(model => model.id === pendingModelDownload)?.label}</p><DialogFooter><Button variant="outline" onClick={() => setPendingModelDownload(null)}>取消</Button><Button onClick={() => { const id = pendingModelDownload; setPendingModelDownload(null); if (id) void prepareAnalysisModel(id) }}>开始下载</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={!!pendingModelRemoval} onOpenChange={open => { if (!open) setPendingModelRemoval(null) }}><DialogContent><DialogHeader><DialogTitle>删除 Pitchord 中的模型？</DialogTitle><DialogDescription>只删除 Pitchord 环境内管理的副本。用户最初选择的模型文件不会被删除，工程中的历史分析结果也会保留。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setPendingModelRemoval(null)}>取消</Button><Button variant="destructive" onClick={() => { if (pendingModelRemoval) void removeAnalysisModel(pendingModelRemoval) }}>确认删除</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={!!pendingModelDownload} onOpenChange={open => { if (!open) setPendingModelDownload(null) }}><DialogContent><DialogHeader><DialogTitle>准备模型</DialogTitle><DialogDescription>将从模型提供方联网下载所需权重，并保存到 Pitchord 自己的 environment/models 中。不会写入系统模型目录，也不要求填写 HF Token。</DialogDescription></DialogHeader><p className="text-sm">模型：{pendingModelDownload?.startsWith('alignment:') ? analysisEnvironment?.alignment.models.find(model => model.id === pendingModelDownload.slice('alignment:'.length))?.label : analysisEnvironment?.separationModels.find(model => model.id === pendingModelDownload)?.label}</p><DialogFooter><Button variant="outline" onClick={() => setPendingModelDownload(null)}>取消</Button><Button onClick={() => { const id = pendingModelDownload; setPendingModelDownload(null); if (!id) return; if (id.startsWith('alignment:')) void prepareAlignmentModel(id.slice('alignment:'.length)); else void prepareAnalysisModel(id) }}>开始下载</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={!!pendingModelRemoval} onOpenChange={open => { if (!open) setPendingModelRemoval(null) }}><DialogContent><DialogHeader><DialogTitle>删除 Pitchord 中的模型？</DialogTitle><DialogDescription>只删除 Pitchord 环境内管理的副本。用户最初选择的模型文件不会被删除，工程中的历史分析结果也会保留。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setPendingModelRemoval(null)}>取消</Button><Button variant="destructive" onClick={() => { if (!pendingModelRemoval) return; if (pendingModelRemoval.startsWith('alignment:')) void removeAlignmentModel(pendingModelRemoval.slice('alignment:'.length)); else void removeAnalysisModel(pendingModelRemoval) }}>确认删除</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={subtitleOpen} onOpenChange={setSubtitleOpen}><DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl"><DialogHeader><DialogTitle>字级字幕与视频</DialogTitle><DialogDescription>按已经校准的逐字时间生成 ASS。默认样式会高亮当前字、在下方显示“・”，并在字的上方实时显示所选音高结果。</DialogDescription></DialogHeader><div className="grid gap-4 md:grid-cols-2"><div className="space-y-3"><label className="block space-y-2 text-sm">色带<Select value={subtitleStyle.colorBand} onValueChange={value => setSubtitleStyle(current => ({ ...current, colorBand: value as SubtitleStyle['colorBand'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="rainbow">音高彩虹</SelectItem><SelectItem value="cool">冷色带</SelectItem><SelectItem value="warm">暖色带</SelectItem><SelectItem value="custom">自定义两端颜色</SelectItem></SelectContent></Select></label><div className="grid grid-cols-2 gap-3"><label className="space-y-2 text-sm">低音颜色<Input type="color" value={subtitleStyle.lowColor} onChange={event => setSubtitleStyle(current => ({ ...current, lowColor: event.target.value }))} /></label><label className="space-y-2 text-sm">高音颜色<Input type="color" value={subtitleStyle.highColor} onChange={event => setSubtitleStyle(current => ({ ...current, highColor: event.target.value }))} /></label><label className="space-y-2 text-sm">普通文字<Input type="color" value={subtitleStyle.baseColor} onChange={event => setSubtitleStyle(current => ({ ...current, baseColor: event.target.value }))} /></label><label className="space-y-2 text-sm">描边<Input type="color" value={subtitleStyle.outlineColor} onChange={event => setSubtitleStyle(current => ({ ...current, outlineColor: event.target.value }))} /></label></div><label className="block space-y-2 text-sm">字体<Input value={subtitleStyle.fontName} onChange={event => setSubtitleStyle(current => ({ ...current, fontName: event.target.value }))} /></label><label className="block space-y-2 text-sm">字号：{subtitleStyle.fontSize}<Slider min={28} max={96} step={2} value={[subtitleStyle.fontSize]} onValueChange={values => setSubtitleStyle(current => ({ ...current, fontSize: values[0] }))} /></label><label className="block space-y-2 text-sm">底部距离：{subtitleStyle.marginBottom}px<Slider min={40} max={240} step={8} value={[subtitleStyle.marginBottom]} onValueChange={values => setSubtitleStyle(current => ({ ...current, marginBottom: values[0] }))} /></label><div className="flex gap-2"><Button size="sm" variant={subtitleStyle.showDot ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(current => ({ ...current, showDot: !current.showDot }))}>下方强调点</Button><Button size="sm" variant={subtitleStyle.showPitch ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(current => ({ ...current, showPitch: !current.showPitch }))}>上方音高</Button></div></div><div className="space-y-3"><div className="relative flex min-h-64 items-center justify-center overflow-hidden rounded-lg bg-black p-8 text-center"><div><p className="text-sm font-semibold text-cyan-300">{subtitleStyle.showPitch ? (pitchPoints.length ? noteName(pitchPoints.find(point => point.voiced)?.hz || null) : '—') : ''}</p><p className="mt-2 text-3xl font-bold" style={{ color: subtitleStyle.baseColor, fontFamily: subtitleStyle.fontName }}><span>示例歌</span><span className="text-cyan-300">词</span></p><p className="text-2xl text-cyan-300">{subtitleStyle.showDot ? '・' : ''}</p></div></div><div className="rounded-lg border border-border bg-muted/30 p-3 text-xs text-muted-foreground"><p>字级时间：{segments.reduce((sum, segment) => sum + segment.chars.length, 0)} 个单位</p><p className="mt-1">音高结果：{pitchPoints.length ? `${pitchPoints.length} 个时间点` : '无；仍可导出逐字时间，颜色保持普通文字色'}</p><p className="mt-1">当前字结束到下一字开始之间，会保留该字最后一个音高。</p></div></div></div><DialogFooter><Button variant="outline" onClick={() => void exportWordSubtitles('json')} disabled={!segments.length}><Download />导出字级 JSON</Button><Button variant="outline" onClick={() => void exportWordSubtitles('ass')} disabled={!segments.length}><Download />导出 ASS</Button><Button onClick={() => void burnSubtitleVideo()} disabled={!segments.length || !mediaIsVideo || !projectDirectory}><Video />嵌入视频</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={storageOpen} onOpenChange={open => { if (!cleanupBusy) { setStorageOpen(open); if (!open) setCleanupTarget(null) } }}><DialogContent className="sm:max-w-xl"><DialogHeader><DialogTitle>存储与环境</DialogTitle><DialogDescription>这里只管理 Pitchord 的分析环境、模型和缓存，工程与歌词不会被删除。</DialogDescription></DialogHeader><div className="space-y-3">

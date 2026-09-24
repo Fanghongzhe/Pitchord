@@ -18,6 +18,7 @@ const managedPython = path.join(localRoot, 'analysis-runtime', `v${runtimeManife
 const models = path.join(localRoot, 'models')
 if (!existsSync(managedPython)) throw new Error('请先在 Pitchord 中安装并验证当前分析环境。')
 if (!existsSync(path.join(models, 'demucs', 'htdemucs.json'))) throw new Error('请先在 Pitchord 中准备并验证 htdemucs 模型。')
+if (!existsSync(path.join(models, 'whisper', 'small', 'model.bin')) || !existsSync(path.join(models, 'whisper', 'small', 'pitchord-model.json'))) throw new Error('请先在 Pitchord 中准备并验证 Whisper Small 歌词对齐模型。')
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -49,8 +50,11 @@ await mkdir(path.join(output, 'base-runtime'), { recursive: true })
 await mkdir(path.join(output, 'wheelhouse'), { recursive: true })
 
 const archive = path.join(output, 'base-runtime', runtimeManifest.baseRuntime.archive)
+const archiveCache = path.join(localRoot, 'downloads', runtimeManifest.baseRuntime.archive)
+await mkdir(path.dirname(archiveCache), { recursive: true })
 console.log('Preparing standalone Python archive...')
-await download(runtimeManifest.baseRuntime.url, archive)
+if (!existsSync(archiveCache)) await download(runtimeManifest.baseRuntime.url, archiveCache)
+await cp(archiveCache, archive, { force: true })
 const archiveStat = await stat(archive)
 const archiveHash = await sha256(archive)
 if (archiveStat.size !== runtimeManifest.baseRuntime.size || archiveHash !== runtimeManifest.baseRuntime.sha256) {
@@ -89,6 +93,7 @@ const manifest = {
   baseRuntime: runtimeManifest.baseRuntime,
   lockSha256: await sha256(lockFile),
   model: 'htdemucs',
+  alignmentModel: 'small',
 }
 await writeFile(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8')
 console.log(`Offline analysis bundle ready: ${output}`)
