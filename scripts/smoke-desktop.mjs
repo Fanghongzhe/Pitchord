@@ -25,6 +25,7 @@ const result = await new Promise((resolve, reject) => {
         chars: document.body.textContent?.includes('单字编辑'),
         save: typeof window.pitchordDesktop?.saveText,
         analysisStatus: typeof window.pitchordDesktop?.analysisStatus,
+        cancelAnalysisTask: typeof window.pitchordDesktop?.cancelAnalysisTask,
         burnSubtitles: typeof window.pitchordDesktop?.burnSubtitles,
         alignLyrics: typeof window.pitchordDesktop?.alignLyrics,
         prepareAlignmentModel: typeof window.pitchordDesktop?.prepareAlignmentModel,
@@ -40,7 +41,7 @@ const result = await new Promise((resolve, reject) => {
 })
 socket.close()
 const state = JSON.parse(result ?? 'null')
-if (state?.heading !== 'Pitchord' || !state.lines || !state.chars || state.save !== 'function' || state.analysisStatus !== 'function' || state.burnSubtitles !== 'function' || state.alignLyrics !== 'function' || state.prepareAlignmentModel !== 'function' || state.importModel !== 'function' || !state.wordSubtitles || !state.lyricAlignment || !state.appMenu || !state.analysisCard || !state.media) {
+if (state?.heading !== 'Pitchord' || !state.lines || !state.chars || state.save !== 'function' || state.analysisStatus !== 'function' || state.cancelAnalysisTask !== 'function' || state.burnSubtitles !== 'function' || state.alignLyrics !== 'function' || state.prepareAlignmentModel !== 'function' || state.importModel !== 'function' || !state.wordSubtitles || !state.lyricAlignment || !state.appMenu || !state.analysisCard || !state.media) {
   throw new Error(`Desktop UI is incomplete: ${JSON.stringify(state)}`)
 }
 console.log('Desktop UI loaded:', JSON.stringify(state))

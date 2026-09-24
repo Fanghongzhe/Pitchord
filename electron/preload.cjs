@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   getPython: () => ipcRenderer.invoke('pitchord:get-python'),
   pickPython: () => ipcRenderer.invoke('pitchord:pick-python'),
   analysisStatus: () => ipcRenderer.invoke('pitchord:analysis-status'),
+  cancelAnalysisTask: taskId => ipcRenderer.invoke('pitchord:cancel-analysis-task', taskId),
   analysisStorageStatus: () => ipcRenderer.invoke('pitchord:analysis-storage-status'),
   removeAnalysisData: target => ipcRenderer.invoke('pitchord:remove-analysis-data', target),
   prepareBaseRuntime: () => ipcRenderer.invoke('pitchord:prepare-base-runtime'),

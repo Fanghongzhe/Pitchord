@@ -2,6 +2,8 @@
 
 Pitchord 把分析能力放在程序根目录的 `environment` 中。界面只向用户展示这一个环境及四类能力，不要求用户理解其中 Python、命令行工具和模型缓存的区别。
 
+运行时以 `torch.cuda.is_available()` 判断真实可用性：CUDA 版 PyTorch 与兼容 NVIDIA 驱动同时存在时，Demucs、MSST 与 TorchCrepe 自动使用第一张 CUDA GPU；不可用时使用 CPU。pYIN 使用 CPU。faster-whisper 由 CTranslate2 单独检测 CUDA，GPU 初始化失败时回退 CPU。当前 GitHub 完整包使用 CPU 版 PyTorch，以维持单个发布附件低于 GitHub 的 2 GiB 限制；CUDA 12.1 的单个官方 PyTorch wheel 已超过 2.4 GB，不能直接塞入现有单压缩包发布方式。
+
 ## 1. 媒体处理
 
 - 使用随桌面应用分发的 FFmpeg 和 FFprobe 读取音频或视频。

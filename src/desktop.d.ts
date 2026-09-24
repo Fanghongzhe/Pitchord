@@ -7,6 +7,7 @@ type AnalysisRuntimeStatus = {
   pythonVersion: string
   root: string
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
+  compute: { backend: 'cpu' | 'cuda'; label: string; torchVersion: string; torchBuildCuda: string; cudaAvailable: boolean; cudaDeviceCount: number; cudaDeviceName: string; alignmentCudaAvailable: boolean }
   runtimeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
   separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
@@ -39,6 +40,7 @@ declare global {
       getPython: () => Promise<string | null>
       pickPython: () => Promise<string | null>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
+      cancelAnalysisTask: (taskId: 'separation' | 'pitch' | 'alignment') => Promise<boolean>
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
       removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
@@ -50,7 +52,7 @@ declare global {
       removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
       onAnalysisProgress: (callback: (progress: { stage: string; message: string }) => void) => () => void
-      onTaskProgress: (callback: (progress: { id: string; title: string; status: 'running' | 'success' | 'error'; message: string; progress?: number }) => void) => () => void
+      onTaskProgress: (callback: (progress: { id: string; title: string; status: 'running' | 'success' | 'error' | 'cancelled'; message: string; progress?: number }) => void) => () => void
       projectDefaults: () => Promise<{ parent: string; suggestedName: string }>
       pickProjectParent: () => Promise<string | null>
       createProject: (name: string, parent: string) => Promise<{ directory: string; name: string }>
@@ -63,7 +65,7 @@ declare global {
       readProjectAsset: (kind: 'media' | 'vocals' | 'accompaniment') => Promise<{ name: string; data: Uint8Array } | null>
       openProjectFolder: () => Promise<string>
       separateVocals: (source: { name: string; data: ArrayBuffer; model?: string }) => Promise<{ vocals: { name: string; path: string; data: Uint8Array }; accompaniment: { name: string; path: string; data: Uint8Array } } | null>
-      analyzePitch: (algorithm: 'pyin' | 'torchcrepe') => Promise<{ algorithm: string; path: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
+      analyzePitch: (algorithm: 'pyin' | 'torchcrepe') => Promise<{ algorithm: string; path: string; device: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
       alignLyrics: (request: { segments: import('./lib/lyrics').LyricSegment[]; duration: number; model: string; language: string; vocals?: string }) => Promise<{ segments: import('./lib/lyrics').LyricSegment[]; coverage: number; matchedTokens: number; referenceTokens: number; recognizedTokens: number; model: string; language?: string; path: string; input: string }>
       readAnalysisFile: (file: string) => Promise<Uint8Array>
       activateSeparationResult: (result: { vocals: string; accompaniment: string }) => Promise<boolean>

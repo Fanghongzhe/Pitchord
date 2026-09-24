@@ -19,9 +19,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("analysis-output"))
     parser.add_argument("--model", default="htdemucs")
     parser.add_argument("--repo", type=Path)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    command = ["--two-stems", "vocals", "-n", args.model]
+    command = ["--two-stems", "vocals", "-n", args.model, "--device", args.device]
     if args.repo:
         command.extend(["--repo", str(args.repo)])
     command.extend(["--out", str(args.output), str(args.input)])

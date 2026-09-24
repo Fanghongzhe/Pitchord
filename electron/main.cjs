@@ -24,6 +24,33 @@ const msstRoot = app.isPackaged ? path.join(process.resourcesPath, 'vendor', 'ms
 const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPath, 'offline-analysis') : path.join(appRoot, 'offline-analysis')
 let mainWindow
 let activeProject = null
+const activeAnalysisTasks = new Map()
+const cancellableAnalysisTasks = new Set(['separation', 'pitch', 'alignment'])
+const pendingTaskCancellations = new Set()
+
+class TaskCancelledError extends Error {
+  constructor() {
+    super('任务已取消。')
+    this.name = 'TaskCancelledError'
+  }
+}
+
+function isTaskCancelled(error) {
+  return error instanceof TaskCancelledError || /任务已取消/.test(error instanceof Error ? error.message : String(error))
+}
+
+function stopProcessTree(child) {
+  if (!child || child.exitCode !== null || child.killed) return Promise.resolve()
+  if (process.platform !== 'win32') {
+    child.kill('SIGTERM')
+    return Promise.resolve()
+  }
+  return new Promise(resolve => {
+    const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+    killer.once('error', () => { child.kill(); resolve() })
+    killer.once('close', () => resolve())
+  })
+}
 
 function applicationDirectory() {
   if (!app.isPackaged) return appRoot
@@ -174,6 +201,7 @@ async function preferredPythonPath() {
 }
 
 function analysisEnvironment(pythonPath) {
+  const torchLibrary = pythonPath && path.isAbsolute(pythonPath) ? path.join(path.dirname(pythonPath), 'Lib', 'site-packages', 'torch', 'lib') : ''
   const environment = {
     ...process.env,
     PITCHORD_MODEL_HOME: modelRoot(),
@@ -186,6 +214,7 @@ function analysisEnvironment(pythonPath) {
     HF_HUB_DISABLE_TELEMETRY: '1',
     HF_HUB_DISABLE_IMPLICIT_TOKEN: '1',
     HF_HUB_VERBOSITY: 'error',
+    PATH: torchLibrary && fs.existsSync(torchLibrary) ? `${torchLibrary}${path.delimiter}${process.env.PATH || ''}` : process.env.PATH,
     ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
   }
   if (fs.existsSync(modelMarker())) environment.HF_HUB_OFFLINE = '1'
@@ -202,13 +231,28 @@ function offlineBundleAvailable() {
 
 function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true, ...options })
+    const { onOutput, taskId, taskTitle, ...spawnOptions } = options
+    if (taskId && pendingTaskCancellations.delete(taskId)) return reject(new TaskCancelledError())
+    if (taskId && activeAnalysisTasks.has(taskId)) return reject(new Error(`${taskTitle || '分析任务'}已经在运行。`))
+    const child = spawn(command, args, { windowsHide: true, ...spawnOptions })
+    const task = taskId ? { child, title: taskTitle || taskId, cancelled: false } : null
+    if (taskId) activeAnalysisTasks.set(taskId, task)
     let stdout = ''
     let stderr = ''
-    child.stdout?.on('data', chunk => { stdout += String(chunk); options.onOutput?.(String(chunk)) })
-    child.stderr?.on('data', chunk => { stderr += String(chunk); options.onOutput?.(String(chunk)) })
-    child.on('error', reject)
-    child.on('close', code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error((stderr || stdout).slice(-4000) || `${command} exited with ${code}`)))
+    let settled = false
+    const finish = callback => {
+      if (settled) return
+      settled = true
+      if (taskId && activeAnalysisTasks.get(taskId) === task) activeAnalysisTasks.delete(taskId)
+      callback()
+    }
+    child.stdout?.on('data', chunk => { stdout += String(chunk); onOutput?.(String(chunk)) })
+    child.stderr?.on('data', chunk => { stderr += String(chunk); onOutput?.(String(chunk)) })
+    child.on('error', error => finish(() => reject(task?.cancelled ? new TaskCancelledError() : error)))
+    child.on('close', code => finish(() => {
+      if (task?.cancelled) return reject(new TaskCancelledError())
+      return code === 0 ? resolve({ stdout, stderr }) : reject(new Error((stderr || stdout).slice(-4000) || `${command} exited with ${code}`))
+    }))
   })
 }
 
@@ -225,8 +269,13 @@ async function probePython(pythonPath) {
   if (!pythonPath || (!fs.existsSync(pythonPath) && path.isAbsolute(pythonPath))) return null
   const program = [
     'import json, platform, importlib.util',
-    "print(json.dumps({'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'fasterWhisper': bool(importlib.util.find_spec('faster_whisper')), 'pip': bool(importlib.util.find_spec('pip'))}))",
-  ].join(';')
+    "result = {'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'fasterWhisper': bool(importlib.util.find_spec('faster_whisper')), 'pip': bool(importlib.util.find_spec('pip')), 'torchVersion': '', 'torchBuildCuda': '', 'cudaAvailable': False, 'cudaDeviceCount': 0, 'cudaDeviceName': '', 'ctranslateCudaAvailable': False}",
+    "torch_spec = importlib.util.find_spec('torch')",
+    "exec(\"import torch\\nresult['torchVersion'] = str(torch.__version__)\\nresult['torchBuildCuda'] = str(torch.version.cuda or '')\\nresult['cudaAvailable'] = bool(torch.cuda.is_available())\\nresult['cudaDeviceCount'] = int(torch.cuda.device_count()) if result['cudaAvailable'] else 0\\nresult['cudaDeviceName'] = torch.cuda.get_device_name(0) if result['cudaAvailable'] else ''\") if torch_spec else None",
+    "ctranslate_spec = importlib.util.find_spec('ctranslate2')",
+    "exec(\"import ctranslate2\\nresult['ctranslateCudaAvailable'] = bool(ctranslate2.get_cuda_device_count())\") if ctranslate_spec else None",
+    'print(json.dumps(result))',
+  ].join('\n')
   try {
     const result = await runProcess(pythonPath, ['-c', program], { env: analysisEnvironment(pythonPath) })
     const detail = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1))
@@ -261,6 +310,16 @@ async function analysisRuntimeStatus() {
     pythonVersion: probe?.version || '',
     root: analysisRoot(),
     packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, librosa: !!probe?.librosa, fasterWhisper: !!probe?.fasterWhisper, pip: !!probe?.pip },
+    compute: {
+      backend: probe?.cudaAvailable ? 'cuda' : 'cpu',
+      label: probe?.cudaAvailable ? `${probe.cudaDeviceName || 'CUDA GPU'}（CUDA ${probe.torchBuildCuda || '可用'}）` : 'CPU',
+      torchVersion: probe?.torchVersion || '',
+      torchBuildCuda: probe?.torchBuildCuda || '',
+      cudaAvailable: !!probe?.cudaAvailable,
+      cudaDeviceCount: probe?.cudaDeviceCount || 0,
+      cudaDeviceName: probe?.cudaDeviceName || '',
+      alignmentCudaAvailable: !!probe?.ctranslateCudaAvailable,
+    },
     runtimeReady: !!(probe?.demucs && probe?.torchcrepe && probe?.librosa),
     mediaTools: { ffmpeg: !!(bundledFfmpeg && fs.existsSync(bundledFfmpeg)), ffprobe: !!(bundledFfprobe && fs.existsSync(bundledFfprobe)) },
     separationModels: models,
@@ -586,6 +645,20 @@ app.whenReady().then(() => {
   ipcMain.handle('pitchord:analysis-status', async event => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     return analysisRuntimeStatus()
+  })
+
+  ipcMain.handle('pitchord:cancel-analysis-task', async (event, taskId) => {
+    if (event.sender !== mainWindow?.webContents || !cancellableAnalysisTasks.has(taskId)) throw new Error('Invalid analysis task')
+    const task = activeAnalysisTasks.get(taskId)
+    if (!task) {
+      pendingTaskCancellations.add(taskId)
+      sendTaskProgress(taskId, taskId === 'separation' ? '人声分离' : taskId === 'pitch' ? '连续音高识别' : '歌词时间戳匹配', 'running', '已收到取消请求，正在停止启动过程…')
+      return true
+    }
+    task.cancelled = true
+    sendTaskProgress(taskId, task.title, 'running', '正在停止模型并清理运行进程…')
+    await stopProcessTree(task.child)
+    return true
   })
 
   ipcMain.handle('pitchord:analysis-storage-status', async event => {
@@ -945,6 +1018,7 @@ app.whenReady().then(() => {
   ipcMain.handle('pitchord:separate-vocals', async (event, sourceData) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (!sourceData || typeof sourceData.name !== 'string' || !(sourceData.data instanceof ArrayBuffer)) throw new Error('No source media was provided')
+    pendingTaskCancellations.delete('separation')
     const selectedModel = separationModel(sourceData.model || analysisModel)
     const project = requireProject()
     const workDir = path.join(project.directory, 'analysis', `separation-${selectedModel.id}-${new Date().toISOString().replace(/[:.]/g, '-')}`)
@@ -955,6 +1029,8 @@ app.whenReady().then(() => {
     const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
     const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
     const childEnv = analysisEnvironment(python)
+    const computeProbe = await probePython(python)
+    const computeDevice = computeProbe?.cudaAvailable ? 'cuda' : 'cpu'
     const binaryDirs = [bundledFfmpeg, bundledFfprobe].filter(binary => binary && fs.existsSync(binary)).map(binary => path.dirname(binary))
     if (binaryDirs.length) childEnv.PATH = `${[...new Set(binaryDirs)].join(path.delimiter)}${path.delimiter}${childEnv.PATH || ''}`
     const source = project.assets.media ? projectAssetPath(project, project.assets.media) : path.join(project.directory, 'media', safeAssetName(sourceData.name))
@@ -962,8 +1038,8 @@ app.whenReady().then(() => {
       await writeFile(source, Buffer.from(sourceData.data))
       project.assets.media = path.relative(project.directory, source)
     }
-    sendTaskProgress('separation', '人声分离', 'running', `正在使用 ${selectedModel.label} 处理 ${path.basename(source)}…`, 0.03)
-    try { await new Promise((resolve, reject) => {
+    sendTaskProgress('separation', '人声分离', 'running', `正在使用 ${selectedModel.label}（${computeProbe?.cudaAvailable ? computeProbe.cudaDeviceName || 'CUDA GPU' : 'CPU'}）处理 ${path.basename(source)}…`, 0.03)
+    try {
       let args
       if (selectedModel.provider === 'msst') {
         const inputDirectory = path.join(workDir, 'input')
@@ -977,36 +1053,37 @@ app.whenReady().then(() => {
           '--input_folder', inputDirectory,
           '--store_dir', workDir,
           '--extract_instrumental',
-          '--force_cpu',
           '--disable_detailed_pbar',
         ]
+        if (!computeProbe?.cudaAvailable) args.push('--force_cpu')
       } else {
-        args = [script, source, '--output', workDir, '--model', selectedModel.modelName || selectedModel.id]
+        args = [script, source, '--output', workDir, '--model', selectedModel.modelName || selectedModel.id, '--device', computeDevice]
         if (selectedModel.provider === 'demucs-local') args.push('--repo', selectedModel.directory)
       }
-      const child = spawn(python, args, { windowsHide: true, env: childEnv })
-      let stderr = ''
-      const relay = chunk => {
-        const output = String(chunk)
-        stderr += output
-        const line = output.trim().split(/\r?\n/).at(-1)
-        const percentage = line?.match(/(\d{1,3})%/)?.[1]
-        if (line) sendTaskProgress('separation', '人声分离', 'running', line.slice(-240), percentage ? Math.min(0.95, Number(percentage) / 100) : undefined)
-      }
-      child.stdout.on('data', relay)
-      child.stderr.on('data', relay)
-      child.on('error', reject)
-      child.on('close', code => {
-        if (code === 0) return resolve(undefined)
-        const detail = stderr.slice(-3000)
-        if (/No module named ['"](?:demucs|omegaconf|ml_collections|beartype|rotary_embedding_torch)['"]/.test(detail)) return reject(new Error('当前分析环境缺少所选分离模型需要的推理组件，请先使用“检查或修复环境”。'))
-        if (/ffmpeg|ffprobe/i.test(detail)) return reject(new Error('处理视频需要 FFmpeg，但当前运行环境无法使用它。请重新安装包含 FFmpeg 的桌面版本。'))
-        if (/checkpoint|download|connection|model/i.test(detail)) return reject(new Error(`分离模型加载或下载失败：${detail}`))
-        reject(new Error(detail || `Demucs exited with ${code}`))
+      await runProcess(python, args, {
+        env: childEnv,
+        taskId: 'separation',
+        taskTitle: '人声分离',
+        onOutput: chunk => {
+          const output = String(chunk)
+          const line = output.trim().split(/\r?\n/).at(-1)
+          const percentage = line?.match(/(\d{1,3})%/)?.[1]
+          if (line) sendTaskProgress('separation', '人声分离', 'running', line.slice(-240), percentage ? Math.min(0.95, Number(percentage) / 100) : undefined)
+        },
       })
-    }) } catch (error) {
-      sendTaskProgress('separation', '人声分离', 'error', error instanceof Error ? error.message : String(error))
-      throw error
+    } catch (error) {
+      if (isTaskCancelled(error)) {
+        await fs.promises.rm(workDir, { recursive: true, force: true })
+        sendTaskProgress('separation', '人声分离', 'cancelled', '已取消运行')
+        throw error
+      }
+      const detail = error instanceof Error ? error.message : String(error)
+      let mapped = error instanceof Error ? error : new Error(detail)
+      if (/No module named ['"](?:demucs|omegaconf|ml_collections|beartype|rotary_embedding_torch)['"]/.test(detail)) mapped = new Error('当前分析环境缺少所选分离模型需要的推理组件，请先使用“检查或修复环境”。')
+      else if (/ffmpeg|ffprobe/i.test(detail)) mapped = new Error('处理视频需要 FFmpeg，但当前运行环境无法使用它。请重新安装包含 FFmpeg 的桌面版本。')
+      else if (/checkpoint|download|connection|model/i.test(detail)) mapped = new Error(`分离模型加载或下载失败：${detail.slice(-3000)}`)
+      sendTaskProgress('separation', '人声分离', 'error', mapped.message)
+      throw mapped
     }
     const findVocals = async (folder, filename) => {
       for (const entry of await readdir(folder, { withFileTypes: true })) {
@@ -1036,6 +1113,7 @@ app.whenReady().then(() => {
   ipcMain.handle('pitchord:analyze-pitch', async (event, algorithm = 'pyin') => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (!['pyin', 'torchcrepe'].includes(algorithm)) throw new Error('当前音高算法尚不可用。')
+    pendingTaskCancellations.delete('pitch')
     const project = requireProject()
     if (!project.assets.vocals) throw new Error('请先运行人声分离或导入纯人声轨。')
     const input = projectAssetPath(project, project.assets.vocals)
@@ -1043,10 +1121,14 @@ app.whenReady().then(() => {
     const python = await preferredPythonPath()
     const probe = await probePython(python)
     if (!python || !probe?.librosa || (algorithm === 'torchcrepe' && !probe?.torchcrepe)) throw new Error(`分析环境尚未准备 ${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}。`)
-    sendTaskProgress('pitch', '连续音高识别', 'running', `正在启动 ${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}…`, 0.02)
+    const computeDevice = algorithm === 'torchcrepe' && probe.cudaAvailable ? 'cuda' : 'cpu'
+    const deviceLabel = computeDevice === 'cuda' ? probe.cudaDeviceName || 'CUDA GPU' : 'CPU'
+    sendTaskProgress('pitch', '连续音高识别', 'running', `正在使用 ${deviceLabel} 启动 ${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}…`, 0.02)
     try {
-      await runProcess(python, [path.join(scriptRoot, 'analyze-pitch.py'), input, '--algorithm', algorithm, '--output', output], {
+      await runProcess(python, [path.join(scriptRoot, 'analyze-pitch.py'), input, '--algorithm', algorithm, '--output', output, '--device', computeDevice], {
         env: analysisEnvironment(python),
+        taskId: 'pitch',
+        taskTitle: '连续音高识别',
         onOutput: chunk => {
           for (const line of chunk.split(/\r?\n/)) {
             const match = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
@@ -1056,9 +1138,14 @@ app.whenReady().then(() => {
       })
       const result = JSON.parse(await readFile(output, 'utf8'))
       if (!Array.isArray(result.points) || !result.points.every(point => Number.isFinite(point.time) && Number.isFinite(point.hz) && Number.isFinite(point.confidence) && Number.isFinite(point.rms) && typeof point.voiced === 'boolean')) throw new Error('音高分析结果格式无效。')
-      sendTaskProgress('pitch', '连续音高识别', 'success', `${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'} 已生成 ${result.points.length} 个时间点`, 1)
-      return { algorithm, path: output, points: result.points }
+      sendTaskProgress('pitch', '连续音高识别', 'success', `${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'} 已用 ${result.device || deviceLabel} 生成 ${result.points.length} 个时间点`, 1)
+      return { algorithm, path: output, points: result.points, device: result.device || deviceLabel }
     } catch (error) {
+      if (isTaskCancelled(error)) {
+        await fs.promises.rm(output, { force: true })
+        sendTaskProgress('pitch', '连续音高识别', 'cancelled', '已取消运行')
+        throw error
+      }
       sendTaskProgress('pitch', '连续音高识别', 'error', error instanceof Error ? error.message : String(error))
       throw error
     }
@@ -1066,6 +1153,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('pitchord:align-lyrics', async (event, request) => {
     if (event.sender !== mainWindow?.webContents || !request || !Array.isArray(request.segments) || !Number.isFinite(request.duration)) throw new Error('Invalid lyric alignment request')
+    pendingTaskCancellations.delete('alignment')
     const selectedModel = alignmentModelCatalog.find(model => model.id === (request.model || 'small'))
     if (!selectedModel) throw new Error('不支持的歌词对齐模型。')
     if (!fs.existsSync(alignmentModelMarker(selectedModel.id))) throw new Error(`请先在模型管理中准备 ${selectedModel.label}。`)
@@ -1081,7 +1169,9 @@ app.whenReady().then(() => {
     const python = await preferredPythonPath()
     const probe = await probePython(python)
     if (!python || !probe?.fasterWhisper) throw new Error('歌词对齐组件尚未安装，请先检查或修复分析环境。')
-    sendTaskProgress('alignment', '歌词时间戳匹配', 'running', `正在使用 ${selectedModel.label} 识别人声音轨…`, 0.02)
+    const computeDevice = probe.ctranslateCudaAvailable ? 'cuda' : 'cpu'
+    const deviceLabel = computeDevice === 'cuda' ? probe.cudaDeviceName || 'CUDA GPU' : 'CPU'
+    sendTaskProgress('alignment', '歌词时间戳匹配', 'running', `正在使用 ${selectedModel.label}（${deviceLabel}）识别人声音轨…`, 0.02)
     try {
       await runProcess(python, [
         path.join(scriptRoot, 'align-lyrics.py'), vocals,
@@ -1090,8 +1180,11 @@ app.whenReady().then(() => {
         '--model', selectedModel.id,
         '--language', typeof request.language === 'string' ? request.language : 'zh',
         '--model-root', alignmentModelRoot(),
+        '--device', computeDevice,
       ], {
         env: analysisEnvironment(python),
+        taskId: 'alignment',
+        taskTitle: '歌词时间戳匹配',
         onOutput: outputText => {
           for (const line of outputText.split(/\r?\n/)) {
             if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
@@ -1105,6 +1198,11 @@ app.whenReady().then(() => {
       sendTaskProgress('alignment', '歌词时间戳匹配', 'success', `匹配完成，歌词覆盖率 ${Math.round(result.coverage * 100)}%`, 1)
       return { ...result, path: output, input: vocals }
     } catch (error) {
+      if (isTaskCancelled(error)) {
+        await Promise.all([fs.promises.rm(input, { force: true }), fs.promises.rm(output, { force: true })])
+        sendTaskProgress('alignment', '歌词时间戳匹配', 'cancelled', '已取消运行')
+        throw error
+      }
       const message = readableModelError(error)
       sendTaskProgress('alignment', '歌词时间戳匹配', 'error', message)
       throw new Error(message)

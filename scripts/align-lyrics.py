@@ -216,7 +216,7 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
     }
 
 
-def transcribe(audio: str, model_name: str, language: str | None, model_root: str) -> tuple[list[dict], str | None]:
+def transcribe(audio: str, model_name: str, language: str | None, model_root: str, requested_device: str) -> tuple[list[dict], str | None, str]:
     try:
         from faster_whisper import WhisperModel
     except ImportError as error:
@@ -224,13 +224,27 @@ def transcribe(audio: str, model_name: str, language: str | None, model_root: st
     model_directory = os.path.join(model_root, model_name)
     local_only = os.path.isdir(model_directory) and any(Path(model_directory).iterdir())
     emit_progress(0.06, f"正在载入 {model_name} 语音识别模型…")
-    model = WhisperModel(
-        model_directory if local_only else model_name,
-        device="cpu",
-        compute_type="int8",
-        download_root=model_root,
-        local_files_only=local_only,
-    )
+    device = "cuda" if requested_device == "cuda" else "cpu"
+    try:
+        model = WhisperModel(
+            model_directory if local_only else model_name,
+            device=device,
+            compute_type="float16" if device == "cuda" else "int8",
+            download_root=model_root,
+            local_files_only=local_only,
+        )
+    except Exception:
+        if device != "cuda":
+            raise
+        emit_progress(0.08, "CUDA 语音识别初始化失败，已自动回退到 CPU。")
+        device = "cpu"
+        model = WhisperModel(
+            model_directory if local_only else model_name,
+            device="cpu",
+            compute_type="int8",
+            download_root=model_root,
+            local_files_only=local_only,
+        )
     emit_progress(0.14, "正在识别人声音轨并生成字词时间戳…")
     stream, info = model.transcribe(
         audio,
@@ -244,7 +258,7 @@ def transcribe(audio: str, model_name: str, language: str | None, model_root: st
     for segment in stream:
         for word in segment.words or []:
             tokens.extend(split_asr_word(word.word, float(word.start), float(word.end)))
-    return tokens, getattr(info, "language", language)
+    return tokens, getattr(info, "language", language), device
 
 
 def main() -> None:
@@ -255,6 +269,7 @@ def main() -> None:
     parser.add_argument("--model", default="small")
     parser.add_argument("--language", default="zh")
     parser.add_argument("--model-root", required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--tokens", help="Use timed ASR tokens from JSON instead of running Whisper (test/debug).")
     args = parser.parse_args()
     payload = json.loads(Path(args.lyrics).read_text(encoding="utf-8"))
@@ -265,13 +280,14 @@ def main() -> None:
     if args.tokens:
         recognized = json.loads(Path(args.tokens).read_text(encoding="utf-8"))
         detected_language = args.language
+        device = "test"
     else:
-        recognized, detected_language = transcribe(args.audio, args.model, args.language, args.model_root)
+        recognized, detected_language, device = transcribe(args.audio, args.model, args.language, args.model_root, args.device)
     if not recognized:
         raise RuntimeError("没有从人声音轨中识别到可用于对齐的歌词。")
     emit_progress(0.86, "正在把识别时间戳匹配到输入歌词…")
     result = align_segments(segments, recognized, duration)
-    result.update({"model": args.model, "language": detected_language, "source": "faster-whisper-monotonic-text-alignment"})
+    result.update({"model": args.model, "language": detected_language, "device": device, "source": "faster-whisper-monotonic-text-alignment"})
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     emit_progress(1.0, f"对齐完成，歌词匹配覆盖率 {result['coverage'] * 100:.1f}%")

@@ -61,7 +61,7 @@ def analyze_pyin(audio: np.ndarray, sample_rate: int) -> list[dict[str, float | 
     return result
 
 
-def analyze_torchcrepe(audio: np.ndarray, sample_rate: int) -> list[dict[str, float | bool]]:
+def analyze_torchcrepe(audio: np.ndarray, sample_rate: int, requested_device: str) -> tuple[list[dict[str, float | bool]], str]:
     import torch
     import torchcrepe
 
@@ -70,7 +70,9 @@ def analyze_torchcrepe(audio: np.ndarray, sample_rate: int) -> list[dict[str, fl
         audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_rate)
         sample_rate = target_rate
     hop_length = 160
-    report(0.25, "正在运行 TorchCrepe 神经音高分析…")
+    device = "cuda" if requested_device == "cuda" and torch.cuda.is_available() else "cpu"
+    device_label = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+    report(0.25, f"正在使用 {device_label} 运行 TorchCrepe 神经音高分析…")
     tensor = torch.from_numpy(audio.astype(np.float32, copy=False)).unsqueeze(0)
     with torch.inference_mode():
         frequency, periodicity = torchcrepe.predict(
@@ -81,7 +83,7 @@ def analyze_torchcrepe(audio: np.ndarray, sample_rate: int) -> list[dict[str, fl
             1100,
             model="full",
             batch_size=1024,
-            device="cpu",
+            device=device,
             return_periodicity=True,
             pad=True,
         )
@@ -99,7 +101,7 @@ def analyze_torchcrepe(audio: np.ndarray, sample_rate: int) -> list[dict[str, fl
             "rms": round(float(energy), 7),
             "voiced": voiced,
         })
-    return result
+    return result, device_label
 
 
 def main() -> None:
@@ -107,6 +109,7 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("--algorithm", choices=("pyin", "torchcrepe"), default="pyin")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
 
     report(0.08, "正在读取纯人声音频…")
@@ -114,10 +117,13 @@ def main() -> None:
     if audio.size == 0:
         raise RuntimeError("纯人声音频为空")
     report(0.18, f"已读取 {len(audio) / sample_rate:.1f} 秒纯人声音频")
-    points = analyze_pyin(audio, sample_rate) if args.algorithm == "pyin" else analyze_torchcrepe(audio, sample_rate)
+    if args.algorithm == "pyin":
+        points, device_label = analyze_pyin(audio, sample_rate), "CPU"
+    else:
+        points, device_label = analyze_torchcrepe(audio, sample_rate, args.device)
     report(0.92, "正在保存连续音高结果…")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"algorithm": args.algorithm, "points": points}, ensure_ascii=False), encoding="utf-8")
+    args.output.write_text(json.dumps({"algorithm": args.algorithm, "device": device_label, "points": points}, ensure_ascii=False), encoding="utf-8")
     report(1.0, f"音高分析完成，共生成 {len(points)} 个时间点")
 
 
