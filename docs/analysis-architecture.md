@@ -1,8 +1,8 @@
 # 分析模块结构
 
-Pitchord 把分析能力放在程序根目录的 `environment` 中。界面只向用户展示这一个环境及四类能力，不要求用户理解其中 Python、命令行工具和模型缓存的区别。
+Pitchord 默认把分析能力放在程序根目录的 `environment` 中，也允许用户在首次向导中选择其他磁盘。界面把它作为一个独立环境展示，不要求用户理解其中 Python、命令行工具和模型缓存的区别；高级用户也可以指定现有 Python 3.10–3.12 环境。
 
-运行时以 `torch.cuda.is_available()` 判断真实可用性：CUDA 版 PyTorch 与兼容 NVIDIA 驱动同时存在时，Demucs、MSST 与 TorchCrepe 自动使用第一张 CUDA GPU；不可用时使用 CPU。pYIN 使用 CPU。faster-whisper 由 CTranslate2 单独检测 CUDA，GPU 初始化失败时回退 CPU。当前 GitHub 完整包使用 CPU 版 PyTorch，以维持单个发布附件低于 GitHub 的 2 GiB 限制；CUDA 12.1 的单个官方 PyTorch wheel 已超过 2.4 GB，不能直接塞入现有单压缩包发布方式。
+运行时以 `torch.cuda.is_available()` 判断真实可用性：CUDA 版 PyTorch 与兼容 NVIDIA 驱动同时存在时，Demucs、MSST 与 TorchCrepe 自动使用第一张 CUDA GPU；不可用时使用 CPU。pYIN 使用 CPU。faster-whisper 由 CTranslate2 单独检测 CUDA，GPU 初始化失败时回退 CPU。GitHub Release 只包含应用和 FFmpeg；独立 Python、CPU 或 CUDA 12.1 PyTorch 及模型在首次配置和首次使用时下载到用户选择的环境目录。
 
 ## 1. 媒体处理
 
@@ -13,7 +13,7 @@ Pitchord 把分析能力放在程序根目录的 `environment` 中。界面只�
 
 当前推理提供者是 Demucs，模型目录支持：
 
-- `htdemucs`：默认平衡方案，随完整包提供。
+- `htdemucs`：默认平衡方案，首次使用时按需下载。
 - `htdemucs_ft`：微调高质量方案，速度较慢，可按需准备。
 - `mdx_extra_q`：量化轻量方案，可按需准备。
 

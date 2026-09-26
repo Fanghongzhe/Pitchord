@@ -8,14 +8,13 @@ const projectRoot = path.resolve(import.meta.dirname, '..')
 const output = path.join(projectRoot, 'release-desktop-bundle')
 const unpacked = path.join(output, 'win-unpacked')
 const bundleRoot = path.join(output, 'Pitchord')
-const archive = path.join(output, `Pitchord-${packageJson.version}-windows-x64-complete.zip`)
+const archive = path.join(output, `Pitchord-${packageJson.version}-windows-x64.zip`)
 
 for (const target of [bundleRoot, archive]) {
   if (!target.startsWith(output + path.sep)) throw new Error('Invalid portable bundle output path')
   await rm(target, { recursive: true, force: true })
 }
 if (!existsSync(path.join(unpacked, 'Pitchord.exe'))) throw new Error('Packaged Pitchord directory was not found')
-if (!existsSync(path.join(unpacked, 'environment', 'base-runtime'))) throw new Error('Prepared analysis environment was not packaged')
 
 await rename(unpacked, bundleRoot)
 await new Promise((resolve, reject) => {

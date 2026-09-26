@@ -56,11 +56,11 @@ setuptools==84.0.0
 soundfile==0.14.0
 soxr==1.1.0
 sphn==0.2.1
-sympy==1.14.0
+sympy==1.13.1
 threadpoolctl==3.7.0
 tokenizers==0.23.2
-torch==2.14.0
-torchaudio==2.11.0
+torch==2.5.1
+torchaudio==2.5.1
 torchcrepe==0.0.24
 tqdm==4.70.1
 typing_extensions==4.16.0

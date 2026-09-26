@@ -25,7 +25,7 @@ const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPa
 let mainWindow
 let activeProject = null
 const activeAnalysisTasks = new Map()
-const cancellableAnalysisTasks = new Set(['separation', 'pitch', 'alignment'])
+const cancellableAnalysisTasks = new Set(['environment', 'separation', 'pitch', 'alignment'])
 const pendingTaskCancellations = new Set()
 
 class TaskCancelledError extends Error {
@@ -70,7 +70,7 @@ const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtim
 const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
 const analysisModel = 'htdemucs'
 const separationModelCatalog = [
-  { id: 'htdemucs', label: 'HTDemucs', description: '默认平衡方案，完整便携包已包含。', bundled: true },
+  { id: 'htdemucs', label: 'HTDemucs', description: '默认平衡方案，首次使用时按需下载模型。', bundled: false },
   { id: 'htdemucs_ft', label: 'HTDemucs FT', description: '微调高质量方案，速度较慢，需要另行准备模型。', bundled: false },
   { id: 'mdx_extra_q', label: 'MDX Extra Q', description: '体积较小、速度较快的量化方案，需要另行准备模型。', bundled: false },
 ]
@@ -80,7 +80,9 @@ const alignmentModelCatalog = [
 ]
 const baseRuntime = runtimeManifest.baseRuntime
 const legacyAnalysisRoot = () => path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'Pitchord')
-const analysisRoot = () => app.isPackaged ? path.join(applicationDirectory(), 'environment') : legacyAnalysisRoot()
+const defaultAnalysisRoot = () => path.join(applicationDirectory(), 'environment')
+let configuredAnalysisRoot = null
+const analysisRoot = () => configuredAnalysisRoot || defaultAnalysisRoot()
 const baseRuntimeRoot = () => path.join(analysisRoot(), 'base-runtime', `cpython-${baseRuntime.version}`)
 const basePythonPath = () => path.join(baseRuntimeRoot(), 'python', pythonExecutable)
 const managedRuntimeRoot = () => baseRuntimeRoot()
@@ -159,8 +161,8 @@ function resolveBundledBinary(binaryPath, packageName) {
 
 function nearbyPythonPaths() {
   const applicationDir = applicationDirectory()
-  const roots = [applicationDir, path.dirname(applicationDir), path.dirname(path.dirname(applicationDir)), appRoot]
-  return [...new Set(roots)].flatMap(root => ['.venv-analysis', '.venv', 'venv'].map(folder =>
+  const roots = app.isPackaged ? [applicationDir] : [appRoot]
+  return [...new Set(roots)].flatMap(root => ['.venv-analysis', '.venv', 'venv', 'env'].map(folder =>
     path.join(root, folder, process.platform === 'win32' ? 'Scripts' : 'bin', pythonExecutable)))
 }
 
@@ -175,16 +177,45 @@ async function readSettings() {
   try { return JSON.parse(await readFile(settingsFile(), 'utf8')) } catch { return {} }
 }
 
-async function rememberPythonPath(pythonPath) {
+async function writeSettings(patch) {
   const settings = await readSettings()
   await mkdir(path.dirname(settingsFile()), { recursive: true })
-  await writeFile(settingsFile(), JSON.stringify({ ...settings, pythonPath, runtimePreference: 'custom' }, null, 2), 'utf8')
+  await writeFile(settingsFile(), JSON.stringify({ ...settings, ...patch }, null, 2), 'utf8')
 }
 
-async function preferManagedRuntime() {
+async function loadAnalysisRoot() {
   const settings = await readSettings()
-  await mkdir(path.dirname(settingsFile()), { recursive: true })
-  await writeFile(settingsFile(), JSON.stringify({ ...settings, runtimePreference: 'managed' }, null, 2), 'utf8')
+  if (typeof settings.analysisRoot === 'string' && path.isAbsolute(settings.analysisRoot)) {
+    configuredAnalysisRoot = path.resolve(settings.analysisRoot)
+    return
+  }
+  const legacyPython = path.join(legacyAnalysisRoot(), 'base-runtime', `cpython-${baseRuntime.version}`, 'python', pythonExecutable)
+  configuredAnalysisRoot = settings.runtimePreference === 'managed' && fs.existsSync(legacyPython)
+    ? legacyAnalysisRoot()
+    : defaultAnalysisRoot()
+}
+
+async function rememberPythonPath(pythonPath) {
+  await writeSettings({ pythonPath, runtimePreference: 'custom' })
+}
+
+async function preferManagedRuntime(computeProfile) {
+  await writeSettings({ analysisRoot: analysisRoot(), runtimePreference: 'managed', computeProfile })
+}
+
+async function configuredComputeProfile() {
+  const settings = await readSettings()
+  return ['auto', 'cpu', 'cuda121'].includes(settings.computeProfile) ? settings.computeProfile : 'auto'
+}
+
+async function detectNvidiaGpu() {
+  try {
+    const result = await runProcess('nvidia-smi.exe', ['--query-gpu=name,driver_version', '--format=csv,noheader'], { env: process.env })
+    const first = result.stdout.trim().split(/\r?\n/)[0]
+    if (!first) return null
+    const [name, driver] = first.split(',').map(value => value.trim())
+    return { name, driver }
+  } catch { return null }
 }
 
 async function preferredPythonPath() {
@@ -209,6 +240,7 @@ function analysisEnvironment(pythonPath) {
     HF_HOME: path.join(modelRoot(), 'huggingface'),
     XDG_CACHE_HOME: path.join(modelRoot(), 'cache'),
     PIP_CACHE_DIR: path.join(analysisRoot(), 'cache', 'pip'),
+    PIP_DEFAULT_TIMEOUT: '120',
     PYTHONNOUSERSITE: '1',
     PYTHONUTF8: '1',
     HF_HUB_DISABLE_TELEMETRY: '1',
@@ -284,6 +316,7 @@ async function probePython(pythonPath) {
 }
 
 async function analysisRuntimeStatus() {
+  const settings = await readSettings()
   const managedPath = managedPythonPath()
   const selectedPath = await preferredPythonPath()
   const probe = await probePython(selectedPath)
@@ -303,12 +336,18 @@ async function analysisRuntimeStatus() {
     ...model,
     ready: fs.existsSync(alignmentModelMarker(model.id)) && fs.existsSync(path.join(alignmentModelDirectory(model.id), 'model.bin')),
   }))
+  const detectedGpu = await detectNvidiaGpu()
+  const computeProfile = await configuredComputeProfile()
   return {
     runtimeVersion: analysisRuntimeVersion,
     source,
     path: probe?.path || selectedPath || '',
     pythonVersion: probe?.version || '',
     root: analysisRoot(),
+    defaultRoot: defaultAnalysisRoot(),
+    runtimePreference: settings.runtimePreference === 'custom' ? 'custom' : 'managed',
+    computeProfile,
+    detectedGpu,
     packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, librosa: !!probe?.librosa, fasterWhisper: !!probe?.fasterWhisper, pip: !!probe?.pip },
     compute: {
       backend: probe?.cudaAvailable ? 'cuda' : 'cpu',
@@ -320,7 +359,7 @@ async function analysisRuntimeStatus() {
       cudaDeviceName: probe?.cudaDeviceName || '',
       alignmentCudaAvailable: !!probe?.ctranslateCudaAvailable,
     },
-    runtimeReady: !!(probe?.demucs && probe?.torchcrepe && probe?.librosa),
+    runtimeReady: !!(probe?.demucs && probe?.torchcrepe && probe?.librosa && probe?.fasterWhisper),
     mediaTools: { ffmpeg: !!(bundledFfmpeg && fs.existsSync(bundledFfmpeg)), ffprobe: !!(bundledFfprobe && fs.existsSync(bundledFfprobe)) },
     separationModels: models,
     pitchMethods: [
@@ -373,11 +412,11 @@ async function analysisStorageStatus() {
 async function removeManagedAnalysisData(target) {
   const legacyTargets = path.resolve(legacyAnalysisRoot()) === path.resolve(analysisRoot()) ? [] : [legacyAnalysisRoot()]
   const targets = {
-    runtime: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime')],
+    runtime: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), path.join(analysisRoot(), 'pitchord-environment.json')],
     models: [modelRoot()],
     cache: [path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads')],
     legacy: legacyTargets,
-    all: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), modelRoot(), path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads'), ...legacyTargets],
+    all: [path.join(analysisRoot(), 'base-runtime'), path.join(analysisRoot(), 'analysis-runtime'), path.join(analysisRoot(), 'pitchord-environment.json'), modelRoot(), path.join(analysisRoot(), 'cache'), path.join(analysisRoot(), 'downloads'), ...legacyTargets],
   }
   if (!Object.hasOwn(targets, target)) throw new Error('Invalid analysis cleanup target')
   for (const directory of targets[target]) {
@@ -400,7 +439,7 @@ function sendTaskProgress(id, title, status, message, progress) {
 
 async function requireFreeSpace(bytes, label) {
   try { await mkdir(analysisRoot(), { recursive: true }) }
-  catch { throw new Error(`无法写入安装目录 ${applicationDirectory()}。请将 Pitchord 安装到当前用户可写的目录后重试。`) }
+  catch { throw new Error(`无法写入环境目录 ${analysisRoot()}。请选择当前用户可写的位置后重试。`) }
   const stats = fs.statfsSync(analysisRoot())
   const available = Number(stats.bavail) * Number(stats.bsize)
   if (Number.isFinite(available) && available < bytes) {
@@ -611,7 +650,8 @@ function createWindow() {
   else void window.loadURL('pitchord://app/index.html')
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await loadAnalysisRoot()
   if (!devUrl) {
     protocol.handle('pitchord', request => {
       const url = new URL(request.url)
@@ -642,6 +682,46 @@ app.whenReady().then(() => {
     return preferredPythonPath()
   })
 
+  ipcMain.handle('pitchord:choose-analysis-directory', async (event, currentPath) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: '选择 Pitchord 环境存放位置',
+      defaultPath: typeof currentPath === 'string' && path.isAbsolute(currentPath) ? currentPath : analysisRoot(),
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    return picked.canceled ? null : picked.filePaths[0]
+  })
+
+  ipcMain.handle('pitchord:choose-python', async (event, currentPath) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: '选择现有 Python 环境',
+      defaultPath: typeof currentPath === 'string' && currentPath ? path.dirname(currentPath) : applicationDirectory(),
+      properties: ['openFile'],
+      filters: [{ name: 'Python', extensions: process.platform === 'win32' ? ['exe'] : [''] }],
+    })
+    return picked.canceled ? null : picked.filePaths[0]
+  })
+
+  ipcMain.handle('pitchord:configure-analysis-environment', async (event, request) => {
+    if (event.sender !== mainWindow?.webContents || !request || !['managed', 'custom'].includes(request.mode)) throw new Error('Invalid environment configuration')
+    if (request.mode === 'managed') {
+      if (typeof request.root !== 'string' || !path.isAbsolute(request.root)) throw new Error('请选择有效的环境目录。')
+      configuredAnalysisRoot = path.resolve(request.root)
+      await mkdir(configuredAnalysisRoot, { recursive: true })
+      const computeProfile = ['auto', 'cpu', 'cuda121'].includes(request.computeProfile) ? request.computeProfile : 'auto'
+      await writeSettings({ analysisRoot: configuredAnalysisRoot, runtimePreference: 'managed', computeProfile })
+    } else {
+      if (typeof request.pythonPath !== 'string' || !path.isAbsolute(request.pythonPath) || !fs.existsSync(request.pythonPath)) throw new Error('请选择有效的 Python 可执行文件。')
+      const probe = await probePython(request.pythonPath)
+      if (!probe) throw new Error('所选 Python 无法启动，或不是可用的 Python 3 环境。')
+      const majorMinor = probe.version.split('.').slice(0, 2).map(Number)
+      if (majorMinor[0] !== 3 || majorMinor[1] < 10 || majorMinor[1] > 12) throw new Error(`当前支持 Python 3.10–3.12，所选版本为 ${probe.version}。`)
+      await rememberPythonPath(path.resolve(request.pythonPath))
+    }
+    return analysisRuntimeStatus()
+  })
+
   ipcMain.handle('pitchord:analysis-status', async event => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     return analysisRuntimeStatus()
@@ -652,7 +732,7 @@ app.whenReady().then(() => {
     const task = activeAnalysisTasks.get(taskId)
     if (!task) {
       pendingTaskCancellations.add(taskId)
-      sendTaskProgress(taskId, taskId === 'separation' ? '人声分离' : taskId === 'pitch' ? '连续音高识别' : '歌词时间戳匹配', 'running', '已收到取消请求，正在停止启动过程…')
+      sendTaskProgress(taskId, taskId === 'environment' ? '准备分析环境' : taskId === 'separation' ? '人声分离' : taskId === 'pitch' ? '连续音高识别' : '歌词时间戳匹配', 'running', '已收到取消请求，正在停止启动过程…')
       return true
     }
     task.cancelled = true
@@ -682,44 +762,76 @@ app.whenReady().then(() => {
     try { return await analysisInstallTask } finally { analysisInstallTask = null }
   })
 
-  ipcMain.handle('pitchord:install-analysis-runtime', async event => {
+  ipcMain.handle('pitchord:install-analysis-runtime', async (event, request = {}) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
     analysisInstallTask = (async () => {
+      if (typeof request.root === 'string' && path.isAbsolute(request.root)) configuredAnalysisRoot = path.resolve(request.root)
+      const requestedProfile = ['auto', 'cpu', 'cuda121'].includes(request.computeProfile) ? request.computeProfile : await configuredComputeProfile()
+      await writeSettings({ analysisRoot: analysisRoot(), runtimePreference: 'managed', computeProfile: requestedProfile })
+      const detectedGpu = await detectNvidiaGpu()
+      let resolvedProfile = requestedProfile === 'auto' ? detectedGpu ? 'cuda121' : 'cpu' : requestedProfile
       const requiredBytes = fs.existsSync(managedPythonPath())
-        ? 1024 * 1024 * 1024
-        : offlineBundleAvailable() ? 2 * 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024
+        ? resolvedProfile === 'cuda121' ? 4 * 1024 * 1024 * 1024 : 2 * 1024 * 1024 * 1024
+        : resolvedProfile === 'cuda121' ? 7 * 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024
       await requireFreeSpace(requiredBytes, '安装分析环境')
+      sendTaskProgress('environment', '准备分析环境', 'running', `正在准备${resolvedProfile === 'cuda121' ? ' NVIDIA GPU' : ' CPU'} 环境…`, 0.02)
       let python
       if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime()
       else python = (await findBootstrapPython())?.executable
       if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
       const offlineRequirements = path.join(offlineAnalysisRoot(), 'analysis-lock-win-x64.txt')
-      const useOfflineBundle = fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
+      const useOfflineBundle = resolvedProfile === 'cpu' && fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
+      const progressOutput = output => {
+        const line = output.trim().split(/\r?\n/).at(-1)
+        if (line) {
+          sendAnalysisProgress('runtime', line.slice(0, 240))
+          sendTaskProgress('environment', '准备分析环境', 'running', line.slice(0, 240))
+        }
+      }
       if (!useOfflineBundle) {
         sendAnalysisProgress('runtime', '正在准备安装工具…')
-        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'pip'], { env: analysisEnvironment(python) })
+        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--timeout', '120', '--upgrade', 'pip'], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
+        const torchProfile = path.join(scriptRoot, resolvedProfile === 'cuda121' ? 'analysis-torch-cu121.txt' : 'analysis-torch-cpu.txt')
+        sendAnalysisProgress('runtime', resolvedProfile === 'cuda121' ? '正在安装 NVIDIA CUDA 12.1 计算组件…' : '正在安装 CPU 计算组件…')
+        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120', '--requirement', torchProfile], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
       }
       sendAnalysisProgress('runtime', '正在安装人声分离和音高模型依赖，这一步可能需要较长时间…')
-      const installArgs = ['-m', 'pip', 'install', '--disable-pip-version-check']
+      const installArgs = ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120']
       if (useOfflineBundle) installArgs.push('--no-index', '--find-links', wheelhouse, '--requirement', offlineRequirements)
-      else installArgs.push('--requirement', path.join(scriptRoot, 'analysis-requirements.txt'))
+      else installArgs.push('--requirement', path.join(scriptRoot, 'analysis-requirements.txt'), '--constraint', path.join(scriptRoot, 'analysis-lock-win-x64.txt'))
       await runProcess(python, installArgs, {
         env: analysisEnvironment(python),
-        onOutput: output => {
-          const line = output.trim().split(/\r?\n/).at(-1)
-          if (line) sendAnalysisProgress('runtime', line.slice(0, 240))
-        },
+        taskId: 'environment',
+        taskTitle: '准备分析环境',
+        onOutput: progressOutput,
       })
-      const probe = await probePython(python)
+      let probe = await probePython(python)
+      if (requestedProfile === 'auto' && resolvedProfile === 'cuda121' && !probe?.cudaAvailable) {
+        resolvedProfile = 'cpu'
+        sendAnalysisProgress('runtime', 'CUDA 环境未能通过运行检查，正在自动切换到 CPU 组件…')
+        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120', '--force-reinstall', '--requirement', path.join(scriptRoot, 'analysis-torch-cpu.txt')], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
+        probe = await probePython(python)
+      }
       if (!probe?.demucs || !probe?.torchcrepe || !probe?.librosa || !probe?.fasterWhisper) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
-      await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify({ version: analysisRuntimeVersion, createdAt: new Date().toISOString(), python }, null, 2), 'utf8')
-      await preferManagedRuntime()
+      if (resolvedProfile === 'cuda121' && !probe.cudaAvailable) throw new Error('CUDA 组件已安装，但 PyTorch 无法使用当前显卡。请选择“自动选择”或 CPU 环境后重试。')
+      const environmentManifest = { schemaVersion: 1, managedBy: 'Pitchord', runtimeVersion: analysisRuntimeVersion, requestedProfile, resolvedProfile, python, pythonVersion: probe.version, createdAt: new Date().toISOString() }
+      await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
+      await writeFile(path.join(analysisRoot(), 'pitchord-environment.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
+      await preferManagedRuntime(requestedProfile)
       sendAnalysisProgress('complete', '分析环境已准备完成。')
+      sendTaskProgress('environment', '准备分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 分析环境已准备完成`, 1)
       return { ...await analysisRuntimeStatus(), busy: false }
     })()
-    try { return await analysisInstallTask } finally { analysisInstallTask = null }
+    try { return await analysisInstallTask }
+    catch (error) {
+      const rawMessage = error instanceof Error ? error.message : String(error)
+      const message = isTaskCancelled(error) ? '环境准备已取消' : /downloading|connection|timed?\s*out|network|reset|remote host/i.test(rawMessage) ? '依赖下载中断。已完成的文件会保留，请检查网络后点击“下载并准备环境”重试。' : rawMessage
+      sendTaskProgress('environment', '准备分析环境', isTaskCancelled(error) ? 'cancelled' : 'error', message)
+      if (!isTaskCancelled(error) && message !== rawMessage) throw new Error(message)
+      throw error
+    } finally { analysisInstallTask = null }
   })
 
   ipcMain.handle('pitchord:prepare-analysis-model', async (event, requestedModel = analysisModel) => {
@@ -882,7 +994,7 @@ app.whenReady().then(() => {
     }
     const model = separationModelCatalog.find(item => item.id === modelId)
     if (!model) throw new Error('没有找到这个模型。')
-    if (model.bundled) throw new Error('完整包内置的默认模型不能单独删除；可以在“存储与环境”中删除全部模型。')
+    if (model.bundled) throw new Error('随软件提供的默认模型不能单独删除；可以在“存储与环境”中删除全部模型。')
     let marker = null
     try { marker = JSON.parse(await readFile(modelMarker(modelId), 'utf8')) } catch { /* already absent */ }
     for (const relative of marker?.files || []) {

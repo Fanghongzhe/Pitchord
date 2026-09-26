@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "analysisRuntimeVersion": "2",
+  "analysisRuntimeVersion": "3",
   "baseRuntime": {
     "version": "3.12.14+20260901",
     "archive": "cpython-3.12.14+20260901-x86_64-pc-windows-msvc-install_only.tar.gz",
@@ -12,7 +12,7 @@
     {
       "id": "htdemucs",
       "provider": "demucs",
-      "bundled": true
+      "bundled": false
     },
     {
       "id": "htdemucs_ft",

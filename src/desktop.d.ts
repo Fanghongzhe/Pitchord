@@ -6,6 +6,10 @@ type AnalysisRuntimeStatus = {
   path: string
   pythonVersion: string
   root: string
+  defaultRoot: string
+  runtimePreference: 'managed' | 'custom'
+  computeProfile: 'auto' | 'cpu' | 'cuda121'
+  detectedGpu: { name: string; driver: string } | null
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
   compute: { backend: 'cpu' | 'cuda'; label: string; torchVersion: string; torchBuildCuda: string; cudaAvailable: boolean; cudaDeviceCount: number; cudaDeviceName: string; alignmentCudaAvailable: boolean }
   runtimeReady: boolean
@@ -39,12 +43,15 @@ declare global {
       saveText: (name: string, content: string) => Promise<boolean>
       getPython: () => Promise<string | null>
       pickPython: () => Promise<string | null>
+      choosePython: (currentPath?: string) => Promise<string | null>
+      chooseAnalysisDirectory: (currentPath?: string) => Promise<string | null>
+      configureAnalysisEnvironment: (request: { mode: 'managed'; root: string; computeProfile: 'auto' | 'cpu' | 'cuda121' } | { mode: 'custom'; pythonPath: string }) => Promise<AnalysisRuntimeStatus>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
-      cancelAnalysisTask: (taskId: 'separation' | 'pitch' | 'alignment') => Promise<boolean>
+      cancelAnalysisTask: (taskId: 'environment' | 'separation' | 'pitch' | 'alignment') => Promise<boolean>
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
       removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
-      installAnalysisRuntime: () => Promise<AnalysisRuntimeStatus>
+      installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121' }) => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
       prepareAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
       removeAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>

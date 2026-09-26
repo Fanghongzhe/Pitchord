@@ -1,4 +1,4 @@
-# Pitchord analysis runtime v1. Installed into the app-managed environment.
+# Pitchord analysis runtime v3. Installed into the app-managed environment.
 demucs==4.1.0
 torchcrepe==0.0.24
 librosa==1.0.0

@@ -16,8 +16,7 @@
     "preview": "vite preview",
     "desktop:start": "pnpm build && electron .",
     "desktop:bundle": "pnpm build && electron-builder --config build/portable-builder.cjs --dir && node scripts/archive-portable-bundle.mjs",
-    "analysis:offline-bundle": "node scripts/prepare-offline-analysis.mjs",
-    "desktop:package": "pnpm analysis:offline-bundle && pnpm desktop:bundle"
+    "desktop:package": "pnpm desktop:bundle"
   },
   "build": {
     "appId": "com.pitchord.editor",
@@ -40,6 +39,10 @@
           "align-lyrics.py",
           "prepare-aligner.py",
           "analysis-requirements.txt",
+          "analysis-lock-win-x64.txt",
+          "analysis-torch-cpu.txt",
+          "analysis-torch-cu121.txt",
+          "pyproject.toml",
           "runtime-manifest.json"
         ]
       },

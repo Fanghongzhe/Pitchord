@@ -43,6 +43,10 @@ type AnalysisEnvironment = {
   path: string
   pythonVersion: string
   root: string
+  defaultRoot: string
+  runtimePreference: 'managed' | 'custom'
+  computeProfile: 'auto' | 'cpu' | 'cuda121'
+  detectedGpu: { name: string; driver: string } | null
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
   compute: { backend: 'cpu' | 'cuda'; label: string; torchVersion: string; torchBuildCuda: string; cudaAvailable: boolean; cudaDeviceCount: number; cudaDeviceName: string; alignmentCudaAvailable: boolean }
   runtimeReady: boolean
@@ -85,7 +89,7 @@ function readDraft(): Draft | null {
 }
 
 const savedDraft = readDraft()
-const cancellableTaskIds = new Set(['separation', 'pitch', 'alignment'])
+const cancellableTaskIds = new Set(['environment', 'separation', 'pitch', 'alignment'])
 
 function taskWasCancelled(error: unknown) {
   return /任务已取消|cancelled|canceled/i.test(error instanceof Error ? error.message : String(error))
@@ -167,6 +171,10 @@ export default function App() {
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [separationPromptOpen, setSeparationPromptOpen] = useState(false)
   const [repairEnvironmentOpen, setRepairEnvironmentOpen] = useState(false)
+  const [environmentMode, setEnvironmentMode] = useState<'managed' | 'custom'>('managed')
+  const [environmentRootDraft, setEnvironmentRootDraft] = useState('')
+  const [externalPythonDraft, setExternalPythonDraft] = useState('')
+  const [computeProfileDraft, setComputeProfileDraft] = useState<'auto' | 'cpu' | 'cuda121'>('auto')
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
   const [pendingModelDownload, setPendingModelDownload] = useState<string | null>(null)
   const [pendingModelRemoval, setPendingModelRemoval] = useState<string | null>(null)
@@ -208,6 +216,7 @@ export default function App() {
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const vocalInputRef = useRef<HTMLInputElement>(null)
   const lyricInputRef = useRef<HTMLInputElement>(null)
+  const environmentSetupPromptedRef = useRef(false)
   const projectInputRef = useRef<HTMLInputElement>(null)
   const mediaRef = useRef<HTMLMediaElement | null>(null)
   const mixerRef = useRef<StemMixer | null>(null)
@@ -240,7 +249,7 @@ export default function App() {
     if (status === 'running') setWorkCenterOpen(true)
   }, [])
 
-  const cancelAnalysisTask = useCallback(async (taskId: 'separation' | 'pitch' | 'alignment') => {
+  const cancelAnalysisTask = useCallback(async (taskId: 'environment' | 'separation' | 'pitch' | 'alignment') => {
     const item = workItems.find(candidate => candidate.id === taskId)
     if (!item || item.status !== 'running' || !window.pitchordDesktop?.cancelAnalysisTask) return
     updateWork(taskId, item.title, 'running', '正在取消运行…', item.progress)
@@ -342,9 +351,17 @@ export default function App() {
     updateWork('environment-check', '分析环境检测', 'running', '正在检查媒体、分离、音高和歌词对齐能力…')
     void window.pitchordDesktop.analysisStatus().then(status => {
       setAnalysisEnvironment(status)
+      setEnvironmentMode(status.runtimePreference)
+      setEnvironmentRootDraft(status.root)
+      setExternalPythonDraft(status.runtimePreference === 'custom' ? status.path : '')
+      setComputeProfileDraft(status.computeProfile)
       setAnalysisProgress(status.runtimeReady ? '分析环境可用' : '分析环境尚未准备完整')
       const readyCount = [status.mediaTools.ffmpeg && status.mediaTools.ffprobe, status.separationModels.some(model => model.ready), status.pitchMethods.some(method => method.ready), status.alignment.forcedAlignment].filter(Boolean).length
       updateWork('environment-check', '分析环境检测', status.runtimeReady && readyCount >= 4 ? 'success' : 'error', `已完成 4 类检查，${readyCount} 类可用`, 1)
+      if (!status.runtimeReady && !environmentSetupPromptedRef.current) {
+        environmentSetupPromptedRef.current = true
+        setRepairEnvironmentOpen(true)
+      }
     }).catch(error => {
       setAnalysisProgress('无法检查分析环境')
       updateWork('environment-check', '分析环境检测', 'error', error instanceof Error ? error.message : '无法检查分析环境')
@@ -353,7 +370,7 @@ export default function App() {
       setAnalysisProgress(progress.message)
       if (progress.stage === 'base-runtime' || progress.stage === 'runtime') {
         const percent = progress.message.match(/(\d{1,3})%/)?.[1]
-        updateWork('environment-repair', '准备分析环境', 'running', progress.message, percent ? Number(percent) / 100 : undefined)
+        updateWork('environment', '准备分析环境', 'running', progress.message, percent ? Number(percent) / 100 : undefined)
       }
     })
     const removeTaskProgress = window.pitchordDesktop.onTaskProgress(progress => updateWork(progress.id, progress.title, progress.status, progress.message, progress.progress))
@@ -673,21 +690,47 @@ export default function App() {
     setNotice('已切换并应用歌词时间戳匹配结果，可通过撤回返回切换前的时间。')
   }
 
+  const openEnvironmentSetup = () => {
+    setEnvironmentMode(analysisEnvironment?.runtimePreference || 'managed')
+    setEnvironmentRootDraft(analysisEnvironment?.root || analysisEnvironment?.defaultRoot || '')
+    setExternalPythonDraft(analysisEnvironment?.runtimePreference === 'custom' ? analysisEnvironment.path : '')
+    setComputeProfileDraft(analysisEnvironment?.computeProfile || 'auto')
+    setRepairEnvironmentOpen(true)
+  }
+
   const installAnalysisRuntime = async () => {
     if (!window.pitchordDesktop?.installAnalysisRuntime) return
     setAnalysisEnvironmentBusy(true)
     setAnalysisProgress('正在启动环境安装…')
-    updateWork('environment-repair', '准备分析环境', 'running', '正在检查并补齐媒体、分离和音高组件…')
+    updateWork('environment', '准备分析环境', 'running', '正在检查并补齐媒体、分离和音高组件…')
     try {
-      const status = await window.pitchordDesktop.installAnalysisRuntime()
+      const status = await window.pitchordDesktop.installAnalysisRuntime({ root: environmentRootDraft, computeProfile: computeProfileDraft })
       setAnalysisEnvironment(status)
+      setEnvironmentRootDraft(status.root)
       setAnalysisProgress('独立分析环境已准备完成')
-      updateWork('environment-repair', '准备分析环境', 'success', '分析环境已准备完成', 1)
+      updateWork('environment', '准备分析环境', 'success', '分析环境已准备完成', 1)
       setNotice('Pitchord 分析环境已准备完成。')
     } catch (error) {
       setAnalysisProgress('环境安装未完成')
-      updateWork('environment-repair', '准备分析环境', 'error', error instanceof Error ? error.message : String(error))
+      updateWork('environment', '准备分析环境', taskWasCancelled(error) ? 'cancelled' : 'error', taskWasCancelled(error) ? '环境准备已取消' : error instanceof Error ? error.message : String(error))
       setNotice(`分析环境安装失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const applyExternalPython = async () => {
+    if (!window.pitchordDesktop?.configureAnalysisEnvironment || !externalPythonDraft) return
+    setAnalysisEnvironmentBusy(true)
+    updateWork('environment-check', '检测现有 Python', 'running', '正在检查 Python 版本和分析组件…')
+    try {
+      const status = await window.pitchordDesktop.configureAnalysisEnvironment({ mode: 'custom', pythonPath: externalPythonDraft })
+      setAnalysisEnvironment(status)
+      setRepairEnvironmentOpen(false)
+      const complete = status.runtimeReady && status.packages.fasterWhisper
+      updateWork('environment-check', '检测现有 Python', complete ? 'success' : 'error', complete ? '现有 Python 环境可以直接使用' : 'Python 已选定，但仍缺少部分分析组件', 1)
+      setNotice(complete ? '已切换到现有 Python 环境。' : '已记录 Python 环境；缺失组件会在分析环境面板中显示。')
+    } catch (error) {
+      updateWork('environment-check', '检测现有 Python', 'error', error instanceof Error ? error.message : String(error))
+      setNotice(`无法使用所选 Python：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
   }
 
@@ -1476,7 +1519,7 @@ export default function App() {
     <div className="min-h-screen bg-background text-foreground">
       <nav className="flex h-9 items-center gap-1 border-b border-border bg-card px-2" aria-label="应用菜单">
         <DropdownMenu modal={false}><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="h-7 px-3 font-normal">文件</Button></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuLabel>工程</DropdownMenuLabel><DropdownMenuItem onSelect={() => void showNewProject()}><FilePlus2 />新建项目</DropdownMenuItem><DropdownMenuItem onSelect={() => void openProject()}><FolderOpen />打开项目</DropdownMenuItem><DropdownMenuItem onSelect={() => void exportProject()} disabled={!projectDirectory && !segments.length}><Save />保存项目</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => mediaInputRef.current?.click()}><Upload />导入媒体</DropdownMenuItem><DropdownMenuItem onSelect={() => lyricInputRef.current?.click()} disabled={!mediaUrl}><FileText />导入 LRC</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => void exportLrc()} disabled={!segments.length}><Download />导出句级 LRC</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(() => setSubtitleOpen(true), 0)} disabled={!segments.some(segment => segment.chars.length)}><Video />字级字幕与视频</DropdownMenuItem><DropdownMenuSeparator />{projectDirectory && <DropdownMenuItem onSelect={() => void window.pitchordDesktop?.openProjectFolder()}><FolderOpen />打开工程文件夹</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu>
-        <DropdownMenu modal={false}><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="h-7 px-3 font-normal">设置</Button></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuItem onSelect={() => window.setTimeout(() => setModelManagerOpen(true), 0)}><Settings2 />模型管理</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(() => setRepairEnvironmentOpen(true), 0)}><Activity />分析环境</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(() => void openStorageManager(), 0)}><HardDrive />存储与环境</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+        <DropdownMenu modal={false}><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="h-7 px-3 font-normal">设置</Button></DropdownMenuTrigger><DropdownMenuContent align="start"><DropdownMenuItem onSelect={() => window.setTimeout(() => setModelManagerOpen(true), 0)}><Settings2 />模型管理</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(openEnvironmentSetup, 0)}><Activity />分析环境</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(() => void openStorageManager(), 0)}><HardDrive />存储与环境</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
       </nav>
       <header className="flex min-h-16 flex-wrap items-center justify-between gap-4 border-b border-border bg-card px-6 py-3">
         <div className="flex items-center gap-3">
@@ -1550,7 +1593,7 @@ export default function App() {
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">{analysisProgress}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Button size="sm" variant="secondary" onClick={() => setRepairEnvironmentOpen(true)} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '检查或修复环境' : '准备分析环境'}</Button>
+                  <Button size="sm" variant="secondary" onClick={openEnvironmentSetup} disabled={analysisEnvironmentBusy}>{analysisEnvironment?.runtimeReady ? '检查或更换环境' : '准备分析环境'}</Button>
                   <Button size="sm" variant="outline" onClick={() => void window.pitchordDesktop?.analysisStatus().then(status => { setAnalysisEnvironment(status); setAnalysisProgress('四类关键能力已重新检测'); updateWork('environment-check', '分析环境检测', 'success', '四类关键能力已重新检测', 1) })} disabled={analysisEnvironmentBusy}>重新检测</Button>
                   <Button size="sm" variant="ghost" onClick={() => void window.pitchordDesktop?.openAnalysisFolder()}>打开环境</Button>
                   <Button size="sm" variant="ghost" onClick={() => void openStorageManager()} disabled={analysisEnvironmentBusy}><HardDrive />管理存储</Button>
@@ -1635,7 +1678,18 @@ export default function App() {
 
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>需要先完成人声分离</DialogTitle><DialogDescription>音高识别和歌词时间戳匹配只读取纯人声结果。Pitchord 会直接处理当前工程中已经导入的媒体，不需要再次选择文件。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setSeparationPromptOpen(false)}>取消</Button><Button onClick={() => { setSeparationPromptOpen(false); requestSeparation() }}>进行人声分离</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady && analysisEnvironment?.packages.fasterWhisper ? '检查并修复分析环境' : '准备分析环境'}</DialogTitle><DialogDescription>Pitchord 将检查自己的 environment 文件夹，并补齐人声分离、音高识别与歌词对齐所需组件。</DialogDescription></DialogHeader><div className="space-y-3 text-sm"><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">会执行的操作</p><p className="mt-1 text-xs text-muted-foreground">校验内置 Python、安装缺失的依赖并再次检测四类能力。完整包优先使用随包文件；文件缺失时可能需要联网下载。</p></div><div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">不会影响系统环境</p><p className="mt-1 text-xs text-muted-foreground">只写入 {analysisEnvironment?.root || 'Pitchord/environment'}，不会修改系统 Python、PATH 或其他软件的模型目录。</p></div></div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>取消</Button><Button onClick={() => { setRepairEnvironmentOpen(false); void installAnalysisRuntime() }}>{analysisEnvironment?.runtimeReady && analysisEnvironment?.packages.fasterWhisper ? '开始检查与修复' : '开始准备'}</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={repairEnvironmentOpen} onOpenChange={open => { if (!analysisEnvironmentBusy) setRepairEnvironmentOpen(open) }}><DialogContent className="sm:max-w-2xl"><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>环境与模型存放在用户选择的位置，不修改系统 Python 或 PATH。推荐使用 Pitchord 独立环境。</DialogDescription></DialogHeader><div className="space-y-4 text-sm">
+        <div className="grid grid-cols-2 gap-2"><Button variant={environmentMode === 'managed' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('managed')} disabled={analysisEnvironmentBusy}>创建独立环境</Button><Button variant={environmentMode === 'custom' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('custom')} disabled={analysisEnvironmentBusy}>使用现有 Python</Button></div>
+        {environmentMode === 'managed' ? <>
+          <div className="space-y-2"><p className="font-medium">环境存放位置</p><div className="flex gap-2"><Input value={environmentRootDraft} readOnly className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseAnalysisDirectory(environmentRootDraft); if (selected) setEnvironmentRootDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><div className="flex items-center justify-between gap-2"><p className="text-xs text-muted-foreground">默认放在软件同目录的 environment 文件夹，也可以选择 D 盘等其他位置。</p>{analysisEnvironment?.defaultRoot && environmentRootDraft !== analysisEnvironment.defaultRoot && <Button size="sm" variant="ghost" onClick={() => setEnvironmentRootDraft(analysisEnvironment.defaultRoot)}>恢复默认</Button>}</div></div>
+          <label className="block space-y-2"><span className="font-medium">计算环境</span><Select value={computeProfileDraft} onValueChange={value => setComputeProfileDraft(value as 'auto' | 'cpu' | 'cuda121')} disabled={analysisEnvironmentBusy}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto">自动选择（推荐）</SelectItem><SelectItem value="cuda121">NVIDIA GPU · CUDA 12.1</SelectItem><SelectItem value="cpu">仅 CPU</SelectItem></SelectContent></Select></label>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><p className="font-medium">设备检测</p><Badge variant={analysisEnvironment?.detectedGpu ? 'secondary' : 'outline'}>{analysisEnvironment?.detectedGpu?.name || '未检测到 NVIDIA GPU'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.detectedGpu ? `驱动 ${analysisEnvironment.detectedGpu.driver}。自动模式会先安装 CUDA 12.1 组件，运行检查失败时回退 CPU。` : '自动模式将安装 CPU 组件。'} 首次安装需要联网，GPU 环境通常需要约 4–7 GB 可用空间。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">独立且可删除</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。删除这个目录即可移除环境。</p></div>
+        </> : <>
+          <div className="space-y-2"><p className="font-medium">Python 可执行文件</p><div className="flex gap-2"><Input value={externalPythonDraft} readOnly placeholder="选择 python.exe" className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.choosePython(externalPythonDraft); if (selected) setExternalPythonDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><p className="text-xs text-muted-foreground">支持 Python 3.10–3.12。Pitchord 只检测并使用该环境，不会自动安装或删除其中的内容。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">适合已有环境的用户</p><p className="mt-1 text-xs text-muted-foreground">检测会确认 Demucs、TorchCrepe、librosa 和 faster-whisper。缺失的组件会明确列出，不会静默修改环境。</p></div>
+        </>}
+      </div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)} disabled={analysisEnvironmentBusy}>稍后设置</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => { setRepairEnvironmentOpen(false); void installAnalysisRuntime() }} disabled={analysisEnvironmentBusy || !environmentRootDraft}>下载并准备环境</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</DialogFooter></DialogContent></Dialog>
 
       <Dialog open={modelManagerOpen} onOpenChange={setModelManagerOpen}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>模型管理</DialogTitle><DialogDescription>功能页只显示已经安装且可以运行的模型。这里可以准备推荐模型，或把自己的模型复制到 Pitchord 环境中统一管理。</DialogDescription></DialogHeader><div className="space-y-3">
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">模型计算设备</p><Badge variant={analysisEnvironment?.compute.cudaAvailable ? 'secondary' : 'outline'}>{analysisEnvironment?.compute.label || '正在检测…'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">支持 CUDA 的 Pitchord 运行环境会自动让 Demucs、MSST 和 TorchCrepe 使用 GPU；pYIN 使用 CPU。歌词识别会单独检测 CTranslate2 的 CUDA 支持，GPU 初始化失败时自动回退 CPU。</p>{analysisEnvironment?.compute.torchVersion && <p className="mt-1 text-xs text-muted-foreground">PyTorch {analysisEnvironment.compute.torchVersion}{analysisEnvironment.compute.torchBuildCuda ? ` · CUDA ${analysisEnvironment.compute.torchBuildCuda}` : ' · CPU 构建'}</p>}</div>
@@ -1662,7 +1716,7 @@ export default function App() {
       <div className="fixed bottom-4 right-4 z-[70] flex max-w-[calc(100vw-2rem)] flex-col items-end gap-2" data-work-center>
         {workCenterOpen && <section className="w-[360px] max-w-full overflow-hidden rounded-xl border border-border bg-card shadow-2xl" aria-label="任务进度">
           <div className="flex items-center justify-between border-b border-border px-3 py-2"><div className="flex items-center gap-2"><Activity className="size-4 text-primary" /><div><p className="text-sm font-medium">任务进度</p><p className="text-[11px] text-muted-foreground">{workItems.filter(item => item.status === 'running').length ? `${workItems.filter(item => item.status === 'running').length} 项正在执行` : '当前没有运行中的任务'}</p></div></div><div className="flex items-center gap-1"><Button size="sm" variant="ghost" onClick={() => setWorkItems(items => items.filter(item => item.status === 'running'))} disabled={!workItems.some(item => item.status !== 'running')}>清除记录</Button><Button size="icon" variant="ghost" onClick={() => setWorkCenterOpen(false)} aria-label="收起任务进度"><ChevronDown /></Button></div></div>
-          <div className="max-h-80 space-y-1 overflow-y-auto p-2">{workItems.map(item => <div key={item.id} className="rounded-lg border border-border bg-background p-2.5"><div className="flex items-start gap-2">{item.status === 'running' ? <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin text-primary" /> : item.status === 'success' ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary" /> : item.status === 'cancelled' ? <Square className="mt-0.5 size-4 shrink-0 text-muted-foreground" /> : <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />}<div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><p className="truncate text-xs font-medium">{item.title}</p><div className="flex items-center gap-1"><span className="text-[10px] text-muted-foreground">{item.status === 'running' ? '进行中' : item.status === 'success' ? '完成' : item.status === 'cancelled' ? '已取消' : '失败'}</span>{item.status === 'running' && cancellableTaskIds.has(item.id) && <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => void cancelAnalysisTask(item.id as 'separation' | 'pitch' | 'alignment')}><Square className="size-3" />取消</Button>}</div></div><p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{item.message}</p>{item.status === 'running' && <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full bg-primary transition-[width] duration-200 ${item.progress === undefined ? 'w-1/3 animate-pulse' : ''}`} style={item.progress === undefined ? undefined : { width: `${Math.round(clamp(item.progress, 0, 1) * 100)}%` }} /></div>}</div></div></div>)}{!workItems.length && <p className="py-6 text-center text-xs text-muted-foreground">导入、环境与模型、人声分离、音高识别和视频渲染的进度会显示在这里。</p>}</div>
+          <div className="max-h-80 space-y-1 overflow-y-auto p-2">{workItems.map(item => <div key={item.id} className="rounded-lg border border-border bg-background p-2.5"><div className="flex items-start gap-2">{item.status === 'running' ? <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin text-primary" /> : item.status === 'success' ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary" /> : item.status === 'cancelled' ? <Square className="mt-0.5 size-4 shrink-0 text-muted-foreground" /> : <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />}<div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><p className="truncate text-xs font-medium">{item.title}</p><div className="flex items-center gap-1"><span className="text-[10px] text-muted-foreground">{item.status === 'running' ? '进行中' : item.status === 'success' ? '完成' : item.status === 'cancelled' ? '已取消' : '失败'}</span>{item.status === 'running' && cancellableTaskIds.has(item.id) && <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => void cancelAnalysisTask(item.id as 'environment' | 'separation' | 'pitch' | 'alignment')}><Square className="size-3" />取消</Button>}</div></div><p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{item.message}</p>{item.status === 'running' && <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full bg-primary transition-[width] duration-200 ${item.progress === undefined ? 'w-1/3 animate-pulse' : ''}`} style={item.progress === undefined ? undefined : { width: `${Math.round(clamp(item.progress, 0, 1) * 100)}%` }} /></div>}</div></div></div>)}{!workItems.length && <p className="py-6 text-center text-xs text-muted-foreground">导入、环境与模型、人声分离、音高识别和视频渲染的进度会显示在这里。</p>}</div>
         </section>}
         {!workCenterOpen && <Button className="shadow-lg" variant="secondary" onClick={() => setWorkCenterOpen(true)}><Activity />任务进度{workItems.some(item => item.status === 'running') && <Badge variant="secondary">{workItems.filter(item => item.status === 'running').length}</Badge>}<ChevronUp /></Button>}
       </div>
