@@ -120,12 +120,72 @@ def matched_indexes(reference: list[dict], recognized: list[dict]) -> dict[int, 
     return matches
 
 
+def matched_indexes_with_time_hints(reference: list[dict], recognized: list[dict], segments: list[dict]) -> dict[int, int]:
+    """Weighted monotonic text alignment, using LRC times to resolve repeats.
+
+    The hints affect where identical words are matched, never the reference
+    text itself. A missing or inaccurate hint can simply remain unmatched.
+    """
+    expected: list[float | None] = [None] * len(reference)
+    average = typical_token_duration(recognized)
+    by_line: list[list[int]] = [[] for _ in segments]
+    for index, token in enumerate(reference):
+        by_line[token["segment"]].append(index)
+    for line_index, indexes in enumerate(by_line):
+        segment = segments[line_index]
+        if segment.get("timingSource") not in ("lrc", "manual") or not indexes:
+            continue
+        start = float(segment.get("start", 0))
+        span = max(0.1, float(segment.get("end", start)) - start)
+        if segment.get("timingSource") == "lrc":
+            span = min(span, max(2.0, min(7.0, len(indexes) * average * 1.8)))
+        for local_index, index in enumerate(indexes):
+            expected[index] = start + span * (local_index + 0.5) / len(indexes)
+
+    width = len(recognized)
+    previous = [0.0] * (width + 1)
+    directions = [bytearray(width + 1) for _ in range(len(reference) + 1)]
+    for ref_index, token in enumerate(reference, 1):
+        current = [0.0] * (width + 1)
+        hint = expected[ref_index - 1]
+        for asr_index, word in enumerate(recognized, 1):
+            if current[asr_index - 1] >= previous[asr_index]:
+                best = current[asr_index - 1]
+                direction = 2
+            else:
+                best = previous[asr_index]
+                direction = 1
+            if token["key"] == word["key"]:
+                distance = abs((word["start"] + word["end"]) / 2 - hint) if hint is not None else 0.0
+                if distance <= 8.0:
+                    score = previous[asr_index - 1] + 1.0 - distance * 0.08
+                    if score > best:
+                        best = score
+                        direction = 3
+            current[asr_index] = best
+            directions[ref_index][asr_index] = direction
+        previous = current
+    matched: dict[int, int] = {}
+    ref_index, asr_index = len(reference), width
+    while ref_index and asr_index:
+        direction = directions[ref_index][asr_index]
+        if direction == 3:
+            matched[ref_index - 1] = asr_index - 1
+            ref_index -= 1
+            asr_index -= 1
+        elif direction == 2:
+            asr_index -= 1
+        else:
+            ref_index -= 1
+    return matched
+
+
 def typical_token_duration(recognized: list[dict]) -> float:
     spans = [token["end"] - token["start"] for token in recognized if 0.04 <= token["end"] - token["start"] <= 1.0]
     return max(0.12, min(0.35, statistics.median(spans) if spans else 0.20))
 
 
-def line_intervals(lines: list[list[int]], recognized: list[dict], matches: dict[int, int], duration: float) -> tuple[list[tuple[float, float]], list[set[int]]]:
+def line_intervals(lines: list[list[int]], segments: list[dict], recognized: list[dict], matches: dict[int, int], duration: float) -> tuple[list[tuple[float, float]], list[set[int]]]:
     """Find line ranges first; weak/missing ASR matches must not collapse a line."""
     average = typical_token_duration(recognized)
     counts = [max(1, len(indexes)) for indexes in lines]
@@ -167,7 +227,26 @@ def line_intervals(lines: list[list[int]], recognized: list[dict], matches: dict
         )
         center = (start + end) / 2
         span = max(floors[line_index], end - start)
-        proposals[line_index] = (max(0.0, center - span / 2), min(duration, center + span / 2))
+        proposed_start = max(0.0, center - span / 2)
+        proposed_end = min(duration, center + span / 2)
+        hint = segments[line_index]
+        if hint.get("timingSource") in ("lrc", "manual") and abs(proposed_start - float(hint.get("start", 0))) > 5.0:
+            accepted[line_index] = set()
+            continue
+        proposals[line_index] = (proposed_start, proposed_end)
+
+    # A timed LRC provides a useful fallback when speech recognition misses a
+    # sung line. Treat it as a weak estimate rather than forcing an exact time.
+    for index, segment in enumerate(segments):
+        if proposals[index] is not None or segment.get("timingSource") not in ("lrc", "manual"):
+            continue
+        start = max(0.0, min(duration, float(segment.get("start", 0))))
+        original_span = max(0.0, float(segment.get("end", start)) - start)
+        if segment.get("timingSource") == "manual":
+            span = max(floors[index], original_span)
+        else:
+            span = max(floors[index], min(original_span, max(2.0, min(7.0, counts[index] * average * 1.8))))
+        proposals[index] = (start, min(duration, start + span))
 
     # Entire lines may be absent from Whisper output (especially sung Chinese).
     # Place them between neighboring reliable lines, weighted by lyric length.
@@ -259,7 +338,19 @@ def token_intervals(indexes: list[int], recognized: list[dict], matches: dict[in
     return {ref_index: (boundaries[index], boundaries[index + 1]) for index, ref_index in enumerate(indexes)}
 
 
+def alignment_hints(segments: list[dict], duration: float) -> list[dict]:
+    """Recognize timed LRC saved by older Pitchord versions without metadata."""
+    if any(segment.get("timingSource") in ("lrc", "manual", "estimated") for segment in segments):
+        return segments
+    if len(segments) < 2:
+        return segments
+    slot = duration / len(segments)
+    looks_uniform = all(abs(float(segment.get("start", 0)) - index * slot) < 0.15 for index, segment in enumerate(segments))
+    return segments if looks_uniform else [{**segment, "timingSource": "lrc"} for segment in segments]
+
+
 def align_segments(segments: list[dict], recognized: list[dict], duration: float) -> dict:
+    hinted_segments = alignment_hints(segments, duration)
     flat_reference = []
     segment_units = []
     for segment_index, segment in enumerate(segments):
@@ -271,9 +362,16 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
                 flat_reference.append({**unit, "segment": segment_index, "unit": unit_index})
         segment_units.append((units, content_indexes))
 
-    matches = matched_indexes(flat_reference, recognized)
+    # Weighted monotonic matching also works without LRC timestamps. Its
+    # global sequence view handles repeated verses better than unique single
+    # characters; retain the cheaper anchor matcher for unusually long files.
+    matches = (
+        matched_indexes_with_time_hints(flat_reference, recognized, hinted_segments)
+        if len(flat_reference) * len(recognized) <= 4_000_000
+        else matched_indexes(flat_reference, recognized)
+    )
     line_indexes = [indexes for _, indexes in segment_units]
-    ranges, accepted = line_intervals(line_indexes, recognized, matches, duration)
+    ranges, accepted = line_intervals(line_indexes, hinted_segments, recognized, matches, duration)
     aligned_segments = []
     for segment_index, segment in enumerate(segments):
         units, content_indexes = segment_units[segment_index]

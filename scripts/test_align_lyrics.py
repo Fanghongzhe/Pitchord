@@ -64,8 +64,37 @@ class ReferenceAlignmentTests(unittest.TestCase):
         self.assertGreater(result["segments"][2]["start"], result["segments"][0]["end"])
         self.assertEqual(result["segments"][0]["chars"][-1]["text"], "，")
 
+    def test_timed_lrc_hints_disambiguate_repeated_chorus(self):
+        reference = [
+            {**line, "start": start, "end": start + 5, "timingSource": "lrc"}
+            for line, start in zip(lyrics("可惜没如果", "只剩下结果", "可惜没如果", "只剩下结果"), (10, 20, 70, 80))
+        ]
+        recognized = tokens("可惜如果", 10) + tokens("只剩结果", 20) + tokens("可惜没如果", 70) + tokens("只剩下结果", 80)
+        result = aligner.align_segments(reference, recognized, 100)
+        self.assert_valid(result, 100)
+        self.assertLess(abs(result["segments"][0]["start"] - 10), 4)
+        self.assertLess(abs(result["segments"][2]["start"] - 70), 4)
+        self.assertGreater(result["coverage"], 0.7)
+
+    def test_plain_reference_text_aligns_repeated_chorus_in_order(self):
+        reference = [{**line, "timingSource": "estimated"} for line in lyrics("可惜没如果", "只剩下结果", "可惜没如果", "只剩下结果")]
+        recognized = tokens("可惜如果", 10) + tokens("只剩结果", 20) + tokens("可惜没如果", 70) + tokens("只剩下结果", 80)
+        result = aligner.align_segments(reference, recognized, 100)
+        self.assert_valid(result, 100)
+        self.assertLess(abs(result["segments"][0]["start"] - 10), 5)
+        self.assertLess(abs(result["segments"][2]["start"] - 70), 5)
+        self.assertGreater(result["coverage"], 0.7)
+
+    def test_old_timed_lrc_project_without_source_field_uses_its_timestamps(self):
+        reference = [{key: value for key, value in line.items() if key != "timingSource"} for line in [
+            {**line, "start": start, "end": start + 5, "timingSource": "lrc"}
+            for line, start in zip(lyrics("春风吹过", "夜晚降临"), (15, 60))
+        ]]
+        self.assertEqual([x.get("timingSource") for x in aligner.alignment_hints(reference, 90)], ["lrc", "lrc"])
+        self.assertIs(aligner.alignment_hints(lyrics("春风吹过", "夜晚降临"), 6)[0].get("timingSource"), None)
+
     def test_unrecognized_reference_stays_spread_over_available_time(self):
-        reference = lyrics("全都没有识别", "但文字应当保留")
+        reference = [{**line, "timingSource": "estimated"} for line in lyrics("全都没有识别", "但文字应当保留")]
         recognized = tokens("山川湖海", 4)
         result = aligner.align_segments(reference, recognized, 12)
         self.assert_valid(result, 12)

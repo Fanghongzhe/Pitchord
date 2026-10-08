@@ -25,7 +25,7 @@ The complete portable bundle contains the pinned Python packages listed in `scri
 
 Pitchord includes an inference-only copy of MSST model and utility modules. Imports used only by training and spectrogram drawing are optional in this copy; the upstream license is included at `vendor/msst/LICENSE`.
 
-The lyric timestamp matcher was independently implemented from the alignment approach documented by ComfyUI Audio SRT Aligner (MIT): https://github.com/ahkimkoo/ComfyUI-Audio-Srt-Aligner. Pitchord uses faster-whisper timestamps, monotonic unique-token anchors, sequence matching between anchors with a whole-text fallback, and duration-aware estimates for missing lyric lines and units.
+The lyric timestamp matcher was independently implemented from the alignment approach documented by ComfyUI Audio SRT Aligner (MIT): https://github.com/ahkimkoo/ComfyUI-Audio-Srt-Aligner. Pitchord uses faster-whisper timestamps, monotonic text matching, and duration-aware estimates for missing lyric lines and units. When an LRC provides approximate timestamps, Pitchord uses them as weak temporal weights to disambiguate repeated text. Very long references use unique-token anchors and sequence matching between anchors.
 
 Pitchord uses `librosa.pyin` for the pYIN option. The optional RMVPE entry is a capability placeholder only; no RMVPE implementation or model weights are currently distributed.
 

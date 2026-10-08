@@ -5,8 +5,14 @@ describe('lyric editing invariants', () => {
   it('imports timed LRC, skips metadata, and keeps lines in time order', () => {
     const lines = parseLyrics('[ar:歌手]\n[00:04.00]第二句\n[00:00.50]第一句', 8)
     expect(lines.map(line => line.text)).toEqual(['第一句', '第二句'])
+    expect(lines.map(line => line.timingSource)).toEqual(['lrc', 'lrc'])
     expect(lines[0].end).toBeLessThan(lines[1].start)
     expect(lines.every(line => line.chars.every(char => char.start >= line.start && char.end <= line.end))).toBe(true)
+  })
+
+  it('marks untimed lyric lines as estimated time slots', () => {
+    const lines = parseLyrics('第一句\n第二句', 8)
+    expect(lines.map(line => line.timingSource)).toEqual(['estimated', 'estimated'])
   })
 
   it('merges only consecutive selections and carries text, time and character offsets', () => {

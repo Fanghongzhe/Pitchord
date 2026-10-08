@@ -14,6 +14,7 @@ export type LyricSegment = {
   start: number
   end: number
   chars: CharSpan[]
+  timingSource?: 'lrc' | 'estimated' | 'manual'
 }
 
 export const MIN_SPAN = 0.04
@@ -71,7 +72,7 @@ export function retimeSegment(segment: LyricSegment, start: number, end: number)
   const oldDuration = segment.end - segment.start
   const map = (time: number) => oldDuration <= 0 ? a : roundTime(a + ((time - segment.start) / oldDuration) * (b - a))
   return {
-    ...segment, start: a, end: b,
+    ...segment, start: a, end: b, timingSource: 'manual',
     chars: segment.chars.map(char => ({ ...char, start: clamp(map(char.start), a, b), end: clamp(map(char.end), a, b) })),
   }
 }
@@ -130,8 +131,8 @@ export function splitSegment(segment: LyricSegment, splitTime: number, textOffse
   const rightChars = segment.chars.filter(char => char.startOffset >= textOffset)
   const rightOffset = segment.text.length - segment.text.slice(textOffset).trimStart().length
   return [
-    { id: id(), text: leftText, start: segment.start, end: t, chars: leftChars.length ? partitionChars(leftChars, 0, segment.start, t) : estimateChars(leftText, segment.start, t) },
-    { id: id(), text: rightText, start: t, end: segment.end, chars: rightChars.length ? partitionChars(rightChars, rightOffset, t, segment.end) : estimateChars(rightText, t, segment.end) },
+    { id: id(), text: leftText, start: segment.start, end: t, timingSource: 'manual', chars: leftChars.length ? partitionChars(leftChars, 0, segment.start, t) : estimateChars(leftText, segment.start, t) },
+    { id: id(), text: rightText, start: t, end: segment.end, timingSource: 'manual', chars: rightChars.length ? partitionChars(rightChars, rightOffset, t, segment.end) : estimateChars(rightText, t, segment.end) },
   ]
 }
 
@@ -170,7 +171,7 @@ export function mergeSegments(parts: LyricSegment[]): LyricSegment | null {
     chars.push(...part.chars.map(char => ({ ...char, startOffset: char.startOffset + joinOffset, endOffset: char.endOffset + joinOffset })))
     offset = joinOffset + part.text.length
   }
-  return { id: id(), text, start: parts[0].start, end: parts[parts.length - 1].end, chars }
+  return { id: id(), text, start: parts[0].start, end: parts[parts.length - 1].end, timingSource: 'manual', chars }
 }
 
 export function parseLyrics(input: string, duration: number): LyricSegment[] {
@@ -191,12 +192,12 @@ export function parseLyrics(input: string, duration: number): LyricSegment[] {
     return timed.filter(item => item.start <= duration - MIN_SPAN).map((item, index) => {
       const next = timed[index + 1]?.start ?? duration
       const end = Math.max(item.start + MIN_SPAN, Math.min(duration, next - 0.001))
-      return createSegment(item.text, item.start, end)
+      return { ...createSegment(item.text, item.start, end), timingSource: 'lrc' }
     })
   }
   if (!plain.length || duration <= 0) return []
   const slot = duration / plain.length
-  return plain.map((text, index) => createSegment(text, index * slot, Math.min(duration, (index + 1) * slot)))
+  return plain.map((text, index) => ({ ...createSegment(text, index * slot, Math.min(duration, (index + 1) * slot)), timingSource: 'estimated' }))
 }
 
 export function getAdjacentSelection(segments: LyricSegment[], ids: string[]) {
