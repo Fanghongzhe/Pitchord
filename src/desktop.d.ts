@@ -13,12 +13,14 @@ type AnalysisRuntimeStatus = {
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
   compute: { backend: 'cpu' | 'cuda'; label: string; torchVersion: string; torchBuildCuda: string; cudaAvailable: boolean; cudaDeviceCount: number; cudaDeviceName: string; alignmentCudaAvailable: boolean }
   runtimeReady: boolean
+  completeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
   separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean; models: Array<{ id: string; label: string; description: string; ready: boolean }> }
   model: string
   modelReady: boolean
+  installSelection: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; alignmentModels: string[] }
   runtimeDirectory: string
   modelDirectory: string
   baseRuntimeVersion: string
@@ -51,14 +53,14 @@ declare global {
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
       removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
-      installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121' }) => Promise<AnalysisRuntimeStatus>
+      installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121'; installSelection?: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; alignmentModels: string[] } }) => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
       prepareAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
       removeAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
       importAnalysisModel: (kind: 'separation' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
       removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
-      onAnalysisProgress: (callback: (progress: { stage: string; message: string; componentId?: string; componentProgress?: number; overallProgress?: number; detail?: string; components?: Array<{ id: string; label: string; detail: string; status: 'pending' | 'running' | 'complete'; progress: number }> }) => void) => () => void
+      onAnalysisProgress: (callback: (progress: { stage: string; message: string; componentId?: string; componentProgress?: number; overallProgress?: number; detail?: string; components?: Array<{ id: string; label: string; detail: string; status: 'pending' | 'running' | 'complete'; progress: number }>; speedBytesPerSecond?: number; downloadedBytes?: number; totalBytes?: number; etaSeconds?: number; transferState?: 'downloading' | 'cache' | 'installing' }) => void) => () => void
       onTaskProgress: (callback: (progress: { id: string; title: string; status: 'running' | 'success' | 'error' | 'cancelled'; message: string; progress?: number }) => void) => () => void
       projectDefaults: () => Promise<{ parent: string; suggestedName: string }>
       pickProjectParent: () => Promise<string | null>

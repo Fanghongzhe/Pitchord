@@ -32,7 +32,7 @@ function evaluate(expression) {
 }
 
 const status = JSON.parse(await evaluate('window.pitchordDesktop.analysisStatus().then(JSON.stringify)'))
-if (!status.root || !status.defaultRoot || !status.computeProfile || !status.runtimePreference) throw new Error(`Environment status is incomplete: ${JSON.stringify(status)}`)
+if (!status.root || !status.defaultRoot || !status.computeProfile || !status.runtimePreference || typeof status.completeReady !== 'boolean' || !status.installSelection) throw new Error(`Environment status is incomplete: ${JSON.stringify(status)}`)
 if (externalPython) {
   try {
     const external = JSON.parse(await evaluate(`window.pitchordDesktop.configureAnalysisEnvironment(${JSON.stringify({ mode: 'custom', pythonPath: externalPython })}).then(JSON.stringify)`))
@@ -83,6 +83,9 @@ const ui = JSON.parse(await evaluate(`JSON.stringify({
   managed: document.body.textContent.includes('创建独立环境'),
   custom: document.body.textContent.includes('使用现有 Python'),
   root: document.body.textContent.includes('环境存放位置'),
+  presets: document.body.textContent.includes('轻量') && document.body.textContent.includes('推荐') && document.body.textContent.includes('全部'),
+  modelChoices: document.body.textContent.includes('TorchCrepe') && document.body.textContent.includes('HTDemucs FT') && document.body.textContent.includes('Whisper Base'),
+  backgroundClose: document.body.textContent.includes('关闭此窗口不会取消任务'),
 })`))
 socket.close()
 if (smokeProjectRoot) await rm(smokeProjectRoot, { recursive: true, force: true })

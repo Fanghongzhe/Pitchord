@@ -78,6 +78,26 @@ const alignmentModelCatalog = [
   { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。' },
   { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。' },
 ]
+const defaultInstallSelection = {
+  pitchMethods: ['pyin', 'torchcrepe'],
+  separationModels: ['htdemucs'],
+  alignmentModels: ['small'],
+}
+
+function normalizeInstallSelection(value, requireComplete = false) {
+  const source = value && typeof value === 'object' ? value : defaultInstallSelection
+  const uniqueSupported = (items, supported) => [...new Set(Array.isArray(items) ? items.filter(item => supported.includes(item)) : [])]
+  const selection = {
+    pitchMethods: uniqueSupported(source.pitchMethods, ['pyin', 'torchcrepe']),
+    separationModels: uniqueSupported(source.separationModels, separationModelCatalog.map(model => model.id)),
+    alignmentModels: uniqueSupported(source.alignmentModels, alignmentModelCatalog.map(model => model.id)),
+  }
+  if (!selection.pitchMethods.length || !selection.separationModels.length || !selection.alignmentModels.length) {
+    if (requireComplete) throw new Error('音高识别、人声分离和歌词对齐至少需要各选择一项。')
+    return { ...defaultInstallSelection, pitchMethods: [...defaultInstallSelection.pitchMethods], separationModels: [...defaultInstallSelection.separationModels], alignmentModels: [...defaultInstallSelection.alignmentModels] }
+  }
+  return selection
+}
 const baseRuntime = runtimeManifest.baseRuntime
 const legacyAnalysisRoot = () => path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'Pitchord')
 const defaultAnalysisRoot = () => path.join(applicationDirectory(), 'environment')
@@ -267,7 +287,7 @@ function offlineBundleAvailable() {
 
 function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const { onOutput, taskId, taskTitle, ...spawnOptions } = options
+    const { onOutput, onTransfer, transferPaths = [], taskId, taskTitle, ...spawnOptions } = options
     if (taskId && pendingTaskCancellations.delete(taskId)) return reject(new TaskCancelledError())
     if (taskId && activeAnalysisTasks.has(taskId)) return reject(new Error(`${taskTitle || '分析任务'}已经在运行。`))
     const child = spawn(command, args, { windowsHide: true, ...spawnOptions })
@@ -276,9 +296,33 @@ function runProcess(command, args, options = {}) {
     let stdout = ''
     let stderr = ''
     let settled = false
+    let transferTimer = null
+    let transferSample = null
+    let transferBaseline = null
+    let transferSampling = false
+    const sampleTransfer = async () => {
+      if (transferSampling || settled || !onTransfer || !transferPaths.length) return
+      transferSampling = true
+      try {
+        const bytes = (await Promise.all(transferPaths.map(directorySize))).reduce((sum, value) => sum + value, 0)
+        const sampledAt = Date.now()
+        if (transferBaseline === null) transferBaseline = bytes
+        if (transferSample && bytes > transferSample.bytes) {
+          const seconds = Math.max(0.1, (sampledAt - transferSample.sampledAt) / 1000)
+          onTransfer({ speedBytesPerSecond: (bytes - transferSample.bytes) / seconds, downloadedBytes: Math.max(0, bytes - transferBaseline), transferState: 'downloading' })
+        }
+        transferSample = { bytes, sampledAt }
+      } catch { /* progress telemetry must never interrupt an install */ }
+      finally { transferSampling = false }
+    }
+    if (onTransfer && transferPaths.length) {
+      void sampleTransfer()
+      transferTimer = setInterval(() => { void sampleTransfer() }, 1000)
+    }
     const finish = callback => {
       if (settled) return
       settled = true
+      if (transferTimer) clearInterval(transferTimer)
       if (taskId && activeAnalysisTasks.get(taskId) === task) activeAnalysisTasks.delete(taskId)
       callback()
     }
@@ -333,13 +377,26 @@ async function analysisRuntimeStatus() {
   }))
   const customModels = readCustomModels()
   for (const model of customModels.filter(item => item.kind !== 'pitch')) models.push({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })
-  const modelReady = !!models.find(model => model.id === analysisModel)?.ready
   const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
   const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
   const alignmentModels = alignmentModelCatalog.map(model => ({
     ...model,
     ready: fs.existsSync(alignmentModelMarker(model.id)) && fs.existsSync(path.join(alignmentModelDirectory(model.id), 'model.bin')),
   }))
+  let installSelection = normalizeInstallSelection()
+  try {
+    const manifest = JSON.parse(await readFile(path.join(analysisRoot(), 'pitchord-environment.json'), 'utf8'))
+    installSelection = normalizeInstallSelection(manifest.installSelection)
+  } catch { /* use the recommended selection for older or custom environments */ }
+  const requiredPackagesReady = (
+    (!installSelection.separationModels.length || !!probe?.demucs) &&
+    (!installSelection.pitchMethods.includes('pyin') || !!probe?.librosa) &&
+    (!installSelection.pitchMethods.includes('torchcrepe') || !!probe?.torchcrepe) &&
+    (!installSelection.alignmentModels.length || !!probe?.fasterWhisper)
+  )
+  const selectedSeparationModelsReady = installSelection.separationModels.every(id => models.some(model => model.id === id && model.ready))
+  const selectedAlignmentModelsReady = installSelection.alignmentModels.every(id => alignmentModels.some(model => model.id === id && model.ready))
+  const completeReady = requiredPackagesReady && selectedSeparationModelsReady && selectedAlignmentModelsReady
   const detectedGpu = await detectNvidiaGpu()
   const computeProfile = await configuredComputeProfile()
   return {
@@ -363,7 +420,8 @@ async function analysisRuntimeStatus() {
       cudaDeviceName: probe?.cudaDeviceName || '',
       alignmentCudaAvailable: !!probe?.ctranslateCudaAvailable,
     },
-    runtimeReady: !!(probe?.demucs && probe?.torchcrepe && probe?.librosa && probe?.fasterWhisper),
+    runtimeReady: requiredPackagesReady,
+    completeReady,
     mediaTools: { ffmpeg: !!(bundledFfmpeg && fs.existsSync(bundledFfmpeg)), ffprobe: !!(bundledFfprobe && fs.existsSync(bundledFfprobe)) },
     separationModels: models,
     pitchMethods: [
@@ -374,7 +432,8 @@ async function analysisRuntimeStatus() {
     ],
     alignment: { manual: true, pitchMatching: true, forcedAlignment: !!probe?.fasterWhisper && alignmentModels.some(model => model.ready), models: alignmentModels },
     model: analysisModel,
-    modelReady,
+    modelReady: models.some(model => model.ready),
+    installSelection,
     runtimeDirectory: managedRuntimeRoot(),
     modelDirectory: modelRoot(),
     baseRuntimeVersion: baseRuntime.version,
@@ -488,18 +547,32 @@ async function choosePackageSource(computeProfile) {
     : officialPackageSource
 }
 
-function environmentPlan(computeProfile, packageSource = officialPackageSource) {
+function environmentPlan(computeProfile, packageSource = officialPackageSource, installSelection = defaultInstallSelection) {
+  const pitchLabels = installSelection.pitchMethods.map(id => id === 'pyin' ? 'pYIN' : 'TorchCrepe').join('、')
+  const separationLabels = installSelection.separationModels.map(id => separationModelCatalog.find(model => model.id === id)?.label || id).join('、')
+  const alignmentLabels = installSelection.alignmentModels.map(id => alignmentModelCatalog.find(model => model.id === id)?.label || id).join('、')
   return [
     { id: 'base-runtime', label: 'Python 与高速安装工具', detail: `内置 Python 3.12、uv 并行安装器 · ${packageSource.label}`, weight: 0.08 },
     { id: 'compute', label: computeProfile === 'cuda121' ? 'GPU 计算组件' : 'CPU 计算组件', detail: computeProfile === 'cuda121' ? 'PyTorch · CUDA 12.1' : 'PyTorch · CPU', weight: 0.32 },
-    { id: 'dependencies', label: '音频分析依赖', detail: '并行下载 Demucs、TorchCrepe、librosa、faster-whisper', weight: 0.28 },
-    { id: 'separation-model', label: '人声分离模型', detail: 'HTDemucs（推荐）', weight: 0.12 },
-    { id: 'alignment-model', label: '歌词对齐模型', detail: 'Whisper Small（推荐）', weight: 0.17 },
+    { id: 'dependencies', label: '音频分析依赖', detail: `音高：${pitchLabels} · 按选择安装运行组件`, weight: 0.28 },
+    { id: 'separation-model', label: '人声分离模型', detail: separationLabels, weight: 0.12 },
+    { id: 'alignment-model', label: '歌词对齐模型', detail: alignmentLabels, weight: 0.17 },
     { id: 'verify', label: '完整性检查', detail: '运行环境、模型与计算设备', weight: 0.03 },
   ]
 }
 
-function reportEnvironmentProgress(plan, componentId, componentProgress, message, detail = '') {
+function transferTelemetry(output) {
+  const text = String(output || '')
+  const speed = text.match(/([\d.]+)\s*([KMGT]?i?B)\/s/i)
+  if (!speed) return {}
+  const units = { KB: 1000, KIB: 1024, MB: 1000 ** 2, MIB: 1024 ** 2, GB: 1000 ** 3, GIB: 1024 ** 3, TB: 1000 ** 4, TIB: 1024 ** 4 }
+  const speedBytesPerSecond = Number(speed[1]) * (units[speed[2].toUpperCase()] || 1)
+  const eta = text.match(/<(\d+):(\d{2})(?::(\d{2}))?/)
+  const etaSeconds = eta ? eta[3] ? Number(eta[1]) * 3600 + Number(eta[2]) * 60 + Number(eta[3]) : Number(eta[1]) * 60 + Number(eta[2]) : undefined
+  return { speedBytesPerSecond, ...(etaSeconds === undefined ? {} : { etaSeconds }) }
+}
+
+function reportEnvironmentProgress(plan, componentId, componentProgress, message, detail = '', telemetry = {}) {
   const currentIndex = plan.findIndex(item => item.id === componentId)
   const bounded = Math.max(0, Math.min(1, Number(componentProgress) || 0))
   let overallProgress = 0
@@ -514,7 +587,7 @@ function reportEnvironmentProgress(plan, componentId, componentProgress, message
     }
     return { id: item.id, label: item.label, detail: item.detail, status: 'pending', progress: 0 }
   })
-  const payload = { componentId, componentProgress: bounded, overallProgress: Math.min(1, overallProgress), components, detail }
+  const payload = { componentId, componentProgress: bounded, overallProgress: Math.min(1, overallProgress), components, detail, ...telemetry }
   sendAnalysisProgress('environment', message, payload)
   sendTaskProgress('environment', '准备完整分析环境', 'running', message, payload.overallProgress)
 }
@@ -552,7 +625,7 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
     try {
       await verifyLocalFile(partial, expectedHash, expectedSize)
       await fs.promises.rename(partial, destination)
-      onProgress?.(1, '已复用完整的 Python 下载缓存。')
+      onProgress?.(1, '已复用完整的 Python 下载缓存。', { downloadedBytes: expectedSize, totalBytes: expectedSize, transferState: 'cache' })
       return
     } catch {
       await fs.promises.rm(partial, { force: true })
@@ -579,6 +652,9 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
   if (existingSize) for await (const chunk of fs.createReadStream(partial)) hash.update(chunk)
   let received = existingSize
   let lastPercent = -1
+  let lastSampleAt = Date.now()
+  let lastSampleBytes = received
+  let speedBytesPerSecond = 0
   try {
     try {
       while (true) {
@@ -592,8 +668,17 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
         const percent = Math.min(100, Math.floor(received / total * 100))
         if (percent !== lastPercent) {
           lastPercent = percent
+          const sampledAt = Date.now()
+          const elapsedSeconds = (sampledAt - lastSampleAt) / 1000
+          if (elapsedSeconds >= 0.25) {
+            const instantSpeed = (received - lastSampleBytes) / elapsedSeconds
+            speedBytesPerSecond = speedBytesPerSecond ? speedBytesPerSecond * 0.7 + instantSpeed * 0.3 : instantSpeed
+            lastSampleAt = sampledAt
+            lastSampleBytes = received
+          }
           const message = `${existingSize ? '正在续传' : '正在下载'}内置 Python… ${percent}%`
-          if (onProgress) onProgress(percent / 100, message)
+          const telemetry = { downloadedBytes: received, totalBytes: expectedSize, transferState: 'downloading', ...(speedBytesPerSecond ? { speedBytesPerSecond, etaSeconds: Math.max(0, Math.round((expectedSize - received) / speedBytesPerSecond)) } : {}) }
+          if (onProgress) onProgress(percent / 100, message, telemetry)
           else sendAnalysisProgress('base-runtime', message)
         }
       }
@@ -628,7 +713,7 @@ async function ensureBaseRuntime(force = false, onProgress) {
     onProgress?.(1, '内置 Python 已存在，无需重复下载。')
     return basePythonPath()
   }
-  const report = (progress, message) => onProgress ? onProgress(progress, message) : sendAnalysisProgress('base-runtime', message)
+  const report = (progress, message, telemetry) => onProgress ? onProgress(progress, message, telemetry) : sendAnalysisProgress('base-runtime', message, telemetry)
   await requireFreeSpace(512 * 1024 * 1024, '安装内置 Python ')
   const downloads = path.join(analysisRoot(), 'downloads')
   const archive = path.join(downloads, baseRuntime.archive)
@@ -641,8 +726,8 @@ async function ensureBaseRuntime(force = false, onProgress) {
     report(0.15, '正在读取完整版内置 Python…')
     await verifyLocalFile(bundledArchive, baseRuntime.sha256, baseRuntime.size)
     await fs.promises.copyFile(bundledArchive, archive)
-  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size, (progress, message) => report(progress * 0.75, message))
-  report(0.8, '下载校验通过，正在解压内置 Python…')
+  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size, (progress, message, telemetry) => report(progress * 0.75, message, telemetry))
+  report(0.8, '下载校验通过，正在解压内置 Python…', { transferState: 'installing' })
   await mkdir(staging, { recursive: true })
   try {
     try { await runProcess('tar.exe', ['-xzf', archive, '-C', staging], { env: process.env }) }
@@ -667,8 +752,8 @@ async function ensureBaseRuntime(force = false, onProgress) {
   return basePythonPath()
 }
 
-async function ensureRecommendedSeparationModel(python, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
-  const selectedModel = separationModel(analysisModel)
+async function ensureRecommendedSeparationModel(python, modelId, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
+  const selectedModel = separationModel(modelId)
   try {
     const marker = JSON.parse(await readFile(modelMarker(selectedModel.id), 'utf8'))
     if (marker.model === selectedModel.id) {
@@ -696,7 +781,7 @@ async function ensureRecommendedSeparationModel(python, onProgress, taskId = 'en
         const line = output.trim().split(/\r?\n/).at(-1)
         if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) return
         ticks += 1
-        onProgress?.(Math.min(0.92, 0.08 + ticks * 0.025), `正在下载 ${selectedModel.label} 人声分离模型…`, line.slice(0, 240))
+        onProgress?.(Math.min(0.92, 0.08 + ticks * 0.025), `正在下载 ${selectedModel.label} 人声分离模型…`, line.slice(0, 240), { transferState: 'downloading', ...transferTelemetry(line) })
       },
     })
   }
@@ -705,8 +790,7 @@ async function ensureRecommendedSeparationModel(python, onProgress, taskId = 'en
   onProgress?.(1, `${selectedModel.label} 人声分离模型已准备完成。`)
 }
 
-async function ensureRecommendedAlignmentModel(python, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
-  const modelId = 'small'
+async function ensureRecommendedAlignmentModel(python, modelId, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
   const selectedModel = alignmentModelCatalog.find(model => model.id === modelId)
   const output = alignmentModelDirectory(modelId)
   if (fs.existsSync(alignmentModelMarker(modelId)) && fs.existsSync(path.join(output, 'model.bin'))) {
@@ -725,7 +809,7 @@ async function ensureRecommendedAlignmentModel(python, onProgress, taskId = 'env
       for (const line of outputText.split(/\r?\n/)) {
         if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
         const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
-        onProgress?.(progress ? Number(progress[1]) : 0.08, progress?.[2] || `正在下载 ${selectedModel.label} 歌词对齐模型…`, progress ? '' : line.slice(-240))
+        onProgress?.(progress ? Number(progress[1]) : 0.08, progress?.[2] || `正在下载 ${selectedModel.label} 歌词对齐模型…`, progress ? '' : line.slice(-240), { transferState: progress && Number(progress[1]) >= 1 ? 'installing' : 'downloading', ...transferTelemetry(line) })
       }
     },
   })
@@ -947,17 +1031,18 @@ app.whenReady().then(async () => {
     analysisInstallTask = (async () => {
       if (typeof request.root === 'string' && path.isAbsolute(request.root)) configuredAnalysisRoot = path.resolve(request.root)
       const requestedProfile = ['auto', 'cpu', 'cuda121'].includes(request.computeProfile) ? request.computeProfile : await configuredComputeProfile()
+      const installSelection = normalizeInstallSelection(request.installSelection, true)
       await writeSettings({ analysisRoot: analysisRoot(), runtimePreference: 'managed', computeProfile: requestedProfile })
       const detectedGpu = await detectNvidiaGpu()
       let resolvedProfile = requestedProfile === 'auto' ? detectedGpu ? 'cuda121' : 'cpu' : requestedProfile
       sendTaskProgress('environment', '准备完整分析环境', 'running', '正在自动选择最快的软件下载线路…', 0.005)
       let packageSource = await choosePackageSource(resolvedProfile)
-      let plan = environmentPlan(resolvedProfile, packageSource)
+      let plan = environmentPlan(resolvedProfile, packageSource, installSelection)
       const reportedComponentProgress = new Map()
-      const report = (componentId, progress, message, detail = '') => {
+      const report = (componentId, progress, message, detail = '', telemetry = {}) => {
         const monotonicProgress = Math.max(reportedComponentProgress.get(componentId) || 0, progress)
         reportedComponentProgress.set(componentId, monotonicProgress)
-        reportEnvironmentProgress(plan, componentId, monotonicProgress, message, detail)
+        reportEnvironmentProgress(plan, componentId, monotonicProgress, message, detail, telemetry)
       }
       const requiredBytes = fs.existsSync(managedPythonPath())
         ? resolvedProfile === 'cuda121' ? 5 * 1024 * 1024 * 1024 : 3 * 1024 * 1024 * 1024
@@ -965,7 +1050,7 @@ app.whenReady().then(async () => {
       await requireFreeSpace(requiredBytes, '安装分析环境')
       report('base-runtime', 0.01, `已选择${packageSource.label}，将一次准备 6 项完整能力。`)
       let python
-      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message) => report('base-runtime', progress * 0.8, message))
+      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message, telemetry) => report('base-runtime', progress * 0.8, message, '', telemetry))
       else python = (await findBootstrapPython())?.executable
       if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
@@ -980,21 +1065,29 @@ app.whenReady().then(async () => {
         componentMessage = message
         progressTicks = 0
         componentStart = start
-        report(id, start, message)
+        report(id, start, message, '', { transferState: 'installing' })
       }
-      const finishComponent = message => report(currentComponent, 1, message || componentMessage)
+      const finishComponent = message => report(currentComponent, 1, message || componentMessage, '', { transferState: 'installing' })
       const progressOutput = output => {
         const line = output.trim().split(/\r?\n/).at(-1)
         if (line) {
           progressTicks += 1
-          report(currentComponent, Math.min(0.92, componentStart + progressTicks * 0.012), componentMessage, line.slice(0, 240))
+          const telemetry = transferTelemetry(line)
+          report(currentComponent, Math.min(0.92, componentStart + progressTicks * 0.012), componentMessage, line.slice(0, 240), { transferState: Object.keys(telemetry).length || /download|fetch/i.test(line) ? 'downloading' : 'installing', ...telemetry })
         }
       }
-      const processOptions = () => ({ env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备完整分析环境', onOutput: progressOutput })
+      const processOptions = () => ({
+        env: analysisEnvironment(python),
+        taskId: 'environment',
+        taskTitle: '准备完整分析环境',
+        onOutput: progressOutput,
+        transferPaths: [path.join(analysisRoot(), 'cache', 'uv'), path.join(analysisRoot(), 'cache', 'pip')],
+        onTransfer: telemetry => report(currentComponent, reportedComponentProgress.get(currentComponent) || componentStart, componentMessage, '', telemetry),
+      })
       const sourceArguments = source => ['--index-url', source.pypi, ...(source.id === 'domestic' ? ['--extra-index-url', officialPackageSource.pypi] : [])]
       const activatePackageSource = source => {
         packageSource = source
-        plan = environmentPlan(resolvedProfile, packageSource)
+        plan = environmentPlan(resolvedProfile, packageSource, installSelection)
       }
       let uvAvailable = false
       if (!useOfflineBundle) {
@@ -1059,15 +1152,24 @@ app.whenReady().then(async () => {
         await installPackages(torchArguments(resolvedProfile))
         if (requestedProfile === 'auto' && resolvedProfile === 'cuda121' && !(await probePython(python))?.cudaAvailable) {
           resolvedProfile = 'cpu'
-          plan = environmentPlan(resolvedProfile, packageSource)
+          plan = environmentPlan(resolvedProfile, packageSource, installSelection)
           beginComponent('compute', 'GPU 运行检查未通过，正在自动切换到 CPU 计算组件…', 0.5)
           await installPackages((source, installer) => [installer === 'uv' ? '--reinstall' : '--force-reinstall', ...torchArguments('cpu')(source)])
         }
         finishComponent(`${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 计算组件已安装。`)
-        beginComponent('dependencies', '正在并行安装音频分析依赖（Demucs、TorchCrepe、librosa、faster-whisper）…')
-        const requirements = path.join(scriptRoot, 'analysis-requirements.txt')
+        beginComponent('dependencies', '正在并行安装所选音频分析组件…')
+        const selectedRequirements = [
+          'demucs==4.1.0',
+          ...(installSelection.pitchMethods.includes('torchcrepe') ? ['torchcrepe==0.0.24'] : []),
+          ...(installSelection.pitchMethods.includes('pyin') ? ['librosa==1.0.0'] : []),
+          'faster-whisper==1.2.1',
+          'omegaconf==2.2.3',
+          'ml-collections==1.1.0',
+          'beartype==0.14.1',
+          'rotary-embedding-torch==0.3.5',
+        ]
         const constraints = path.join(scriptRoot, 'analysis-lock-win-x64.txt')
-        await installPackages(source => [...sourceArguments(source), '--requirement', requirements, '--constraint', constraints])
+        await installPackages(source => [...sourceArguments(source), ...selectedRequirements, '--constraint', constraints])
       } else {
         report('base-runtime', 1, 'Python 与安装工具已准备完成。')
         report('compute', 1, '离线 CPU 计算组件已准备完成。')
@@ -1076,20 +1178,26 @@ app.whenReady().then(async () => {
       }
       finishComponent('音频分析依赖已安装。')
       const probe = await probePython(python)
-      if (!probe?.demucs || !probe?.torchcrepe || !probe?.librosa || !probe?.fasterWhisper) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
+      const selectedPackagesReady = !!probe?.demucs && !!probe?.fasterWhisper && (!installSelection.pitchMethods.includes('torchcrepe') || !!probe?.torchcrepe) && (!installSelection.pitchMethods.includes('pyin') || !!probe?.librosa)
+      if (!selectedPackagesReady) throw new Error('依赖安装完成，但所选分析组件未通过完整性检查。请再次点击修复。')
       if (resolvedProfile === 'cuda121' && !probe.cudaAvailable) throw new Error('CUDA 组件已安装，但 PyTorch 无法使用当前显卡。请选择“自动选择”或 CPU 环境后重试。')
-      const environmentManifest = { schemaVersion: 1, managedBy: 'Pitchord', runtimeVersion: analysisRuntimeVersion, requestedProfile, resolvedProfile, python, pythonVersion: probe.version, createdAt: new Date().toISOString() }
+      const environmentManifest = { schemaVersion: 1, managedBy: 'Pitchord', runtimeVersion: analysisRuntimeVersion, requestedProfile, resolvedProfile, python, pythonVersion: probe.version, installSelection, createdAt: new Date().toISOString() }
       await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
       await writeFile(path.join(analysisRoot(), 'pitchord-environment.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
       await preferManagedRuntime(requestedProfile)
-      await ensureRecommendedSeparationModel(python, (progress, message, detail) => report('separation-model', progress, message, detail))
-      await ensureRecommendedAlignmentModel(python, (progress, message, detail) => report('alignment-model', progress, message, detail))
+      for (const [index, modelId] of installSelection.separationModels.entries()) {
+        await ensureRecommendedSeparationModel(python, modelId, (progress, message, detail, telemetry) => report('separation-model', (index + progress) / installSelection.separationModels.length, message, detail, telemetry))
+      }
+      for (const [index, modelId] of installSelection.alignmentModels.entries()) {
+        await ensureRecommendedAlignmentModel(python, modelId, (progress, message, detail, telemetry) => report('alignment-model', (index + progress) / installSelection.alignmentModels.length, message, detail, telemetry))
+      }
       report('verify', 0.25, '正在检查全部组件与推荐模型…')
       const finalStatus = await analysisRuntimeStatus()
-      if (!finalStatus.runtimeReady || !finalStatus.modelReady || !finalStatus.alignment.forcedAlignment) throw new Error('完整环境安装结束，但部分组件或推荐模型未通过检查。请点击修复后重试。')
+      const selectedModelsReady = installSelection.separationModels.every(id => finalStatus.separationModels.find(model => model.id === id)?.ready) && installSelection.alignmentModels.every(id => finalStatus.alignment.models.find(model => model.id === id)?.ready)
+      if (!finalStatus.runtimeReady || !selectedModelsReady) throw new Error('完整环境安装结束，但部分所选模型未通过检查。请点击修复后重试。')
       report('verify', 1, '完整分析环境已准备完成。')
       sendAnalysisProgress('complete', '完整分析环境已准备完成。', { overallProgress: 1, componentProgress: 1, components: plan.map(item => ({ id: item.id, label: item.label, detail: item.detail, status: 'complete', progress: 1 })) })
-      sendTaskProgress('environment', '准备完整分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 环境与推荐模型已全部准备完成`, 1)
+      sendTaskProgress('environment', '准备完整分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 环境与所选模型已全部准备完成`, 1)
       return { ...finalStatus, busy: false }
     })()
     try { return await analysisInstallTask }
