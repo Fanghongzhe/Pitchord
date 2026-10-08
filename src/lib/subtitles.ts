@@ -1,5 +1,5 @@
 import type { LyricSegment } from './lyrics'
-import { noteName, type PitchPoint } from './pitch'
+import { noteHz, pitchForChar, pitchNotation, type PitchAnnotation, type PitchPoint } from './pitch'
 
 export type PitchColorBand = 'rainbow' | 'cool' | 'warm' | 'custom'
 
@@ -39,7 +39,7 @@ export type WordTimedSubtitle = {
   text: string
   start: number
   end: number
-  words: Array<{ text: string; start: number; end: number }>
+  words: Array<{ text: string; start: number; end: number; pitch?: { notation: string; motion: PitchAnnotation['motion']; notes: Array<{ note: string; start: number; end: number }> } }>
 }
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value))
@@ -113,29 +113,21 @@ function activeX(segment: LyricSegment, charIndex: number, style: SubtitleStyle)
   return Math.round(style.width / 2 - estimatedWidth / 2 + estimatedWidth * (before + current / 2) / total)
 }
 
-function charPitchSlices(start: number, end: number, points: PitchPoint[]) {
-  const voiced = points.filter(point => point.voiced && point.hz > 0 && point.time >= start && point.time < end)
-  if (!voiced.length) return [{ start, end, hz: 0 }]
-  const slices: Array<{ start: number; end: number; hz: number }> = []
-  let sliceStart = start
-  let lastHz = voiced[0].hz
-  for (const point of voiced) {
-    if (point.time > sliceStart + 0.035 && Math.abs(1200 * Math.log2(point.hz / lastHz)) >= 18) {
-      slices.push({ start: sliceStart, end: point.time, hz: lastHz })
-      sliceStart = point.time
-    }
-    lastHz = point.hz
-  }
-  slices.push({ start: sliceStart, end, hz: lastHz })
-  return slices.filter(slice => slice.end - slice.start >= 0.005)
-}
-
-export function wordTimedSubtitles(segments: LyricSegment[]): WordTimedSubtitle[] {
+export function wordTimedSubtitles(segments: LyricSegment[], points: PitchPoint[] = []): WordTimedSubtitle[] {
   return segments.map(segment => ({
     text: segment.text,
     start: segment.start,
     end: segment.end,
-    words: segment.chars.map(word => ({ text: word.text, start: word.start, end: word.end })),
+    words: segment.chars.map(word => {
+      const annotation = pitchForChar(word, points)
+      return {
+        text: word.text, start: word.start, end: word.end,
+        ...((points.length || word.pitchOverride) ? { pitch: {
+          notation: pitchNotation(annotation), motion: annotation.motion,
+          notes: annotation.notes.map(item => ({ note: item.note, start: word.start + (word.end - word.start) * item.start, end: word.start + (word.end - word.start) * item.end })),
+        } } : {}),
+      }
+    }),
   }))
 }
 
@@ -147,7 +139,13 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
     segment.chars.forEach((word, index) => {
       const nextStart = segment.chars[index + 1]?.start ?? segment.end
       const displayEnd = Math.max(word.end, nextStart)
-      const slices = charPitchSlices(word.start, word.end, points)
+      const annotation = pitchForChar(word, points)
+      const slices = annotation.notes.length ? annotation.notes.map((item, noteIndex) => ({
+        start: word.start + (word.end - word.start) * item.start,
+        end: word.start + (word.end - word.start) * item.end,
+        hz: noteHz(item.note) ?? 0,
+        label: annotation.motion === 'vibrato' && noteIndex === 0 ? `${item.note}~` : item.note,
+      })) : [{ start: word.start, end: word.end, hz: 0, label: '' }]
       const x = activeX(segment, index, style)
       const lineY = style.height - style.marginBottom
       slices[slices.length - 1].end = displayEnd
@@ -156,7 +154,7 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
         const start = assTime(slice.start)
         const end = assTime(slice.end)
         events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${displayedText(segment, word.id, color)}`)
-        if (style.showPitch && slice.hz > 0) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${lineY - style.fontSize - 16})\\c${assColor(color)}&}${escapeAss(noteName(slice.hz))}`)
+        if (style.showPitch && slice.hz > 0) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${lineY - style.fontSize - 16})\\c${assColor(color)}&}${escapeAss(slice.label)}`)
         if (style.showDot) events.push(`Dialogue: 1,${start},${end},Dot,,0,0,0,,{\\pos(${x},${lineY + Math.round(style.fontSize * 0.72)})\\c${assColor(color)}&}・`)
       }
     })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createSegment, getAdjacentSelection, mergeSegments, parseLyrics, replaceText, retimeSegment, splitSegment, suggestSplitOffset } from './lyrics'
+import { carryPitchOverrides, createSegment, getAdjacentSelection, mergeSegments, parseLyrics, replaceText, retimeSegment, splitSegment, suggestSplitOffset } from './lyrics'
 
 describe('lyric editing invariants', () => {
   it('imports timed LRC, skips metadata, and keeps lines in time order', () => {
@@ -56,5 +56,15 @@ describe('lyric editing invariants', () => {
     expect(changed.chars[0].id).toBe(original.chars[0].id)
     expect(changed.chars[2].id).toBe(original.chars[1].id)
     expect(changed.chars[1].origin).toBe('estimated')
+  })
+
+  it('keeps current manual pitch when switching a stored timing result', () => {
+    const current = createSegment('唱', 0, 1)
+    current.chars[0].pitchOverride = { motion: 'flat', notes: [{ note: 'E4', start: 0, end: 1 }] }
+    const historical = retimeSegment(current, 2, 3)
+    delete historical.chars[0].pitchOverride
+    expect(carryPitchOverrides([historical], [current])[0].chars[0].pitchOverride).toEqual(current.chars[0].pitchOverride)
+    const revised = { ...current, chars: [{ ...current.chars[0], text: '啊' }] }
+    expect(carryPitchOverrides([revised], [current])[0].chars[0].pitchOverride).toBeUndefined()
   })
 })

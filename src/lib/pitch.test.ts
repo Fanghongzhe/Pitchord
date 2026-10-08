@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSegment } from './lyrics'
-import { analyzeAudioBuffer, matchPitchToChars, noteName } from './pitch'
+import { analyzeAudioBuffer, matchPitchToChars, noteName, parsePitchNotation, pitchNotation, validPitchAnnotation } from './pitch'
 
 describe('pitch analysis matching', () => {
   it('formats detected frequencies as note names', () => {
@@ -33,6 +33,39 @@ describe('pitch analysis matching', () => {
     const segment = createSegment('字', 0, 1)
     const matches = matchPitchToChars([segment], [{ time: 0.5, hz: 0, confidence: 0, rms: 0.001, voiced: false }])
     expect(matches[segment.chars[0].id].motion).toBe('unvoiced')
+  })
+
+  it('does not turn a stable tone with jitter or one brief pitch error into a run of notes', () => {
+    const segment = createSegment('唱', 0, 1)
+    const points = Array.from({ length: 100 }, (_, index) => {
+      const cents = index >= 50 && index < 53 ? 200 : Math.sin(index * 1.7) * 17
+      return { time: (index + 0.5) / 100, hz: 440 * 2 ** (cents / 1200), confidence: 0.9, rms: 0.2, voiced: true }
+    })
+    expect(pitchNotation(matchPitchToChars([segment], points)[segment.chars[0].id].annotation)).toBe('A4')
+  })
+
+  it('separates sustained note changes from periodic vibrato', () => {
+    const segment = createSegment('唱', 0, 1)
+    const glide = Array.from({ length: 100 }, (_, index) => ({
+      time: (index + 0.5) / 100,
+      hz: index < 30 || index >= 65 ? 329.63 : 349.23,
+      confidence: 0.9, rms: 0.2, voiced: true,
+    }))
+    expect(pitchNotation(matchPitchToChars([segment], glide)[segment.chars[0].id].annotation)).toBe('E4-F4-E4')
+    const vibrato = Array.from({ length: 100 }, (_, index) => ({
+      time: (index + 0.5) / 100,
+      hz: 329.63 * 2 ** (55 * Math.sin(2 * Math.PI * 5 * index / 100) / 1200),
+      confidence: 0.9, rms: 0.2, voiced: true,
+    }))
+    expect(pitchNotation(matchPitchToChars([segment], vibrato)[segment.chars[0].id].annotation)).toBe('E4~')
+  })
+
+  it('parses editable shorthand and keeps valid note timing', () => {
+    const annotation = parsePitchNotation('E4-F4-E4')!
+    expect(annotation.notes).toHaveLength(3)
+    expect(validPitchAnnotation(annotation)).toBe(true)
+    expect(pitchNotation(parsePitchNotation('E4~')!)).toBe('E4~')
+    expect(parsePitchNotation('E4~F4')).toBeNull()
   })
 })
 

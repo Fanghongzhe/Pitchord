@@ -1,3 +1,5 @@
+import type { PitchAnnotation } from './pitch'
+
 export type CharSpan = {
   id: string
   text: string
@@ -6,6 +8,7 @@ export type CharSpan = {
   start: number
   end: number
   origin: 'estimated' | 'manual'
+  pitchOverride?: PitchAnnotation
 }
 
 export type LyricSegment = {
@@ -66,6 +69,18 @@ export function createSegment(text: string, start: number, end: number): LyricSe
   return { id: id(), text: clean, start: a, end: b, chars: estimateChars(clean, a, b) }
 }
 
+/** Keep the latest human pitch edits when applying a stored timing suggestion. */
+export function carryPitchOverrides(next: LyricSegment[], current: LyricSegment[]): LyricSegment[] {
+  const existing = new Map(current.flatMap(segment => segment.chars.map(char => [char.id, char] as const)))
+  return next.map(segment => ({
+    ...segment,
+    chars: segment.chars.map(char => {
+      const previous = existing.get(char.id)
+      return previous?.text === char.text ? { ...char, pitchOverride: previous.pitchOverride } : { ...char, pitchOverride: undefined }
+    }),
+  }))
+}
+
 export function retimeSegment(segment: LyricSegment, start: number, end: number): LyricSegment {
   const a = roundTime(start)
   const b = roundTime(end)
@@ -91,8 +106,11 @@ export function replaceText(segment: LyricSegment, text: string): LyricSegment {
   const middleEnd = right.length ? right[0].start : segment.end
   if (middle.length && middleEnd - middleStart < middle.length * 0.001) {
     const redistributed = estimateChars(text, segment.start, segment.end).map((char, index) => {
-      if (index < prefix) return { ...char, id: segment.chars[index].id }
-      if (index >= newUnits.length - suffix) return { ...char, id: segment.chars[oldUnits.length - (newUnits.length - index)].id }
+      if (index < prefix) return { ...char, id: segment.chars[index].id, pitchOverride: segment.chars[index].pitchOverride }
+      if (index >= newUnits.length - suffix) {
+        const previous = segment.chars[oldUnits.length - (newUnits.length - index)]
+        return { ...char, id: previous.id, pitchOverride: previous.pitchOverride }
+      }
       return char
     })
     return { ...segment, text, chars: redistributed }

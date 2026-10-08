@@ -402,6 +402,7 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
                 "start": round(max(line_start, min(line_end, timing[0])), 3),
                 "end": round(max(line_start, min(line_end, timing[1])), 3),
                 "origin": "estimated",
+                **({"pitchOverride": old["pitchOverride"]} if old.get("text") == unit["text"] and old.get("pitchOverride") else {}),
             })
         aligned_segments.append({
             **segment,
