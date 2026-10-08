@@ -110,6 +110,36 @@ class ReferenceAlignmentTests(unittest.TestCase):
         self.assert_valid(result, 10)
         self.assertTrue(all(line["end"] - line["start"] > 0.5 for line in result["segments"]))
 
+    def test_missed_opening_line_uses_vocal_onset_instead_of_old_lrc_time(self):
+        reference = [{**line, "start": start, "end": end, "timingSource": "lrc"}
+                     for line, start, end in zip(lyrics("假如把犯得起的错", "能错的都错过"), (24, 29), (28, 31))]
+        activity = {"step": 0.02, "high": [False] * 1600, "onsets": [25.44, 29.40], "gaps": []}
+        result = aligner.align_segments(reference, tokens("能错的都错过", 29.4), 35, activity)
+        self.assert_valid(result, 35)
+        self.assertAlmostEqual(result["segments"][0]["start"], 25.44, places=2)
+        self.assertIn(0, result["lowConfidenceLines"])
+
+    def test_sustained_last_word_uses_pitch_gap_inside_quiet_vocal_valley(self):
+        ranges = [(98.2, 100.9), (100.91, 104.85), (108.0, 111.0)]
+        times = [100.9 + index * 0.02 for index in range(42)]
+        activity = {
+            "step": 0.02, "high": [True] * 6000, "onsets": [],
+            "gaps": [(101.36, 101.84)], "pitchGaps": [(101.70, 101.84)],
+            "pitchTimes": times, "pitchVoiced": [True] * len(times),
+        }
+        updated, adjustments = aligner.refine_ranges_with_vocals(ranges, [set(), set(), set()], lyrics("你会怎么做", "那么多如果", "下一句"), activity)
+        self.assertAlmostEqual(updated[0][1], 101.70, places=2)
+        self.assertAlmostEqual(updated[1][0], 101.84, places=2)
+        self.assertEqual(updated[2], ranges[2])
+        self.assertEqual(len(adjustments), 1)
+
+    def test_a_quiet_gap_does_not_move_an_already_correct_boundary(self):
+        ranges = [(10.0, 12.0), (12.01, 15.0)]
+        activity = {"step": 0.02, "high": [False] * 1000, "onsets": [], "gaps": [(12.4, 12.8)]}
+        updated, adjustments = aligner.refine_ranges_with_vocals(ranges, [set(), set()], lyrics("一句", "二句"), activity)
+        self.assertEqual(updated, ranges)
+        self.assertEqual(adjustments, [])
+
     def test_cli_aligns_reference_json_with_mock_asr_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

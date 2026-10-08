@@ -349,7 +349,173 @@ def alignment_hints(segments: list[dict], duration: float) -> list[dict]:
     return segments if looks_uniform else [{**segment, "timingSource": "lrc"} for segment in segments]
 
 
-def align_segments(segments: list[dict], recognized: list[dict], duration: float) -> dict:
+def vocal_activity(audio: str, pitch_points: list[dict] | None = None) -> dict | None:
+    """Find phrase onsets and clear vocal gaps in the selected vocal stem."""
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        with sf.SoundFile(audio) as source:
+            sample_rate = source.samplerate
+            step = max(1, round(sample_rate * 0.02))
+            rms = []
+            while True:
+                frame = source.read(step, dtype="float32", always_2d=True)
+                if not len(frame):
+                    break
+                rms.append(float(np.sqrt(np.mean(frame * frame))))
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return None
+    if not rms:
+        return None
+    reference = float(np.quantile(rms, 0.90))
+    low = [value >= max(0.002, reference * 0.025) for value in rms]
+    high = [value >= max(0.012, reference * 0.10) for value in rms]
+
+    def runs(flags: list[bool]) -> list[tuple[int, int]]:
+        found = []
+        index = 0
+        while index < len(flags):
+            if not flags[index]:
+                index += 1
+                continue
+            end = index + 1
+            while end < len(flags) and flags[end]:
+                end += 1
+            found.append((index, end))
+            index = end
+        return found
+
+    # Small drops within a sung syllable should not become phrase breaks.
+    for flags in (low, high):
+        spans = runs(flags)
+        for (_, left_end), (right_start, _) in zip(spans, spans[1:]):
+            if right_start - left_end <= 3:
+                flags[left_end:right_start] = [True] * (right_start - left_end)
+
+    seconds = step / sample_rate
+    low_runs = runs(low)
+    onsets = [
+        start * seconds for index, (start, end) in enumerate(low_runs)
+        if (end - start) * seconds >= 0.18
+        and (index == 0 or (start - low_runs[index - 1][1]) * seconds >= 0.40)
+    ]
+    high_runs = runs(high)
+    gaps = [
+        (left_end * seconds, right_start * seconds)
+        for (left_start, left_end), (right_start, right_end) in zip(high_runs, high_runs[1:])
+        if (left_end - left_start) * seconds >= 0.18
+        and (right_end - right_start) * seconds >= 0.12
+        and 0.16 <= (right_start - left_end) * seconds <= 2.0
+    ]
+    pitch_gaps = []
+    if pitch_points:
+        voiced = [bool(point.get("voiced")) and float(point.get("hz") or 0) > 0 for point in pitch_points]
+        pitch_runs = runs(voiced)
+        for (left_start, left_end), (right_start, right_end) in zip(pitch_runs, pitch_runs[1:]):
+            gap_start = float(pitch_points[left_end]["time"])
+            gap_end = float(pitch_points[right_start]["time"])
+            if float(pitch_points[left_end - 1]["time"]) - float(pitch_points[left_start]["time"]) < 0.08:
+                continue
+            if float(pitch_points[right_end - 1]["time"]) - float(pitch_points[right_start]["time"]) < 0.08:
+                continue
+            if 0.10 <= gap_end - gap_start <= 1.5:
+                pitch_gaps.append((gap_start, gap_end))
+    return {
+        "step": seconds, "rms": rms, "high": high, "onsets": onsets, "gaps": gaps,
+        "pitchGaps": pitch_gaps,
+        "pitchTimes": [float(point["time"]) for point in pitch_points] if pitch_points else [],
+        "pitchVoiced": voiced if pitch_points else [],
+    }
+
+
+def local_vocal_valleys(activity: dict, boundary: float) -> list[tuple[float, float]]:
+    """Find a quiet phrase break relative to the local sung volume."""
+    values = activity.get("rms")
+    if not values:
+        return []
+    step = activity["step"]
+    baseline_start = max(0, round((boundary - 0.34) / step))
+    baseline_end = min(len(values), round((boundary + 0.10) / step))
+    if baseline_end <= baseline_start:
+        return []
+    baseline = statistics.median(values[baseline_start:baseline_end])
+    if baseline < 0.008:
+        return []
+    threshold = max(0.003, baseline * 0.20)
+    start = max(0, round((boundary + 0.08) / step))
+    stop = min(len(values), round((boundary + 1.35) / step))
+    valleys = []
+    while start < stop:
+        if values[start] >= threshold:
+            start += 1
+            continue
+        end = start + 1
+        while end < stop and values[end] < threshold:
+            end += 1
+        if (end - start) * step >= 0.12:
+            valleys.append((start * step, end * step))
+        start = end
+    return valleys
+
+
+def refine_ranges_with_vocals(ranges: list[tuple[float, float]], accepted: list[set[int]], segments: list[dict], activity: dict | None) -> tuple[list[tuple[float, float]], list[dict]]:
+    if not ranges or not activity:
+        return ranges, []
+    updated = list(ranges)
+    adjustments = []
+    # A missed opening phrase should use the first clear vocal onset near its
+    # LRC hint, instead of keeping an inaccurate timestamp unchanged.
+    if not accepted[0] and segments[0].get("timingSource") in ("lrc", "manual"):
+        start, end = updated[0]
+        nearby = [time for time in activity["onsets"] if start - 0.4 <= time <= start + 3.0 and time <= end - 0.25]
+        if nearby:
+            onset = min(nearby, key=lambda time: abs(time - start))
+            if abs(onset - start) >= 0.08:
+                updated[0] = (onset, end)
+                adjustments.append({"line": 0, "kind": "onset", "from": start, "to": onset})
+
+    for index in range(len(updated) - 1):
+        start, boundary = updated[index]
+        next_start, next_end = updated[index + 1]
+        frame = min(len(activity["high"]) - 1, max(0, round(boundary / activity["step"])))
+        if not activity["high"][frame]:
+            continue
+        energy_gaps = [*activity["gaps"], *local_vocal_valleys(activity, boundary)]
+        candidates = [
+            (gap_start, gap_end) for gap_start, gap_end in energy_gaps
+            if boundary + 0.08 <= gap_start <= boundary + 0.95
+            and gap_start > start + 0.25 and gap_end < next_end - 0.25
+            and gap_end >= next_start - 0.25
+        ]
+        if not candidates:
+            continue
+        gap_start, gap_end = min(candidates, key=lambda gap: gap[0] - boundary - 0.2 * (gap[1] - gap[0]))
+        matching_pitch_gaps = [
+            (pitch_start, pitch_end) for pitch_start, pitch_end in activity.get("pitchGaps", [])
+            if min(gap_end, pitch_end) - max(gap_start, pitch_start) >= 0.04
+            and pitch_start >= boundary + 0.08 and pitch_end < next_end - 0.25
+        ]
+        if matching_pitch_gaps:
+            gap_start, gap_end = min(matching_pitch_gaps, key=lambda gap: abs(gap[0] - gap_start))
+        if gap_start - boundary < 0.24:
+            continue
+        pitch_times = activity.get("pitchTimes", [])
+        if pitch_times:
+            first = bisect_left(pitch_times, boundary)
+            last = bisect_left(pitch_times, gap_start)
+            region = activity["pitchVoiced"][first:last]
+            if len(region) < 5 or sum(region) / len(region) < 0.70:
+                continue
+        elif gap_start - boundary < 0.40 or gap_end - gap_start < 0.20:
+            continue
+        updated[index] = (start, gap_start)
+        updated[index + 1] = (gap_end, next_end)
+        adjustments.append({"line": index, "kind": "gap", "from": boundary, "to": gap_start, "nextStart": gap_end})
+    return updated, adjustments
+
+
+def align_segments(segments: list[dict], recognized: list[dict], duration: float, activity: dict | None = None) -> dict:
     hinted_segments = alignment_hints(segments, duration)
     flat_reference = []
     segment_units = []
@@ -372,6 +538,7 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
     )
     line_indexes = [indexes for _, indexes in segment_units]
     ranges, accepted = line_intervals(line_indexes, hinted_segments, recognized, matches, duration)
+    ranges, audio_adjustments = refine_ranges_with_vocals(ranges, accepted, hinted_segments, activity)
     aligned_segments = []
     for segment_index, segment in enumerate(segments):
         units, content_indexes = segment_units[segment_index]
@@ -417,6 +584,7 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
         "referenceTokens": len(flat_reference),
         "recognizedTokens": len(recognized),
         "lowConfidenceLines": [index for index, indexes in enumerate(line_indexes) if indexes and not accepted[index]],
+        "audioBoundaryAdjustments": audio_adjustments,
     }
 
 
@@ -504,7 +672,7 @@ def main() -> None:
     if not recognized:
         raise RuntimeError("没有从人声音轨中识别到可用于对齐的歌词。")
     emit_progress(0.86, "正在把识别时间戳匹配到输入歌词…")
-    result = align_segments(segments, recognized, duration)
+    result = align_segments(segments, recognized, duration, vocal_activity(args.audio, payload.get("pitchPoints")))
     result.update({"model": args.model, "language": detected_language, "device": device, "source": "faster-whisper-monotonic-text-alignment"})
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

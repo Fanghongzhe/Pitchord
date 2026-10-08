@@ -1277,7 +1277,7 @@ app.whenReady().then(async () => {
     const suffix = `${selectedModel.id}-${new Date().toISOString().replace(/[:.]/g, '-')}`
     const input = path.join(analysisDirectory, `alignment-input-${suffix}.json`)
     const output = path.join(analysisDirectory, `lyrics-alignment-${suffix}.json`)
-    await writeFile(input, JSON.stringify({ segments: request.segments, duration: request.duration }, null, 2), 'utf8')
+    await writeFile(input, JSON.stringify({ segments: request.segments, duration: request.duration, pitchPoints: Array.isArray(request.pitchPoints) ? request.pitchPoints : [] }, null, 2), 'utf8')
     const python = await preferredPythonPath()
     const probe = await probePython(python)
     if (!python || !probe?.fasterWhisper) throw new Error('歌词对齐组件尚未安装，请先检查或修复分析环境。')

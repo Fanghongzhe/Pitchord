@@ -73,7 +73,7 @@ declare global {
       openProjectFolder: () => Promise<string>
       separateVocals: (source: { name: string; data: ArrayBuffer; model?: string }) => Promise<{ vocals: { name: string; path: string; data: Uint8Array }; accompaniment: { name: string; path: string; data: Uint8Array } } | null>
       analyzePitch: (algorithm: 'pyin' | 'torchcrepe') => Promise<{ algorithm: string; path: string; device: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
-      alignLyrics: (request: { segments: import('./lib/lyrics').LyricSegment[]; duration: number; model: string; language: string; vocals?: string }) => Promise<{ segments: import('./lib/lyrics').LyricSegment[]; coverage: number; matchedTokens: number; referenceTokens: number; recognizedTokens: number; lowConfidenceLines: number[]; model: string; language?: string; path: string; input: string }>
+      alignLyrics: (request: { segments: import('./lib/lyrics').LyricSegment[]; duration: number; model: string; language: string; vocals?: string; pitchPoints?: import('./lib/pitch').PitchPoint[] }) => Promise<{ segments: import('./lib/lyrics').LyricSegment[]; coverage: number; matchedTokens: number; referenceTokens: number; recognizedTokens: number; lowConfidenceLines: number[]; model: string; language?: string; path: string; input: string }>
       readAnalysisFile: (file: string) => Promise<Uint8Array>
       activateSeparationResult: (result: { vocals: string; accompaniment: string }) => Promise<boolean>
       activateVocalResult: (result: { vocals: string }) => Promise<boolean>
