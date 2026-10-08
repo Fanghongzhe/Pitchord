@@ -1307,7 +1307,7 @@ app.whenReady().then(async () => {
       })
       const result = JSON.parse(await readFile(output, 'utf8'))
       if (!Array.isArray(result.segments) || !Number.isFinite(result.coverage)) throw new Error('歌词对齐结果格式无效。')
-      sendTaskProgress('alignment', '歌词时间戳匹配', 'success', `匹配完成，歌词覆盖率 ${Math.round(result.coverage * 100)}%`, 1)
+      sendTaskProgress('alignment', '歌词时间戳匹配', 'success', `匹配完成，歌词覆盖率 ${Math.round(result.coverage * 100)}%，${result.lowConfidenceLines?.length || 0} 句建议复核`, 1)
       return { ...result, path: output, input: vocals }
     } catch (error) {
       if (isTaskCancelled(error)) {

@@ -15,6 +15,8 @@ import re
 import sys
 import unicodedata
 import uuid
+import statistics
+from bisect import bisect_left
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -66,20 +68,24 @@ def longest_increasing_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, in
     pairs = sorted(pairs)
     if not pairs:
         return []
-    lengths = [1] * len(pairs)
+    tails: list[int] = []
+    tail_indexes: list[int] = []
     previous = [-1] * len(pairs)
-    best = 0
     for index, (_, asr_index) in enumerate(pairs):
-        for candidate in range(index):
-            if pairs[candidate][1] < asr_index and lengths[candidate] + 1 > lengths[index]:
-                lengths[index] = lengths[candidate] + 1
-                previous[index] = candidate
-        if lengths[index] > lengths[best]:
-            best = index
+        position = bisect_left(tails, asr_index)
+        if position == len(tails):
+            tails.append(asr_index)
+            tail_indexes.append(index)
+        else:
+            tails[position] = asr_index
+            tail_indexes[position] = index
+        if position:
+            previous[index] = tail_indexes[position - 1]
     result = []
-    while best >= 0:
-        result.append(pairs[best])
-        best = previous[best]
+    cursor = tail_indexes[-1]
+    while cursor >= 0:
+        result.append(pairs[cursor])
+        cursor = previous[cursor]
     return list(reversed(result))
 
 
@@ -93,6 +99,11 @@ def matched_indexes(reference: list[dict], recognized: list[dict]) -> dict[int, 
         for index, key in enumerate(ref_keys)
         if key and ref_counts[key] == 1 and asr_counts[key] == 1
     ])
+    # Individual Chinese characters are often repeated throughout a song. A
+    # handful of unique-character anchors is less reliable than matching the
+    # complete reference in order (as in Audio-Srt-Aligner's fallback).
+    if len(anchors) < max(12, int(min(len(reference), len(recognized)) * 0.008)):
+        anchors = []
     matches: dict[int, int] = {ref: asr for ref, asr in anchors}
     sentinels = [(-1, -1), *anchors, (len(reference), len(recognized))]
     for (left_ref, left_asr), (right_ref, right_asr) in zip(sentinels, sentinels[1:]):
@@ -109,45 +120,143 @@ def matched_indexes(reference: list[dict], recognized: list[dict]) -> dict[int, 
     return matches
 
 
-def interpolate_times(reference: list[dict], recognized: list[dict], matches: dict[int, int], duration: float) -> list[tuple[float, float]]:
-    if not reference:
-        return []
-    recognized_start = recognized[0]["start"] if recognized else 0.0
-    recognized_end = recognized[-1]["end"] if recognized else duration
-    direct = {
-        ref_index: (recognized[asr_index]["start"], recognized[asr_index]["end"])
-        for ref_index, asr_index in matches.items()
-    }
-    times: list[tuple[float, float] | None] = [direct.get(index) for index in range(len(reference))]
-    matched = sorted(direct)
-    sentinels = [-1, *matched, len(reference)]
-    for left, right in zip(sentinels, sentinels[1:]):
-        first = left + 1
-        last = right - 1
-        if first > last:
+def typical_token_duration(recognized: list[dict]) -> float:
+    spans = [token["end"] - token["start"] for token in recognized if 0.04 <= token["end"] - token["start"] <= 1.0]
+    return max(0.12, min(0.35, statistics.median(spans) if spans else 0.20))
+
+
+def line_intervals(lines: list[list[int]], recognized: list[dict], matches: dict[int, int], duration: float) -> tuple[list[tuple[float, float]], list[set[int]]]:
+    """Find line ranges first; weak/missing ASR matches must not collapse a line."""
+    average = typical_token_duration(recognized)
+    counts = [max(1, len(indexes)) for indexes in lines]
+    gap = min(0.01, duration / max(1, len(lines) * 4))
+    floors = [max(0.12, count * max(0.10, average * 0.65)) for count in counts]
+    floor_budget = max(0.001, duration - gap * max(0, len(lines) - 1))
+    if sum(floors) > floor_budget:
+        floors = [value * floor_budget / sum(floors) for value in floors]
+
+    proposals: list[tuple[float, float] | None] = [None] * len(lines)
+    accepted: list[set[int]] = [set() for _ in lines]
+    for line_index, indexes in enumerate(lines):
+        if not indexes:
             continue
-        window_start = direct[left][1] if left in direct else recognized_start
-        window_end = direct[right][0] if right in direct else recognized_end
-        if window_end <= window_start:
-            window_end = min(duration, window_start + 0.04 * (last - first + 1))
-        count = last - first + 1
-        for offset, index in enumerate(range(first, last + 1)):
-            times[index] = (
-                window_start + (window_end - window_start) * offset / count,
-                window_start + (window_end - window_start) * (offset + 1) / count,
-            )
-    clean: list[tuple[float, float]] = []
-    cursor = 0.0
-    for item in times:
-        start, end = item or (cursor, cursor + 0.04)
-        start = max(cursor, min(duration, float(start)))
-        end = max(start + 0.001, min(duration, float(end)))
-        if end > duration:
-            start = max(cursor, duration - 0.001)
-            end = duration
-        clean.append((round(start, 3), round(end, 3)))
-        cursor = end
-    return clean
+        observations = []
+        for local_index, ref_index in enumerate(indexes):
+            if ref_index not in matches:
+                continue
+            token = recognized[matches[ref_index]]
+            center = (token["start"] + token["end"]) / 2
+            estimated_center = center + ((len(indexes) - 1) / 2 - local_index) * average
+            observations.append((ref_index, local_index, token, estimated_center))
+        required = 1 if len(indexes) <= 2 else max(2, math.ceil(len(indexes) * 0.25))
+        if len(observations) < required:
+            continue
+        median_center = statistics.median(item[3] for item in observations)
+        tolerance = max(0.8, len(indexes) * average * 0.7)
+        inliers = [item for item in observations if abs(item[3] - median_center) <= tolerance]
+        if len(inliers) < required:
+            continue
+        accepted[line_index] = {item[0] for item in inliers}
+        start = min(
+            statistics.median(item[2]["start"] - item[1] * average for item in inliers),
+            min(item[2]["start"] for item in inliers),
+        )
+        end = max(
+            statistics.median(item[2]["end"] + (len(indexes) - item[1] - 1) * average for item in inliers),
+            max(item[2]["end"] for item in inliers),
+        )
+        center = (start + end) / 2
+        span = max(floors[line_index], end - start)
+        proposals[line_index] = (max(0.0, center - span / 2), min(duration, center + span / 2))
+
+    # Entire lines may be absent from Whisper output (especially sung Chinese).
+    # Place them between neighboring reliable lines, weighted by lyric length.
+    position = 0
+    while position < len(lines):
+        if proposals[position] is not None:
+            position += 1
+            continue
+        first = position
+        while position < len(lines) and proposals[position] is None:
+            position += 1
+        last = position
+        left = proposals[first - 1][1] if first else 0.0
+        right = proposals[last][0] if last < len(lines) else duration
+        if right <= left:
+            right = left + sum(counts[first:last]) * average
+        weight_total = sum(counts[first:last])
+        weight_before = 0
+        for index in range(first, last):
+            slot_start = left + (right - left) * weight_before / weight_total
+            weight_before += counts[index]
+            slot_end = left + (right - left) * weight_before / weight_total
+            span = max(floors[index], min(slot_end - slot_start, counts[index] * average * 2.5))
+            center = (slot_start + slot_end) / 2
+            proposals[index] = (center - span / 2, center + span / 2)
+
+    # Preserve each line's shape on collision by moving following lines. If
+    # necessary, remove free gaps before reducing any line's duration.
+    placed: list[tuple[float, float]] = []
+    for index, proposal in enumerate(proposals):
+        assert proposal is not None
+        start, end = proposal
+        span = max(end - start, floors[index])
+        start = max(0.0 if not placed else placed[-1][1] + gap, start)
+        placed.append((start, start + span))
+    if placed[-1][1] > duration:
+        spans = [end - start for start, end in placed]
+        free_gaps = [placed[0][0], *[placed[index][0] - placed[index - 1][1] for index in range(1, len(placed))]]
+        overflow = placed[-1][1] - duration
+        reducible_gaps = sum(free_gaps) - gap * max(0, len(lines) - 1)
+        remove = min(overflow, max(0.0, reducible_gaps))
+        if remove:
+            removable = [free_gaps[0], *[max(0.0, value - gap) for value in free_gaps[1:]]]
+            free_gaps = [value - remove * part / sum(removable) for value, part in zip(free_gaps, removable)]
+            overflow -= remove
+        if overflow > 0:
+            extras = [max(0.0, span - floor) for span, floor in zip(spans, floors)]
+            reduction = min(overflow, sum(extras))
+            if reduction:
+                spans = [span - reduction * extra / sum(extras) for span, extra in zip(spans, extras)]
+        placed = []
+        cursor = 0.0
+        for free, span in zip(free_gaps, spans):
+            start = cursor + free
+            placed.append((start, start + span))
+            cursor = start + span
+    return placed, accepted
+
+
+def token_intervals(indexes: list[int], recognized: list[dict], matches: dict[int, int], accepted: set[int], start: float, end: float) -> dict[int, tuple[float, float]]:
+    """Spread unmatched words inside their line rather than in a tiny anchor gap."""
+    if not indexes:
+        return {}
+    count = len(indexes)
+    step = (end - start) / count
+    anchors = [(-1, start - step / 2)]
+    for position, ref_index in enumerate(indexes):
+        if ref_index in accepted:
+            token = recognized[matches[ref_index]]
+            center = (token["start"] + token["end"]) / 2
+            if start <= center <= end:
+                anchors.append((position, center))
+    anchors.append((count, end + step / 2))
+    anchors.sort()
+    targets = [start + (position + 0.5) * step for position in range(count)]
+    for (left_index, left_time), (right_index, right_time) in zip(anchors, anchors[1:]):
+        for index in range(max(0, left_index), min(count - 1, right_index) + 1):
+            targets[index] = left_time + (right_time - left_time) * (index - left_index) / (right_index - left_index)
+    minimum = min(0.06, step * 0.5)
+    centers = [max(start + (index + 0.5) * minimum, target) for index, target in enumerate(targets)]
+    for index in range(count - 1, -1, -1):
+        upper = end - (count - index - 0.5) * minimum
+        if index + 1 < count:
+            upper = min(upper, centers[index + 1] - minimum)
+        centers[index] = min(centers[index], upper)
+    for index in range(1, count):
+        centers[index] = max(centers[index], centers[index - 1] + minimum)
+    boundaries = [start, *[(centers[index - 1] + centers[index]) / 2 for index in range(1, count)], end]
+    return {ref_index: (boundaries[index], boundaries[index + 1]) for index, ref_index in enumerate(indexes)}
 
 
 def align_segments(segments: list[dict], recognized: list[dict], duration: float) -> dict:
@@ -163,31 +272,27 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
         segment_units.append((units, content_indexes))
 
     matches = matched_indexes(flat_reference, recognized)
-    content_times = interpolate_times(flat_reference, recognized, matches, duration)
+    line_indexes = [indexes for _, indexes in segment_units]
+    ranges, accepted = line_intervals(line_indexes, recognized, matches, duration)
     aligned_segments = []
-    previous_end = 0.0
     for segment_index, segment in enumerate(segments):
         units, content_indexes = segment_units[segment_index]
         old_chars = segment.get("chars") if isinstance(segment.get("chars"), list) else []
-        if content_indexes:
-            line_start = content_times[content_indexes[0]][0]
-            line_end = content_times[content_indexes[-1]][1]
-        else:
-            line_start = float(segment.get("start", previous_end))
-            line_end = float(segment.get("end", line_start + 0.2))
-        line_start = max(previous_end, min(duration, line_start))
-        line_end = max(line_start + 0.001, min(duration, line_end))
+        line_start, line_end = ranges[segment_index]
 
-        # Punctuation receives the nearest gap; recognized lyric units keep ASR time.
+        content_times = token_intervals(content_indexes, recognized, matches, accepted[segment_index], line_start, line_end)
         content_by_unit = {flat_reference[index]["unit"]: content_times[index] for index in content_indexes}
         timed_units: list[tuple[float, float]] = []
         for unit_index in range(len(units)):
             if unit_index in content_by_unit:
                 timed_units.append(content_by_unit[unit_index])
                 continue
-            left = next((content_by_unit[i][1] for i in range(unit_index - 1, -1, -1) if i in content_by_unit), line_start)
-            right = next((content_by_unit[i][0] for i in range(unit_index + 1, len(units)) if i in content_by_unit), line_end)
-            timed_units.append((left, max(left + 0.001, right)))
+            # Punctuation has no spoken duration; keep its marker beside the
+            # nearest lyric unit and entirely inside the enclosing line.
+            previous = next((content_by_unit[i][1] for i in range(unit_index - 1, -1, -1) if i in content_by_unit), None)
+            following = next((content_by_unit[i][0] for i in range(unit_index + 1, len(units)) if i in content_by_unit), None)
+            point = previous if previous is not None else following if following is not None else line_start
+            timed_units.append((max(line_start, point - 0.001), min(line_end, point + 0.001)))
         chars = []
         for unit_index, (unit, timing) in enumerate(zip(units, timed_units)):
             old = old_chars[unit_index] if unit_index < len(old_chars) else {}
@@ -196,8 +301,8 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
                 "text": unit["text"],
                 "startOffset": unit["startOffset"],
                 "endOffset": unit["endOffset"],
-                "start": round(max(line_start, timing[0]), 3),
-                "end": round(min(line_end, max(timing[0] + 0.001, timing[1])), 3),
+                "start": round(max(line_start, min(line_end, timing[0])), 3),
+                "end": round(max(line_start, min(line_end, timing[1])), 3),
                 "origin": "estimated",
             })
         aligned_segments.append({
@@ -206,13 +311,13 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
             "end": round(line_end, 3),
             "chars": chars,
         })
-        previous_end = line_end
     return {
         "segments": aligned_segments,
         "coverage": round(len(matches) / max(1, len(flat_reference)), 4),
         "matchedTokens": len(matches),
         "referenceTokens": len(flat_reference),
         "recognizedTokens": len(recognized),
+        "lowConfidenceLines": [index for index, indexes in enumerate(line_indexes) if indexes and not accepted[index]],
     }
 
 
@@ -251,13 +356,27 @@ def transcribe(audio: str, model_name: str, language: str | None, model_root: st
         language=language or None,
         beam_size=5,
         word_timestamps=True,
-        vad_filter=True,
+        # Sung and quiet syllables can be rejected by speech VAD. The input is
+        # already the selected vocal stem, so preserve the whole recording.
+        vad_filter=False,
         condition_on_previous_text=False,
     )
     tokens = []
     for segment in stream:
-        for word in segment.words or []:
-            tokens.extend(split_asr_word(word.word, float(word.start), float(word.end)))
+        if segment.words:
+            for word in segment.words:
+                tokens.extend(split_asr_word(word.word, float(word.start), float(word.end)))
+        else:
+            # Whisper sometimes supplies segment text without word timings.
+            fallback = [unit for unit in text_units(segment.text or "") if unit["key"]]
+            start = float(segment.start or 0)
+            end = max(start + 0.05, float(segment.end or start + 0.05))
+            for index, unit in enumerate(fallback):
+                tokens.append({
+                    "key": unit["key"], "text": unit["text"],
+                    "start": start + (end - start) * index / len(fallback),
+                    "end": start + (end - start) * (index + 1) / len(fallback),
+                })
     return tokens, getattr(info, "language", language), device
 
 

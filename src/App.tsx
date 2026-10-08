@@ -32,7 +32,7 @@ type History = { present: LyricSegment[]; past: LyricSegment[][]; future: LyricS
 type View = 'lines' | 'chars'
 type SeparationResult = { id: string; modelId: string; modelLabel: string; createdAt: string; vocals: string; accompaniment: string }
 type PitchResult = { id: string; algorithm: PitchAlgorithm; label: string; createdAt: string; path?: string; device?: string; points: PitchPoint[]; separationResultId?: string }
-type AlignmentResult = { id: string; modelId: string; modelLabel: string; createdAt: string; inputResultId?: string; path?: string; coverage: number; segments: LyricSegment[] }
+type AlignmentResult = { id: string; modelId: string; modelLabel: string; createdAt: string; inputResultId?: string; path?: string; coverage: number; lowConfidenceLines?: number[]; segments: LyricSegment[] }
 type Draft = { segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; activeVocalResultId?: string; activeAccompanimentResultId?: string; pitchInputResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string; alignmentInputResultId?: string; alignmentResults?: AlignmentResult[]; activeAlignmentResultId?: string }
 type TrackKind = 'original' | 'vocals' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
@@ -655,15 +655,17 @@ export default function App() {
       const modelLabel = analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel
       const saved: AlignmentResult = {
         id: crypto.randomUUID(), modelId: alignmentModel, modelLabel, createdAt: new Date().toISOString(),
-        inputResultId: alignmentInputResultId, path: result.path, coverage: result.coverage, segments: result.segments,
+        inputResultId: alignmentInputResultId, path: result.path, coverage: result.coverage, lowConfidenceLines: result.lowConfidenceLines, segments: result.segments,
       }
       setAlignmentResults(current => [saved, ...current])
       setActiveAlignmentResultId(saved.id)
       commit(result.segments)
       setSelectedLineIds([])
       setSelectedCharIds([])
-      setAlignmentStatus(`${modelLabel} 已匹配，覆盖率 ${Math.round(result.coverage * 100)}%`)
-      setNotice('歌词时间建议已应用到句级和字级时间块。可立即人工复核；撤回会恢复应用前的时间。')
+      const uncertain = result.lowConfidenceLines || []
+      setAlignmentStatus(`${modelLabel} 已匹配，覆盖率 ${Math.round(result.coverage * 100)}% · ${uncertain.length} 句建议复核`)
+      const reviewLines = uncertain.slice(0, 8).map(index => index + 1).join('、')
+      setNotice(`歌词时间建议已应用到句级和字级时间块。${uncertain.length ? `第 ${reviewLines}${uncertain.length > 8 ? ' 等' : ''} 句缺少可靠识别，请重点复核。` : '可立即人工复核。'}撤回会恢复应用前的时间。`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (taskWasCancelled(error)) {
@@ -686,7 +688,7 @@ export default function App() {
     if (!result) return
     setActiveAlignmentResultId(id)
     commit(result.segments)
-    setAlignmentStatus(`${result.modelLabel} 的历史匹配结果已应用，覆盖率 ${Math.round(result.coverage * 100)}%`)
+    setAlignmentStatus(`${result.modelLabel} 的历史匹配结果已应用，覆盖率 ${Math.round(result.coverage * 100)}% · ${result.lowConfidenceLines?.length || 0} 句建议复核`)
     setNotice('已切换并应用歌词时间戳匹配结果，可通过撤回返回切换前的时间。')
   }
 
