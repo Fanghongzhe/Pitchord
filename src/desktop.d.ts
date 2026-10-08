@@ -58,7 +58,7 @@ declare global {
       importAnalysisModel: (kind: 'separation' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
       removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
-      onAnalysisProgress: (callback: (progress: { stage: string; message: string }) => void) => () => void
+      onAnalysisProgress: (callback: (progress: { stage: string; message: string; componentId?: string; componentProgress?: number; overallProgress?: number; detail?: string; components?: Array<{ id: string; label: string; detail: string; status: 'pending' | 'running' | 'complete'; progress: number }> }) => void) => () => void
       onTaskProgress: (callback: (progress: { id: string; title: string; status: 'running' | 'success' | 'error' | 'cancelled'; message: string; progress?: number }) => void) => () => void
       projectDefaults: () => Promise<{ parent: string; suggestedName: string }>
       pickProjectParent: () => Promise<string | null>

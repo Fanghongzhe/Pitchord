@@ -241,11 +241,15 @@ function analysisEnvironment(pythonPath) {
     XDG_CACHE_HOME: path.join(modelRoot(), 'cache'),
     PIP_CACHE_DIR: path.join(analysisRoot(), 'cache', 'pip'),
     PIP_DEFAULT_TIMEOUT: '120',
+    UV_CACHE_DIR: path.join(analysisRoot(), 'cache', 'uv'),
+    UV_HTTP_TIMEOUT: '120',
     PYTHONNOUSERSITE: '1',
     PYTHONUTF8: '1',
     HF_HUB_DISABLE_TELEMETRY: '1',
     HF_HUB_DISABLE_IMPLICIT_TOKEN: '1',
     HF_HUB_VERBOSITY: 'error',
+    HF_HUB_DOWNLOAD_TIMEOUT: '120',
+    HF_XET_HIGH_PERFORMANCE: '1',
     PATH: torchLibrary && fs.existsSync(torchLibrary) ? `${torchLibrary}${path.delimiter}${process.env.PATH || ''}` : process.env.PATH,
     ...(pythonPath ? { PITCHORD_PYTHON: pythonPath } : {}),
   }
@@ -429,12 +433,90 @@ async function removeManagedAnalysisData(target) {
   return analysisStorageStatus()
 }
 
-function sendAnalysisProgress(stage, message) {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('pitchord:analysis-progress', { stage, message })
+function sendAnalysisProgress(stage, message, details = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('pitchord:analysis-progress', { stage, message, ...details })
 }
 
 function sendTaskProgress(id, title, status, message, progress) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('pitchord:task-progress', { id, title, status, message, progress })
+}
+
+const officialPackageSource = {
+  id: 'official',
+  label: '官方下载线路',
+  pypi: 'https://pypi.org/simple',
+  torchBase: 'https://download.pytorch.org/whl',
+}
+const domesticPackageSource = {
+  id: 'domestic',
+  label: '国内加速线路（清华 TUNA / 上海交大 SJTUG）',
+  pypi: 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple',
+  torchBase: 'https://mirror.sjtu.edu.cn/pytorch-wheels',
+}
+
+function torchIndex(source, computeProfile) {
+  return `${source.torchBase}/${computeProfile === 'cuda121' ? 'cu121' : 'cpu'}`
+}
+
+async function probeDownloadUrl(url, timeout = 2800) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeout)
+  const startedAt = Date.now()
+  try {
+    const response = await net.fetch(url, { signal: controller.signal, headers: { Range: 'bytes=0-0' } })
+    if (!response.ok || !response.body) return Number.POSITIVE_INFINITY
+    await response.body.cancel()
+    return Date.now() - startedAt
+  } catch { return Number.POSITIVE_INFINITY }
+  finally { clearTimeout(timer) }
+}
+
+async function choosePackageSource(computeProfile) {
+  const forced = process.env.PITCHORD_PACKAGE_SOURCE
+  if (forced === 'domestic') return domesticPackageSource
+  if (forced === 'official') return officialPackageSource
+  const measure = async source => {
+    const probes = await Promise.all([
+      probeDownloadUrl(`${source.pypi}/uv/`),
+      probeDownloadUrl(`${torchIndex(source, computeProfile)}/torch/`),
+    ])
+    return probes.some(value => !Number.isFinite(value)) ? Number.POSITIVE_INFINITY : Math.max(...probes)
+  }
+  const [domesticLatency, officialLatency] = await Promise.all([measure(domesticPackageSource), measure(officialPackageSource)])
+  return Number.isFinite(domesticLatency) && (!Number.isFinite(officialLatency) || domesticLatency <= officialLatency * 1.25)
+    ? domesticPackageSource
+    : officialPackageSource
+}
+
+function environmentPlan(computeProfile, packageSource = officialPackageSource) {
+  return [
+    { id: 'base-runtime', label: 'Python 与高速安装工具', detail: `内置 Python 3.12、uv 并行安装器 · ${packageSource.label}`, weight: 0.08 },
+    { id: 'compute', label: computeProfile === 'cuda121' ? 'GPU 计算组件' : 'CPU 计算组件', detail: computeProfile === 'cuda121' ? 'PyTorch · CUDA 12.1' : 'PyTorch · CPU', weight: 0.32 },
+    { id: 'dependencies', label: '音频分析依赖', detail: '并行下载 Demucs、TorchCrepe、librosa、faster-whisper', weight: 0.28 },
+    { id: 'separation-model', label: '人声分离模型', detail: 'HTDemucs（推荐）', weight: 0.12 },
+    { id: 'alignment-model', label: '歌词对齐模型', detail: 'Whisper Small（推荐）', weight: 0.17 },
+    { id: 'verify', label: '完整性检查', detail: '运行环境、模型与计算设备', weight: 0.03 },
+  ]
+}
+
+function reportEnvironmentProgress(plan, componentId, componentProgress, message, detail = '') {
+  const currentIndex = plan.findIndex(item => item.id === componentId)
+  const bounded = Math.max(0, Math.min(1, Number(componentProgress) || 0))
+  let overallProgress = 0
+  const components = plan.map((item, index) => {
+    if (index < currentIndex) {
+      overallProgress += item.weight
+      return { id: item.id, label: item.label, detail: item.detail, status: 'complete', progress: 1 }
+    }
+    if (index === currentIndex) {
+      overallProgress += item.weight * bounded
+      return { id: item.id, label: item.label, detail: item.detail, status: bounded >= 1 ? 'complete' : 'running', progress: bounded }
+    }
+    return { id: item.id, label: item.label, detail: item.detail, status: 'pending', progress: 0 }
+  })
+  const payload = { componentId, componentProgress: bounded, overallProgress: Math.min(1, overallProgress), components, detail }
+  sendAnalysisProgress('environment', message, payload)
+  sendTaskProgress('environment', '准备完整分析环境', 'running', message, payload.overallProgress)
 }
 
 async function requireFreeSpace(bytes, label) {
@@ -462,16 +544,40 @@ async function findBootstrapPython() {
   return null
 }
 
-async function downloadVerifiedFile(url, destination, expectedHash, expectedSize) {
+async function downloadVerifiedFile(url, destination, expectedHash, expectedSize, onProgress) {
   const partial = `${destination}.part`
-  await fs.promises.rm(partial, { force: true })
-  const response = await net.fetch(url)
+  let existingSize = 0
+  try { existingSize = (await fs.promises.stat(partial)).size } catch { /* no resumable download */ }
+  if (existingSize === expectedSize) {
+    try {
+      await verifyLocalFile(partial, expectedHash, expectedSize)
+      await fs.promises.rename(partial, destination)
+      onProgress?.(1, '已复用完整的 Python 下载缓存。')
+      return
+    } catch {
+      await fs.promises.rm(partial, { force: true })
+      existingSize = 0
+    }
+  } else if (existingSize > expectedSize) {
+    await fs.promises.rm(partial, { force: true })
+    existingSize = 0
+  }
+  let response = await net.fetch(url, existingSize ? { headers: { Range: `bytes=${existingSize}-` } } : undefined)
   if (!response.ok || !response.body) throw new Error(`基础运行时下载失败（HTTP ${response.status}）。`)
-  const total = Number(response.headers.get('content-length')) || expectedSize
+  if (existingSize && response.status !== 206) {
+    await response.body.cancel()
+    await fs.promises.rm(partial, { force: true })
+    existingSize = 0
+    response = await net.fetch(url)
+    if (!response.ok || !response.body) throw new Error(`基础运行时下载失败（HTTP ${response.status}）。`)
+  }
+  const responseSize = Number(response.headers.get('content-length')) || 0
+  const total = existingSize + responseSize || expectedSize
   const reader = response.body.getReader()
-  const handle = await fs.promises.open(partial, 'w')
+  const handle = await fs.promises.open(partial, existingSize ? 'a' : 'w')
   const hash = createHash('sha256')
-  let received = 0
+  if (existingSize) for await (const chunk of fs.createReadStream(partial)) hash.update(chunk)
+  let received = existingSize
   let lastPercent = -1
   try {
     try {
@@ -486,16 +592,18 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
         const percent = Math.min(100, Math.floor(received / total * 100))
         if (percent !== lastPercent) {
           lastPercent = percent
-          sendAnalysisProgress('base-runtime', `正在下载内置 Python… ${percent}%`)
+          const message = `${existingSize ? '正在续传' : '正在下载'}内置 Python… ${percent}%`
+          if (onProgress) onProgress(percent / 100, message)
+          else sendAnalysisProgress('base-runtime', message)
         }
       }
     } finally { await handle.close() }
   } catch (error) {
-    await fs.promises.rm(partial, { force: true })
+    if (received > expectedSize) await fs.promises.rm(partial, { force: true })
     throw error
   }
   if (received !== expectedSize) {
-    await fs.promises.rm(partial, { force: true })
+    if (received > expectedSize) await fs.promises.rm(partial, { force: true })
     throw new Error(`基础运行时下载不完整：应为 ${expectedSize} 字节，实际为 ${received} 字节。`)
   }
   const digest = hash.digest('hex')
@@ -514,9 +622,13 @@ async function verifyLocalFile(file, expectedHash, expectedSize) {
   if (hash.digest('hex') !== expectedHash) throw new Error('离线基础运行时校验失败，请重新下载安装包。')
 }
 
-async function ensureBaseRuntime(force = false) {
+async function ensureBaseRuntime(force = false, onProgress) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('当前自动下载基础运行时仅支持 Windows 64 位。')
-  if (!force && await probePython(basePythonPath())) return basePythonPath()
+  if (!force && await probePython(basePythonPath())) {
+    onProgress?.(1, '内置 Python 已存在，无需重复下载。')
+    return basePythonPath()
+  }
+  const report = (progress, message) => onProgress ? onProgress(progress, message) : sendAnalysisProgress('base-runtime', message)
   await requireFreeSpace(512 * 1024 * 1024, '安装内置 Python ')
   const downloads = path.join(analysisRoot(), 'downloads')
   const archive = path.join(downloads, baseRuntime.archive)
@@ -526,11 +638,11 @@ async function ensureBaseRuntime(force = false) {
   await fs.promises.rm(baseRuntimeRoot(), { recursive: true, force: true })
   const bundledArchive = path.join(offlineAnalysisRoot(), 'base-runtime', baseRuntime.archive)
   if (fs.existsSync(bundledArchive)) {
-    sendAnalysisProgress('base-runtime', '正在读取完整版内置 Python…')
+    report(0.15, '正在读取完整版内置 Python…')
     await verifyLocalFile(bundledArchive, baseRuntime.sha256, baseRuntime.size)
     await fs.promises.copyFile(bundledArchive, archive)
-  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size)
-  sendAnalysisProgress('base-runtime', '下载校验通过，正在解压内置 Python…')
+  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size, (progress, message) => report(progress * 0.75, message))
+  report(0.8, '下载校验通过，正在解压内置 Python…')
   await mkdir(staging, { recursive: true })
   try {
     try { await runProcess('tar.exe', ['-xzf', archive, '-C', staging], { env: process.env }) }
@@ -551,8 +663,75 @@ async function ensureBaseRuntime(force = false) {
     await fs.promises.rm(staging, { recursive: true, force: true })
     throw error
   } finally { await fs.promises.rm(archive, { force: true }) }
-  sendAnalysisProgress('base-runtime', '内置 Python 已准备完成。')
+  report(1, '内置 Python 已准备完成。')
   return basePythonPath()
+}
+
+async function ensureRecommendedSeparationModel(python, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
+  const selectedModel = separationModel(analysisModel)
+  try {
+    const marker = JSON.parse(await readFile(modelMarker(selectedModel.id), 'utf8'))
+    if (marker.model === selectedModel.id) {
+      onProgress?.(1, `${selectedModel.label} 已存在，无需重复下载。`)
+      return
+    }
+  } catch { /* model is not ready */ }
+  await mkdir(path.dirname(modelMarker(selectedModel.id)), { recursive: true })
+  const bundledModels = path.join(offlineAnalysisRoot(), 'models')
+  const beforeFiles = new Set(await listFilesRecursive(modelRoot()))
+  if (selectedModel.bundled && fs.existsSync(bundledModels)) {
+    onProgress?.(0.15, `正在从完整版安装 ${selectedModel.label}…`)
+    await fs.promises.cp(bundledModels, modelRoot(), { recursive: true, force: true })
+  } else {
+    let ticks = 0
+    onProgress?.(0.04, `正在下载 ${selectedModel.label} 人声分离模型…`)
+    const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(selectedModel.id)}); print('ready')`
+    const downloadEnvironment = analysisEnvironment(python)
+    delete downloadEnvironment.HF_HUB_OFFLINE
+    await runProcess(python, ['-c', program], {
+      env: downloadEnvironment,
+      taskId,
+      taskTitle,
+      onOutput: output => {
+        const line = output.trim().split(/\r?\n/).at(-1)
+        if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) return
+        ticks += 1
+        onProgress?.(Math.min(0.92, 0.08 + ticks * 0.025), `正在下载 ${selectedModel.label} 人声分离模型…`, line.slice(0, 240))
+      },
+    })
+  }
+  const files = (await listFilesRecursive(modelRoot())).filter(file => !beforeFiles.has(file) && file !== path.relative(modelRoot(), modelMarker(selectedModel.id)))
+  await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source: selectedModel.bundled && fs.existsSync(bundledModels) ? 'offline-bundle' : 'download', files }, null, 2), 'utf8')
+  onProgress?.(1, `${selectedModel.label} 人声分离模型已准备完成。`)
+}
+
+async function ensureRecommendedAlignmentModel(python, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
+  const modelId = 'small'
+  const selectedModel = alignmentModelCatalog.find(model => model.id === modelId)
+  const output = alignmentModelDirectory(modelId)
+  if (fs.existsSync(alignmentModelMarker(modelId)) && fs.existsSync(path.join(output, 'model.bin'))) {
+    onProgress?.(1, `${selectedModel.label} 已存在，无需重复下载。`)
+    return
+  }
+  await mkdir(output, { recursive: true })
+  const environment = analysisEnvironment(python)
+  delete environment.HF_HUB_OFFLINE
+  onProgress?.(0.02, `正在下载 ${selectedModel.label} 歌词对齐模型…`)
+  await runProcess(python, [path.join(scriptRoot, 'prepare-aligner.py'), '--model', modelId, '--output', output], {
+    env: environment,
+    taskId,
+    taskTitle,
+    onOutput: outputText => {
+      for (const line of outputText.split(/\r?\n/)) {
+        if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
+        const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
+        onProgress?.(progress ? Number(progress[1]) : 0.08, progress?.[2] || `正在下载 ${selectedModel.label} 歌词对齐模型…`, progress ? '' : line.slice(-240))
+      }
+    },
+  })
+  if (!fs.existsSync(path.join(output, 'model.bin'))) throw new Error('下载结束，但没有找到完整的歌词对齐模型文件。')
+  await writeFile(alignmentModelMarker(modelId), JSON.stringify({ model: modelId, provider: 'faster-whisper', preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+  onProgress?.(1, `${selectedModel.label} 歌词对齐模型已准备完成。`)
 }
 
 const projectRoot = () => path.join(app.getPath('documents'), 'Pitchord Projects')
@@ -771,64 +950,153 @@ app.whenReady().then(async () => {
       await writeSettings({ analysisRoot: analysisRoot(), runtimePreference: 'managed', computeProfile: requestedProfile })
       const detectedGpu = await detectNvidiaGpu()
       let resolvedProfile = requestedProfile === 'auto' ? detectedGpu ? 'cuda121' : 'cpu' : requestedProfile
+      sendTaskProgress('environment', '准备完整分析环境', 'running', '正在自动选择最快的软件下载线路…', 0.005)
+      let packageSource = await choosePackageSource(resolvedProfile)
+      let plan = environmentPlan(resolvedProfile, packageSource)
+      const reportedComponentProgress = new Map()
+      const report = (componentId, progress, message, detail = '') => {
+        const monotonicProgress = Math.max(reportedComponentProgress.get(componentId) || 0, progress)
+        reportedComponentProgress.set(componentId, monotonicProgress)
+        reportEnvironmentProgress(plan, componentId, monotonicProgress, message, detail)
+      }
       const requiredBytes = fs.existsSync(managedPythonPath())
-        ? resolvedProfile === 'cuda121' ? 4 * 1024 * 1024 * 1024 : 2 * 1024 * 1024 * 1024
-        : resolvedProfile === 'cuda121' ? 7 * 1024 * 1024 * 1024 : 4 * 1024 * 1024 * 1024
+        ? resolvedProfile === 'cuda121' ? 5 * 1024 * 1024 * 1024 : 3 * 1024 * 1024 * 1024
+        : resolvedProfile === 'cuda121' ? 8 * 1024 * 1024 * 1024 : 5 * 1024 * 1024 * 1024
       await requireFreeSpace(requiredBytes, '安装分析环境')
-      sendTaskProgress('environment', '准备分析环境', 'running', `正在准备${resolvedProfile === 'cuda121' ? ' NVIDIA GPU' : ' CPU'} 环境…`, 0.02)
+      report('base-runtime', 0.01, `已选择${packageSource.label}，将一次准备 6 项完整能力。`)
       let python
-      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime()
+      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message) => report('base-runtime', progress * 0.8, message))
       else python = (await findBootstrapPython())?.executable
       if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
       const offlineRequirements = path.join(offlineAnalysisRoot(), 'analysis-lock-win-x64.txt')
       const useOfflineBundle = resolvedProfile === 'cpu' && fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
+      let currentComponent = 'base-runtime'
+      let componentMessage = '正在准备完整分析环境…'
+      let progressTicks = 0
+      let componentStart = 0.02
+      const beginComponent = (id, message, start = 0.02) => {
+        currentComponent = id
+        componentMessage = message
+        progressTicks = 0
+        componentStart = start
+        report(id, start, message)
+      }
+      const finishComponent = message => report(currentComponent, 1, message || componentMessage)
       const progressOutput = output => {
         const line = output.trim().split(/\r?\n/).at(-1)
         if (line) {
-          sendAnalysisProgress('runtime', line.slice(0, 240))
-          sendTaskProgress('environment', '准备分析环境', 'running', line.slice(0, 240))
+          progressTicks += 1
+          report(currentComponent, Math.min(0.92, componentStart + progressTicks * 0.012), componentMessage, line.slice(0, 240))
         }
       }
+      const processOptions = () => ({ env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备完整分析环境', onOutput: progressOutput })
+      const sourceArguments = source => ['--index-url', source.pypi, ...(source.id === 'domestic' ? ['--extra-index-url', officialPackageSource.pypi] : [])]
+      const activatePackageSource = source => {
+        packageSource = source
+        plan = environmentPlan(resolvedProfile, packageSource)
+      }
+      let uvAvailable = false
       if (!useOfflineBundle) {
-        sendAnalysisProgress('runtime', '正在准备安装工具…')
-        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--timeout', '120', '--upgrade', 'pip'], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
-        const torchProfile = path.join(scriptRoot, resolvedProfile === 'cuda121' ? 'analysis-torch-cu121.txt' : 'analysis-torch-cpu.txt')
-        sendAnalysisProgress('runtime', resolvedProfile === 'cuda121' ? '正在安装 NVIDIA CUDA 12.1 计算组件…' : '正在安装 CPU 计算组件…')
-        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120', '--requirement', torchProfile], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
+        beginComponent('base-runtime', '正在准备高速并行安装器…', 0.82)
+        try {
+          const uvProbe = await runProcess(python, ['-c', "import importlib.util; print('ready' if importlib.util.find_spec('uv') else 'missing')"], { env: analysisEnvironment(python) })
+          uvAvailable = uvProbe.stdout.trim().endsWith('ready')
+          if (!uvAvailable) {
+            const bootstrapSources = packageSource.id === 'domestic' ? [packageSource, officialPackageSource] : [packageSource]
+            let lastBootstrapError
+            for (const source of bootstrapSources) {
+              try {
+                await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '4', '--timeout', '120', '--only-binary', ':all:', ...sourceArguments(source), 'uv==0.12.23'], processOptions())
+                activatePackageSource(source)
+                uvAvailable = true
+                break
+              } catch (error) {
+                if (isTaskCancelled(error)) throw error
+                lastBootstrapError = error
+              }
+            }
+            if (!uvAvailable) throw lastBootstrapError
+          }
+        } catch (error) {
+          if (isTaskCancelled(error)) throw error
+          report('base-runtime', 0.96, '高速安装器不可用，将自动使用兼容安装模式。', error instanceof Error ? error.message.slice(-240) : String(error).slice(-240))
+        }
+        finishComponent(uvAvailable ? 'Python 与高速并行安装器已准备完成。' : 'Python 与兼容安装工具已准备完成。')
+        const installPackages = async argumentsForSource => {
+          const candidateSources = packageSource.id === 'domestic' ? [packageSource, officialPackageSource] : [packageSource]
+          let lastError
+          if (uvAvailable) {
+            for (const source of candidateSources) {
+              try {
+                await runProcess(python, ['-m', 'uv', 'pip', 'install', '--python', python, '--cache-dir', path.join(analysisRoot(), 'cache', 'uv'), ...argumentsForSource(source, 'uv')], processOptions())
+                if (source.id !== packageSource.id) activatePackageSource(source)
+                return
+              } catch (error) {
+                if (isTaskCancelled(error)) throw error
+                lastError = error
+                if (source.id === 'domestic') report(currentComponent, 0.92, `${componentMessage}（国内线路未完成，正在自动尝试官方线路）`, error instanceof Error ? error.message.slice(-240) : String(error).slice(-240))
+              }
+            }
+            uvAvailable = false
+            report(currentComponent, 0.92, `${componentMessage}（并行安装模式未完成，正在用兼容模式继续）`, lastError instanceof Error ? lastError.message.slice(-240) : String(lastError).slice(-240))
+          }
+          for (const source of candidateSources) {
+            try {
+              await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120', ...argumentsForSource(source, 'pip')], processOptions())
+              if (source.id !== packageSource.id) activatePackageSource(source)
+              return
+            } catch (error) {
+              if (isTaskCancelled(error)) throw error
+              lastError = error
+              if (source.id === 'domestic') report(currentComponent, 0.92, `${componentMessage}（国内线路未完成，正在自动尝试官方线路）`, error instanceof Error ? error.message.slice(-240) : String(error).slice(-240))
+            }
+          }
+          throw lastError
+        }
+        beginComponent('compute', resolvedProfile === 'cuda121' ? '正在并行安装 GPU 计算组件（PyTorch · CUDA 12.1）…' : '正在并行安装 CPU 计算组件（PyTorch）…')
+        const torchArguments = profile => source => ['--index-url', torchIndex(source, profile), `torch==2.5.1+${profile === 'cuda121' ? 'cu121' : 'cpu'}`, `torchaudio==2.5.1+${profile === 'cuda121' ? 'cu121' : 'cpu'}`]
+        await installPackages(torchArguments(resolvedProfile))
+        if (requestedProfile === 'auto' && resolvedProfile === 'cuda121' && !(await probePython(python))?.cudaAvailable) {
+          resolvedProfile = 'cpu'
+          plan = environmentPlan(resolvedProfile, packageSource)
+          beginComponent('compute', 'GPU 运行检查未通过，正在自动切换到 CPU 计算组件…', 0.5)
+          await installPackages((source, installer) => [installer === 'uv' ? '--reinstall' : '--force-reinstall', ...torchArguments('cpu')(source)])
+        }
+        finishComponent(`${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 计算组件已安装。`)
+        beginComponent('dependencies', '正在并行安装音频分析依赖（Demucs、TorchCrepe、librosa、faster-whisper）…')
+        const requirements = path.join(scriptRoot, 'analysis-requirements.txt')
+        const constraints = path.join(scriptRoot, 'analysis-lock-win-x64.txt')
+        await installPackages(source => [...sourceArguments(source), '--requirement', requirements, '--constraint', constraints])
+      } else {
+        report('base-runtime', 1, 'Python 与安装工具已准备完成。')
+        report('compute', 1, '离线 CPU 计算组件已准备完成。')
+        beginComponent('dependencies', '正在从本地完整版安装音频分析依赖…')
+        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--find-links', wheelhouse, '--requirement', offlineRequirements], processOptions())
       }
-      sendAnalysisProgress('runtime', '正在安装人声分离和音高模型依赖，这一步可能需要较长时间…')
-      const installArgs = ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120']
-      if (useOfflineBundle) installArgs.push('--no-index', '--find-links', wheelhouse, '--requirement', offlineRequirements)
-      else installArgs.push('--requirement', path.join(scriptRoot, 'analysis-requirements.txt'), '--constraint', path.join(scriptRoot, 'analysis-lock-win-x64.txt'))
-      await runProcess(python, installArgs, {
-        env: analysisEnvironment(python),
-        taskId: 'environment',
-        taskTitle: '准备分析环境',
-        onOutput: progressOutput,
-      })
-      let probe = await probePython(python)
-      if (requestedProfile === 'auto' && resolvedProfile === 'cuda121' && !probe?.cudaAvailable) {
-        resolvedProfile = 'cpu'
-        sendAnalysisProgress('runtime', 'CUDA 环境未能通过运行检查，正在自动切换到 CPU 组件…')
-        await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '8', '--resume-retries', '8', '--timeout', '120', '--force-reinstall', '--requirement', path.join(scriptRoot, 'analysis-torch-cpu.txt')], { env: analysisEnvironment(python), taskId: 'environment', taskTitle: '准备分析环境', onOutput: progressOutput })
-        probe = await probePython(python)
-      }
+      finishComponent('音频分析依赖已安装。')
+      const probe = await probePython(python)
       if (!probe?.demucs || !probe?.torchcrepe || !probe?.librosa || !probe?.fasterWhisper) throw new Error('依赖安装完成，但环境完整性检查未通过。请再次点击修复。')
       if (resolvedProfile === 'cuda121' && !probe.cudaAvailable) throw new Error('CUDA 组件已安装，但 PyTorch 无法使用当前显卡。请选择“自动选择”或 CPU 环境后重试。')
       const environmentManifest = { schemaVersion: 1, managedBy: 'Pitchord', runtimeVersion: analysisRuntimeVersion, requestedProfile, resolvedProfile, python, pythonVersion: probe.version, createdAt: new Date().toISOString() }
       await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
       await writeFile(path.join(analysisRoot(), 'pitchord-environment.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
       await preferManagedRuntime(requestedProfile)
-      sendAnalysisProgress('complete', '分析环境已准备完成。')
-      sendTaskProgress('environment', '准备分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 分析环境已准备完成`, 1)
-      return { ...await analysisRuntimeStatus(), busy: false }
+      await ensureRecommendedSeparationModel(python, (progress, message, detail) => report('separation-model', progress, message, detail))
+      await ensureRecommendedAlignmentModel(python, (progress, message, detail) => report('alignment-model', progress, message, detail))
+      report('verify', 0.25, '正在检查全部组件与推荐模型…')
+      const finalStatus = await analysisRuntimeStatus()
+      if (!finalStatus.runtimeReady || !finalStatus.modelReady || !finalStatus.alignment.forcedAlignment) throw new Error('完整环境安装结束，但部分组件或推荐模型未通过检查。请点击修复后重试。')
+      report('verify', 1, '完整分析环境已准备完成。')
+      sendAnalysisProgress('complete', '完整分析环境已准备完成。', { overallProgress: 1, componentProgress: 1, components: plan.map(item => ({ id: item.id, label: item.label, detail: item.detail, status: 'complete', progress: 1 })) })
+      sendTaskProgress('environment', '准备完整分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 环境与推荐模型已全部准备完成`, 1)
+      return { ...finalStatus, busy: false }
     })()
     try { return await analysisInstallTask }
     catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
       const message = isTaskCancelled(error) ? '环境准备已取消' : /downloading|connection|timed?\s*out|network|reset|remote host/i.test(rawMessage) ? '依赖下载中断。已完成的文件会保留，请检查网络后点击“下载并准备环境”重试。' : rawMessage
-      sendTaskProgress('environment', '准备分析环境', isTaskCancelled(error) ? 'cancelled' : 'error', message)
+      sendTaskProgress('environment', '准备完整分析环境', isTaskCancelled(error) ? 'cancelled' : 'error', message)
       if (!isTaskCancelled(error) && message !== rawMessage) throw new Error(message)
       throw error
     } finally { analysisInstallTask = null }

@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 const port = process.argv[2] ?? '9229'
 const externalPython = process.argv[3] === '-' ? '' : process.argv[3]
 const alternateRoot = process.argv[4]
@@ -45,7 +49,34 @@ if (alternateRoot) {
     await evaluate(`window.pitchordDesktop.configureAnalysisEnvironment(${JSON.stringify({ mode: 'managed', root: status.root, computeProfile: status.computeProfile })}).then(JSON.stringify)`)
   }
 }
-await evaluate(`(() => { [...document.querySelectorAll('button')].find(button => /准备分析环境|检查或更换环境/.test(button.textContent))?.click(); return true })()`)
+let smokeProjectRoot = ''
+const environmentControlVisible = await evaluate(`[...document.querySelectorAll('button')].some(button => button.offsetParent && /^(分析环境|准备分析环境|检查或更换环境)$/.test(button.textContent.trim()))`)
+if (!environmentControlVisible) {
+  smokeProjectRoot = await mkdtemp(join(tmpdir(), 'pitchord-environment-smoke-'))
+  await evaluate(`(() => { [...document.querySelectorAll('button')].find(button => button.offsetParent && button.textContent.includes('新建项目'))?.click(); return true })()`)
+  await new Promise(resolve => setTimeout(resolve, 250))
+  const created = await evaluate(`(() => {
+    const dialog = document.querySelector('[role="dialog"]')
+    const inputs = [...(dialog?.querySelectorAll('input') || [])]
+    if (inputs.length < 2) return false
+    const setValue = (input, value) => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    setValue(inputs[0], '环境界面检查')
+    setValue(inputs[1], ${JSON.stringify(smokeProjectRoot)})
+    ;[...dialog.querySelectorAll('button')].find(button => button.textContent.includes('创建工程'))?.click()
+    return true
+  })()`)
+  if (!created) throw new Error('Could not create an isolated project for the environment UI smoke test')
+  await new Promise(resolve => setTimeout(resolve, 500))
+}
+await evaluate(`(() => {
+  if (document.body.textContent.includes('首次准备分析环境') || document.body.textContent.includes('分析环境设置')) return true
+  const button = [...document.querySelectorAll('button')].find(item => item.offsetParent && /^(分析环境|准备分析环境|检查或更换环境)$/.test(item.textContent.trim()))
+  button?.click()
+  return !!button
+})()`)
 await new Promise(resolve => setTimeout(resolve, 250))
 const ui = JSON.parse(await evaluate(`JSON.stringify({
   dialog: document.body.textContent.includes('分析环境设置') || document.body.textContent.includes('首次准备分析环境'),
@@ -54,5 +85,6 @@ const ui = JSON.parse(await evaluate(`JSON.stringify({
   root: document.body.textContent.includes('环境存放位置'),
 })`))
 socket.close()
+if (smokeProjectRoot) await rm(smokeProjectRoot, { recursive: true, force: true })
 if (!Object.values(ui).every(Boolean)) throw new Error(`Environment setup UI is incomplete: ${JSON.stringify(ui)}`)
 console.log('Environment setup smoke test passed:', JSON.stringify({ source: status.source, runtimePreference: status.runtimePreference, computeProfile: status.computeProfile, root: status.root, ui }))

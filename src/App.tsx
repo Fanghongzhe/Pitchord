@@ -76,6 +76,8 @@ type AnalysisStorage = {
   legacyTotal: number
   total: number
 }
+type EnvironmentProgressComponent = { id: string; label: string; detail: string; status: 'pending' | 'running' | 'complete'; progress: number }
+type EnvironmentProgress = { componentId?: string; componentProgress?: number; overallProgress: number; components: EnvironmentProgressComponent[]; detail?: string }
 
 function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
@@ -174,6 +176,7 @@ export default function App() {
   const [analysisEnvironment, setAnalysisEnvironment] = useState<AnalysisEnvironment | null>(null)
   const [analysisEnvironmentBusy, setAnalysisEnvironmentBusy] = useState(false)
   const [analysisProgress, setAnalysisProgress] = useState('正在检查分析环境…')
+  const [environmentProgress, setEnvironmentProgress] = useState<EnvironmentProgress | null>(null)
   const [storageOpen, setStorageOpen] = useState(false)
   const [analysisStorage, setAnalysisStorage] = useState<AnalysisStorage | null>(null)
   const [cleanupTarget, setCleanupTarget] = useState<'runtime' | 'models' | 'cache' | 'legacy' | 'all' | null>(null)
@@ -386,7 +389,10 @@ export default function App() {
     })
     const removeProgress = window.pitchordDesktop.onAnalysisProgress(progress => {
       setAnalysisProgress(progress.message)
-      if (progress.stage === 'base-runtime' || progress.stage === 'runtime') {
+      if (typeof progress.overallProgress === 'number' && Array.isArray(progress.components)) {
+        setEnvironmentProgress({ componentId: progress.componentId, componentProgress: progress.componentProgress, overallProgress: progress.overallProgress, components: progress.components, detail: progress.detail })
+        updateWork('environment', '准备完整分析环境', 'running', progress.message, progress.overallProgress)
+      } else if (progress.stage === 'base-runtime' || progress.stage === 'runtime') {
         const percent = progress.message.match(/(\d{1,3})%/)?.[1]
         updateWork('environment', '准备分析环境', 'running', progress.message, percent ? Number(percent) / 100 : undefined)
       }
@@ -730,15 +736,16 @@ export default function App() {
   const installAnalysisRuntime = async () => {
     if (!window.pitchordDesktop?.installAnalysisRuntime) return
     setAnalysisEnvironmentBusy(true)
-    setAnalysisProgress('正在启动环境安装…')
-    updateWork('environment', '准备分析环境', 'running', '正在检查并补齐媒体、分离和音高组件…')
+    setEnvironmentProgress(null)
+    setAnalysisProgress('正在规划完整环境安装…')
+    updateWork('environment', '准备完整分析环境', 'running', '正在检查 Python、计算组件、分析依赖和推荐模型…', 0)
     try {
       const status = await window.pitchordDesktop.installAnalysisRuntime({ root: environmentRootDraft, computeProfile: computeProfileDraft })
       setAnalysisEnvironment(status)
       setEnvironmentRootDraft(status.root)
-      setAnalysisProgress('独立分析环境已准备完成')
-      updateWork('environment', '准备分析环境', 'success', '分析环境已准备完成', 1)
-      setNotice('Pitchord 分析环境已准备完成。')
+      setAnalysisProgress('完整分析环境与推荐模型已准备完成')
+      updateWork('environment', '准备完整分析环境', 'success', 'Python、分析依赖、人声模型和歌词模型已全部准备完成', 1)
+      setNotice('Pitchord 完整分析环境已准备完成，可直接运行默认流程。')
     } catch (error) {
       setAnalysisProgress('环境安装未完成')
       updateWork('environment', '准备分析环境', taskWasCancelled(error) ? 'cancelled' : 'error', taskWasCancelled(error) ? '环境准备已取消' : error instanceof Error ? error.message : String(error))
@@ -1950,18 +1957,24 @@ export default function App() {
 
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>需要先完成人声分离</DialogTitle><DialogDescription>音高识别和歌词时间戳匹配只读取纯人声结果。Pitchord 会直接处理当前工程中已经导入的媒体，不需要再次选择文件。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setSeparationPromptOpen(false)}>取消</Button><Button onClick={() => { setSeparationPromptOpen(false); requestSeparation() }}>进行人声分离</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={repairEnvironmentOpen} onOpenChange={open => { if (!analysisEnvironmentBusy) setRepairEnvironmentOpen(open) }}><DialogContent className="sm:max-w-2xl"><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>环境与模型存放在用户选择的位置，不修改系统 Python 或 PATH。推荐使用 Pitchord 独立环境。</DialogDescription></DialogHeader><div className="space-y-4 text-sm">
+      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{analysisEnvironment?.runtimeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>一次准备 Python、计算组件、音高识别、人声分离、歌词对齐及推荐模型。安装可在后台继续，关闭此窗口不会取消任务。</DialogDescription></DialogHeader><div className="space-y-4 text-sm">
         <div className="grid grid-cols-2 gap-2"><Button variant={environmentMode === 'managed' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('managed')} disabled={analysisEnvironmentBusy}>创建独立环境</Button><Button variant={environmentMode === 'custom' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('custom')} disabled={analysisEnvironmentBusy}>使用现有 Python</Button></div>
         {environmentMode === 'managed' ? <>
           <div className="space-y-2"><p className="font-medium">环境存放位置</p><div className="flex gap-2"><Input value={environmentRootDraft} readOnly className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseAnalysisDirectory(environmentRootDraft); if (selected) setEnvironmentRootDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><div className="flex items-center justify-between gap-2"><p className="text-xs text-muted-foreground">默认放在软件同目录的 environment 文件夹，也可以选择 D 盘等其他位置。</p>{analysisEnvironment?.defaultRoot && environmentRootDraft !== analysisEnvironment.defaultRoot && <Button size="sm" variant="ghost" onClick={() => setEnvironmentRootDraft(analysisEnvironment.defaultRoot)}>恢复默认</Button>}</div></div>
           <label className="block space-y-2"><span className="font-medium">计算环境</span><Select value={computeProfileDraft} onValueChange={value => setComputeProfileDraft(value as 'auto' | 'cpu' | 'cuda121')} disabled={analysisEnvironmentBusy}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto">自动选择（推荐）</SelectItem><SelectItem value="cuda121">NVIDIA GPU · CUDA 12.1</SelectItem><SelectItem value="cpu">仅 CPU</SelectItem></SelectContent></Select></label>
-          <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><p className="font-medium">设备检测</p><Badge variant={analysisEnvironment?.detectedGpu ? 'secondary' : 'outline'}>{analysisEnvironment?.detectedGpu?.name || '未检测到 NVIDIA GPU'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.detectedGpu ? `驱动 ${analysisEnvironment.detectedGpu.driver}。自动模式会先安装 CUDA 12.1 组件，运行检查失败时回退 CPU。` : '自动模式将安装 CPU 组件。'} 首次安装需要联网，GPU 环境通常需要约 4–7 GB 可用空间。</p></div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">独立且可删除</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。删除这个目录即可移除环境。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><p className="font-medium">设备检测</p><Badge variant={analysisEnvironment?.detectedGpu ? 'secondary' : 'outline'}>{analysisEnvironment?.detectedGpu?.name || '未检测到 NVIDIA GPU'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.detectedGpu ? `驱动 ${analysisEnvironment.detectedGpu.driver}。自动模式会先安装 CUDA 12.1 组件，运行检查失败时回退 CPU。` : '自动模式将安装 CPU 组件。'} 首次安装需要联网，完整 GPU 环境与推荐模型通常需要约 5–8 GB 可用空间。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；模型下载启用高吞吐与断点缓存，失败会自动回退。</p></div>
+          {environmentProgress && <div className="rounded-xl border border-primary/30 bg-primary/5 p-4" aria-label="完整环境安装进度">
+            <div className="flex items-center justify-between gap-3"><div><p className="font-medium">完整环境安装</p><p className="mt-1 text-xs text-muted-foreground">共 {environmentProgress.components.length} 项，关闭窗口后仍会在任务进度中继续。</p></div><span className="font-mono text-lg font-semibold text-primary">{Math.round(environmentProgress.overallProgress * 100)}%</span></div>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${Math.round(environmentProgress.overallProgress * 100)}%` }} /></div>
+            <div className="mt-3 space-y-2">{environmentProgress.components.map(component => <div key={component.id} className="flex items-start gap-2 rounded-md bg-background/80 px-3 py-2"><span className={`mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full ${component.status === 'complete' ? 'bg-emerald-100 text-emerald-700' : component.status === 'running' ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'}`}>{component.status === 'complete' ? <CheckCircle2 className="size-3.5" /> : component.status === 'running' ? <LoaderCircle className="size-3.5 animate-spin" /> : <span className="size-1.5 rounded-full bg-current" />}</span><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><p className="text-xs font-medium">{component.label}</p><span className="text-[11px] text-muted-foreground">{component.status === 'complete' ? '完成' : component.status === 'running' ? `${Math.round(component.progress * 100)}%` : '等待'}</span></div><p className="mt-0.5 text-[11px] text-muted-foreground">{component.detail}</p></div></div>)}</div>
+            <p className="mt-3 text-xs font-medium">{analysisProgress}</p>{environmentProgress.detail && <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground" title={environmentProgress.detail}>当前明细：{environmentProgress.detail}</p>}
+          </div>}
         </> : <>
           <div className="space-y-2"><p className="font-medium">Python 可执行文件</p><div className="flex gap-2"><Input value={externalPythonDraft} readOnly placeholder="选择 python.exe" className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.choosePython(externalPythonDraft); if (selected) setExternalPythonDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><p className="text-xs text-muted-foreground">支持 Python 3.10–3.12。Pitchord 只检测并使用该环境，不会自动安装或删除其中的内容。</p></div>
           <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">适合已有环境的用户</p><p className="mt-1 text-xs text-muted-foreground">检测会确认 Demucs、TorchCrepe、librosa 和 faster-whisper。缺失的组件会明确列出，不会静默修改环境。</p></div>
         </>}
-      </div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)} disabled={analysisEnvironmentBusy}>稍后设置</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => { setRepairEnvironmentOpen(false); void installAnalysisRuntime() }} disabled={analysisEnvironmentBusy || !environmentRootDraft}>下载并准备环境</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</DialogFooter></DialogContent></Dialog>
+      </div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>{analysisEnvironmentBusy ? '后台继续' : '稍后设置'}</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy || !environmentRootDraft}>{analysisEnvironmentBusy ? '正在准备完整环境…' : '下载并准备完整环境'}</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</DialogFooter></DialogContent></Dialog>
 
       <Dialog open={modelManagerOpen} onOpenChange={setModelManagerOpen}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>模型管理</DialogTitle><DialogDescription>功能页只显示已经安装且可以运行的模型。这里可以准备推荐模型，或把自己的模型复制到 Pitchord 环境中统一管理。</DialogDescription></DialogHeader><div className="space-y-3">
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">模型计算设备</p><Badge variant={analysisEnvironment?.compute.cudaAvailable ? 'secondary' : 'outline'}>{analysisEnvironment?.compute.label || '正在检测…'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">支持 CUDA 的 Pitchord 运行环境会自动让 Demucs、MSST 和 TorchCrepe 使用 GPU；pYIN 使用 CPU。歌词识别会单独检测 CTranslate2 的 CUDA 支持，GPU 初始化失败时自动回退 CPU。</p>{analysisEnvironment?.compute.torchVersion && <p className="mt-1 text-xs text-muted-foreground">PyTorch {analysisEnvironment.compute.torchVersion}{analysisEnvironment.compute.torchBuildCuda ? ` · CUDA ${analysisEnvironment.compute.torchBuildCuda}` : ' · CPU 构建'}</p>}</div>
