@@ -75,8 +75,8 @@ const separationModelCatalog = [
   { id: 'mdx_extra_q', label: 'MDX Extra Q', description: '体积较小、速度较快的量化方案，需要另行准备模型。', bundled: false },
 ]
 const alignmentModelCatalog = [
-  { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。' },
-  { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。' },
+  { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。', revision: '536b0662742c02347bc0e980a01041f333bce120' },
+  { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。', revision: 'ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66' },
 ]
 const defaultInstallSelection = {
   pitchMethods: ['pyin', 'torchcrepe'],
@@ -512,6 +512,8 @@ const domesticPackageSource = {
   pypi: 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple',
   torchBase: 'https://mirror.sjtu.edu.cn/pytorch-wheels',
 }
+const officialModelSource = { id: 'official', label: 'Hugging Face 官方线路', endpoint: 'https://huggingface.co' }
+const domesticModelSource = { id: 'domestic', label: '国内模型加速线路（HF Mirror）', endpoint: 'https://hf-mirror.com' }
 
 function torchIndex(source, computeProfile) {
   return `${source.torchBase}/${computeProfile === 'cuda121' ? 'cu121' : 'cpu'}`
@@ -545,6 +547,46 @@ async function choosePackageSource(computeProfile) {
   return Number.isFinite(domesticLatency) && (!Number.isFinite(officialLatency) || domesticLatency <= officialLatency * 1.25)
     ? domesticPackageSource
     : officialPackageSource
+}
+
+async function probeModelDownload(source, model, timeout = 8000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeout)
+  const startedAt = Date.now()
+  let received = 0
+  let reader
+  try {
+    const repository = `Systran/faster-whisper-${model.id}`
+    const response = await net.fetch(`${source.endpoint}/${repository}/resolve/${model.revision}/model.bin`, {
+      signal: controller.signal,
+      headers: { Range: 'bytes=0-524287' },
+    })
+    if (!response.ok || !response.body) return 0
+    reader = response.body.getReader()
+    while (received < 512 * 1024) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += value.byteLength
+    }
+    return received / Math.max(0.1, (Date.now() - startedAt) / 1000)
+  } catch { return 0 }
+  finally {
+    clearTimeout(timer)
+    try { await reader?.cancel() } catch { /* probe already ended */ }
+  }
+}
+
+async function chooseModelSource(model) {
+  const forced = process.env.PITCHORD_MODEL_SOURCE
+  if (forced === 'domestic') return domesticModelSource
+  if (forced === 'official') return officialModelSource
+  const [domesticSpeed, officialSpeed] = await Promise.all([
+    probeModelDownload(domesticModelSource, model),
+    probeModelDownload(officialModelSource, model),
+  ])
+  return domesticSpeed > 0 && (officialSpeed <= 0 || domesticSpeed >= officialSpeed * 0.8)
+    ? domesticModelSource
+    : officialModelSource
 }
 
 function environmentPlan(computeProfile, packageSource = officialPackageSource, installSelection = defaultInstallSelection) {
@@ -798,23 +840,44 @@ async function ensureRecommendedAlignmentModel(python, modelId, onProgress, task
     return
   }
   await mkdir(output, { recursive: true })
-  const environment = analysisEnvironment(python)
-  delete environment.HF_HUB_OFFLINE
-  onProgress?.(0.02, `正在下载 ${selectedModel.label} 歌词对齐模型…`)
-  await runProcess(python, [path.join(scriptRoot, 'prepare-aligner.py'), '--model', modelId, '--output', output], {
-    env: environment,
-    taskId,
-    taskTitle,
-    onOutput: outputText => {
-      for (const line of outputText.split(/\r?\n/)) {
-        if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
-        const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
-        onProgress?.(progress ? Number(progress[1]) : 0.08, progress?.[2] || `正在下载 ${selectedModel.label} 歌词对齐模型…`, progress ? '' : line.slice(-240), { transferState: progress && Number(progress[1]) >= 1 ? 'installing' : 'downloading', ...transferTelemetry(line) })
-      }
-    },
-  })
+  onProgress?.(0.02, `正在为 ${selectedModel.label} 测速选择模型下载线路…`)
+  const preferredSource = await chooseModelSource(selectedModel)
+  const sources = preferredSource.id === 'domestic' ? [domesticModelSource, officialModelSource] : [officialModelSource, domesticModelSource]
+  let lastError
+  for (const [sourceIndex, source] of sources.entries()) {
+    const environment = analysisEnvironment(python)
+    delete environment.HF_HUB_OFFLINE
+    environment.HF_ENDPOINT = source.endpoint
+    if (source.id === 'domestic') environment.HF_HUB_DISABLE_XET = '1'
+    let latestProgress = 0.05
+    onProgress?.(latestProgress, `已选择${source.label}，正在下载 ${selectedModel.label}…`, '', { transferState: 'downloading' })
+    try {
+      await runProcess(python, [path.join(scriptRoot, 'prepare-aligner.py'), '--model', modelId, '--revision', selectedModel.revision, '--output', output], {
+        env: environment,
+        taskId,
+        taskTitle,
+        transferPaths: [path.join(modelRoot(), 'huggingface'), output],
+        onTransfer: telemetry => onProgress?.(latestProgress, `正在通过${source.label}下载 ${selectedModel.label}…`, '', telemetry),
+        onOutput: outputText => {
+          for (const line of outputText.split(/\r?\n/)) {
+            if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
+            const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
+            latestProgress = progress ? Number(progress[1]) : Math.max(latestProgress, 0.08)
+            onProgress?.(latestProgress, progress?.[2] || `正在通过${source.label}下载 ${selectedModel.label}…`, progress ? '' : line.slice(-240), { transferState: progress && latestProgress >= 1 ? 'installing' : 'downloading', ...transferTelemetry(line) })
+          }
+        },
+      })
+      lastError = null
+      break
+    } catch (error) {
+      if (isTaskCancelled(error)) throw error
+      lastError = error
+      if (sourceIndex < sources.length - 1) onProgress?.(Math.max(latestProgress, 0.08), `${source.label}未完成，正在保留进度并切换备用线路…`, error instanceof Error ? error.message.slice(-240) : String(error).slice(-240), { transferState: 'downloading' })
+    }
+  }
+  if (lastError) throw lastError
   if (!fs.existsSync(path.join(output, 'model.bin'))) throw new Error('下载结束，但没有找到完整的歌词对齐模型文件。')
-  await writeFile(alignmentModelMarker(modelId), JSON.stringify({ model: modelId, provider: 'faster-whisper', preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+  await writeFile(alignmentModelMarker(modelId), JSON.stringify({ model: modelId, provider: 'faster-whisper', revision: selectedModel.revision, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
   onProgress?.(1, `${selectedModel.label} 歌词对齐模型已准备完成。`)
 }
 
@@ -1267,26 +1330,11 @@ app.whenReady().then(async () => {
       const python = await preferredPythonPath()
       const probe = await probePython(python)
       if (!python || !probe?.fasterWhisper) throw new Error('歌词对齐组件尚未安装，请先检查或修复分析环境。')
-      const output = alignmentModelDirectory(requestedModel)
-      await mkdir(output, { recursive: true })
-      const environment = analysisEnvironment(python)
-      delete environment.HF_HUB_OFFLINE
       sendAnalysisProgress('alignment-model', `正在准备 ${selectedModel.label}…`)
-      sendTaskProgress('alignment-model', '准备歌词对齐模型', 'running', `正在下载 ${selectedModel.label} 到 Pitchord/environment/models…`, 0.02)
-      await runProcess(python, [path.join(scriptRoot, 'prepare-aligner.py'), '--model', requestedModel, '--output', output], {
-        env: environment,
-        onOutput: outputText => {
-          for (const line of outputText.split(/\r?\n/)) {
-            if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) continue
-            const progress = line.match(/^PITCHORD_PROGRESS\|([\d.]+)\|(.*)$/)
-            const message = progress?.[2] || line.slice(-240)
-            sendAnalysisProgress('alignment-model', message)
-            sendTaskProgress('alignment-model', '准备歌词对齐模型', 'running', message, progress ? Number(progress[1]) : undefined)
-          }
-        },
-      })
-      if (!fs.existsSync(path.join(output, 'model.bin'))) throw new Error('下载结束，但没有找到完整的歌词对齐模型文件。')
-      await writeFile(alignmentModelMarker(requestedModel), JSON.stringify({ model: requestedModel, provider: 'faster-whisper', preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      await ensureRecommendedAlignmentModel(python, requestedModel, (progress, message, detail, telemetry = {}) => {
+        sendAnalysisProgress('alignment-model', message, { detail, ...telemetry })
+        sendTaskProgress('alignment-model', '准备歌词对齐模型', 'running', message, progress)
+      }, null, '准备歌词对齐模型')
       sendTaskProgress('alignment-model', '准备歌词对齐模型', 'success', `${selectedModel.label} 已准备完成`, 1)
       sendAnalysisProgress('complete', '歌词对齐模型已准备完成。')
       return { ...await analysisRuntimeStatus(), busy: false }

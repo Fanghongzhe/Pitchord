@@ -86,6 +86,7 @@ const ui = JSON.parse(await evaluate(`JSON.stringify({
   presets: document.body.textContent.includes('轻量') && document.body.textContent.includes('推荐') && document.body.textContent.includes('全部'),
   modelChoices: document.body.textContent.includes('TorchCrepe') && document.body.textContent.includes('HTDemucs FT') && document.body.textContent.includes('Whisper Base'),
   backgroundClose: document.body.textContent.includes('关闭此窗口不会取消任务'),
+  modelRouting: document.body.textContent.includes('Hugging Face 官方与国内模型线路间实测下载速度'),
 })`))
 socket.close()
 if (smokeProjectRoot) await rm(smokeProjectRoot, { recursive: true, force: true })

@@ -2046,7 +2046,7 @@ export default function App() {
             </div>
             {!installSelectionComplete && <p className="mt-3 text-xs font-medium text-destructive">音高识别、人声分离和歌词对齐必须各保留至少一项。</p>}
           </div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；模型下载启用高吞吐与断点缓存，失败会自动回退。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；Whisper 会在 Hugging Face 官方与国内模型线路间实测下载速度，失败时保留进度并切换备用线路。</p></div>
           {environmentProgress && <div className="rounded-xl border border-primary/30 bg-primary/5 p-4" aria-label="完整环境安装进度">
             <div className="flex items-center justify-between gap-3"><div><p className="font-medium">完整环境安装</p><p className="mt-1 text-xs text-muted-foreground">共 {environmentProgress.components.length} 项，关闭窗口后仍会在任务进度中继续。</p></div><span className="font-mono text-lg font-semibold text-primary">{Math.round(environmentProgress.overallProgress * 100)}%</span></div>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${Math.round(environmentProgress.overallProgress * 100)}%` }} /></div>

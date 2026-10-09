@@ -11,6 +11,7 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="small")
+    parser.add_argument("--revision")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     warnings.filterwarnings("ignore", message=".*local_dir_use_symlinks.*")
@@ -24,6 +25,7 @@ def main() -> None:
         output_dir=str(target),
         cache_dir=os.environ.get("HF_HOME"),
         local_files_only=False,
+        revision=args.revision,
     )
     print("PITCHORD_PROGRESS|1.000|歌词对齐模型已准备完成", flush=True)
 
