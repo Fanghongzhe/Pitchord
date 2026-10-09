@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSegment, retimeSegment } from './lyrics'
-import { generatePitchAss, wordTimedSubtitles } from './subtitles'
+import { generatePitchAss, sentenceSrt, wordTimedSubtitles } from './subtitles'
 
 describe('word timed subtitle export', () => {
   it('keeps the edited timing for every lyric unit', () => {
@@ -62,5 +62,21 @@ describe('word timed subtitle export', () => {
     const ass = generatePitchAss([segment], [])
     expect(ass).toContain('}E4~')
     expect(ass.match(/,Pitch,/g)).toHaveLength(1)
+  })
+
+  it('exports broadly compatible sentence-level SRT timing', () => {
+    const segment = createSegment('一句歌词', 1.234, 3.456)
+    expect(sentenceSrt([segment])).toBe('1\n00:00:01,234 --> 00:00:03,456\n一句歌词\n')
+  })
+
+  it('places ASS captions in the selected grid position and supports a background box', () => {
+    const segment = createSegment('歌词', 0, 1)
+    const ass = generatePitchAss([segment], [], {
+      verticalPosition: 'top', horizontalPosition: 'left', backgroundStyle: 'box',
+      backgroundColor: '#000000', backgroundOpacity: 75, bold: false, italic: true,
+    })
+    expect(ass).toMatch(/Style: Main,[^\n]+,0,-1,0,0,100,100,0,0,3,/)
+    expect(ass).toMatch(/,7,80,80,96,1/)
+    expect(ass).toContain('&H40000000')
   })
 })
