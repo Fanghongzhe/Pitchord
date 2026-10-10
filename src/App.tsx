@@ -42,7 +42,7 @@ type RecentProject = { name: string; directory: string; updatedAt: string }
 type TrackKind = 'original' | 'vocals' | 'harmonies' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
 type ContextState = { x: number; y: number; id?: string; time?: number }
-type InstallSelection = { pitchMethods: PitchAlgorithm[]; separationModels: string[]; alignmentModels: string[] }
+type InstallSelection = { pitchMethods: PitchAlgorithm[]; separationModels: string[]; harmonyModels: string[]; alignmentModels: string[] }
 type AnalysisEnvironment = {
   runtimeVersion: string
   source: 'managed' | 'portable' | 'custom' | 'missing'
@@ -115,20 +115,22 @@ function readRecentProjects(): RecentProject[] {
 const savedDraft = readDraft()
 const cancellableTaskIds = new Set(['environment', 'separation', 'pitch', 'alignment'])
 const installPresets: Record<'minimum' | 'recommended' | 'all', InstallSelection> = {
-  minimum: { pitchMethods: ['pyin'], separationModels: ['mdx_extra_q'], alignmentModels: ['base'] },
-  recommended: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs'], alignmentModels: ['small'] },
-  all: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs', 'htdemucs_ft', 'mdx_extra_q'], alignmentModels: ['small', 'base'] },
+  minimum: { pitchMethods: ['pyin'], separationModels: ['mdx_extra_q'], harmonyModels: [], alignmentModels: ['base'] },
+  recommended: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs'], harmonyModels: [], alignmentModels: ['small'] },
+  all: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs', 'htdemucs_ft', 'mdx_extra_q'], harmonyModels: ['bs-roformer-karaoke-frazer'], alignmentModels: ['small', 'base'] },
 }
 
 const installOptionLabels = {
   pitchMethods: { pyin: 'pYIN', torchcrepe: 'TorchCrepe' },
   separationModels: { htdemucs: 'HTDemucs', htdemucs_ft: 'HTDemucs FT', mdx_extra_q: 'MDX Extra Q' },
+  harmonyModels: { 'bs-roformer-karaoke-frazer': 'BS-RoFormer Karaoke' },
   alignmentModels: { small: 'Whisper Small', base: 'Whisper Base' },
 } as const
 
 const installOptionSizes = {
   pitchMethods: { pyin: 120, torchcrepe: 25 },
   separationModels: { htdemucs: 85, htdemucs_ft: 330, mdx_extra_q: 170 },
+  harmonyModels: { 'bs-roformer-karaoke-frazer': 204 },
   alignmentModels: { small: 470, base: 150 },
 } as const
 
@@ -140,7 +142,7 @@ const subtitleStylePresets: Record<string, Partial<SubtitleStyle>> = {
 }
 
 function copyInstallSelection(selection: InstallSelection): InstallSelection {
-  return { pitchMethods: [...selection.pitchMethods], separationModels: [...selection.separationModels], alignmentModels: [...selection.alignmentModels] }
+  return { pitchMethods: [...selection.pitchMethods], separationModels: [...selection.separationModels], harmonyModels: [...(selection.harmonyModels ?? [])], alignmentModels: [...selection.alignmentModels] }
 }
 
 function subtitleSignature(mediaName: string, segments: LyricSegment[], points: PitchPoint[], style: SubtitleStyle) {
@@ -239,7 +241,7 @@ export default function App() {
   const [externalPythonDraft, setExternalPythonDraft] = useState('')
   const [computeProfileDraft, setComputeProfileDraft] = useState<'auto' | 'cpu' | 'cuda121'>('auto')
   const [installPreset, setInstallPreset] = useState<'minimum' | 'recommended' | 'all' | 'custom'>('recommended')
-  const [installSelectionDraft, setInstallSelectionDraft] = useState<InstallSelection>({ pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs'], alignmentModels: ['small'] })
+  const [installSelectionDraft, setInstallSelectionDraft] = useState<InstallSelection>(copyInstallSelection(installPresets.recommended))
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
   const [pendingModelDownload, setPendingModelDownload] = useState<string | null>(null)
   const [pendingModelRemoval, setPendingModelRemoval] = useState<string | null>(null)
@@ -2338,13 +2340,14 @@ export default function App() {
           <div className="space-y-2"><p className="font-medium">环境存放位置</p><div className="flex gap-2"><Input value={environmentRootDraft} readOnly className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseAnalysisDirectory(environmentRootDraft); if (selected) setEnvironmentRootDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><div className="flex items-center justify-between gap-2"><p className="text-xs text-muted-foreground">默认放在软件同目录的 environment 文件夹，也可以选择 D 盘等其他位置。</p>{analysisEnvironment?.defaultRoot && environmentRootDraft !== analysisEnvironment.defaultRoot && <Button size="sm" variant="ghost" onClick={() => setEnvironmentRootDraft(analysisEnvironment.defaultRoot)}>恢复默认</Button>}</div></div>
           <label className="block space-y-2"><span className="font-medium">计算环境</span><Select value={computeProfileDraft} onValueChange={value => setComputeProfileDraft(value as 'auto' | 'cpu' | 'cuda121')} disabled={analysisEnvironmentBusy}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto">自动选择（推荐）</SelectItem><SelectItem value="cuda121">NVIDIA GPU · CUDA 12.1</SelectItem><SelectItem value="cpu">仅 CPU</SelectItem></SelectContent></Select></label>
           <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex items-center justify-between gap-3"><p className="font-medium">设备检测</p><Badge variant={analysisEnvironment?.detectedGpu ? 'secondary' : 'outline'}>{analysisEnvironment?.detectedGpu?.name || '未检测到 NVIDIA GPU'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{analysisEnvironment?.detectedGpu ? `驱动 ${analysisEnvironment.detectedGpu.driver}。自动模式会先安装 CUDA 12.1 组件，运行检查失败时回退 CPU。` : '自动模式将安装 CPU 组件。'} 首次安装需要联网，完整 GPU 环境与推荐模型通常需要约 5–8 GB 可用空间。</p></div>
-          <div className="rounded-xl border border-border p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-medium">选择安装内容</p><p className="mt-1 text-xs text-muted-foreground">每类至少选择一项。后续仍可在模型管理中增删。</p></div><Badge variant="outline">预计下载约 {formatBytes(estimatedInstallBytes)}</Badge></div>
+          <div className="rounded-xl border border-border p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-medium">选择安装内容</p><p className="mt-1 text-xs text-muted-foreground">音高、人声分离和歌词对齐各选至少一项；提取主唱模型可选。后续仍可在模型管理中增删。</p></div><Badge variant="outline">预计下载约 {formatBytes(estimatedInstallBytes)}</Badge></div>
             <div className="mt-3 grid grid-cols-3 gap-2"><Button type="button" size="sm" variant={installPreset === 'minimum' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('minimum')} disabled={analysisEnvironmentBusy}>轻量</Button><Button type="button" size="sm" variant={installPreset === 'recommended' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('recommended')} disabled={analysisEnvironmentBusy}>推荐</Button><Button type="button" size="sm" variant={installPreset === 'all' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('all')} disabled={analysisEnvironmentBusy}>全部</Button></div>
             <div className="mt-4 grid gap-4 md:grid-cols-3">
               <div><p className="mb-2 text-xs font-medium">音高识别</p><div className="space-y-2">{(['pyin', 'torchcrepe'] as PitchAlgorithm[]).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.pitchMethods.includes(id)} onChange={() => toggleInstallOption('pitchMethods', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.pitchMethods[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'pyin' ? '轻量，适合干净人声' : '复杂唱法更稳'}</span></span></label>)}</div></div>
               <div><p className="mb-2 text-xs font-medium">人声分离</p><div className="space-y-2">{(['htdemucs', 'htdemucs_ft', 'mdx_extra_q'] as const).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.separationModels.includes(id)} onChange={() => toggleInstallOption('separationModels', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.separationModels[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'htdemucs' ? '默认平衡方案' : id === 'htdemucs_ft' ? '更高质量，速度较慢' : '体积较小，速度较快'}</span></span></label>)}</div></div>
               <div><p className="mb-2 text-xs font-medium">歌词对齐</p><div className="space-y-2">{(['small', 'base'] as const).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.alignmentModels.includes(id)} onChange={() => toggleInstallOption('alignmentModels', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.alignmentModels[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'small' ? '精度与体积均衡' : '下载更小、运行更快'}</span></span></label>)}</div></div>
             </div>
+            <div className="mt-4 border-t border-border pt-3"><p className="mb-2 text-xs font-medium">可选 · 提取主唱、剥离和声（第二阶段）</p><label className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.harmonyModels.includes('bs-roformer-karaoke-frazer')} onChange={() => toggleInstallOption('harmonyModels', 'bs-roformer-karaoke-frazer')} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">BS-RoFormer Karaoke</span><span className="mt-0.5 block text-[11px] text-muted-foreground">先用上方模型分离人声，再提取主唱并保留和声／残留轨。额外下载约 204 MB；“轻量”“推荐”默认不选，“全部”会选中。</span></span></label></div>
             {!installSelectionComplete && <p className="mt-3 text-xs font-medium text-destructive">音高识别、人声分离和歌词对齐必须各保留至少一项。</p>}
           </div>
           <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；Whisper 会在 Hugging Face 官方与国内模型线路间实测下载速度，失败时保留进度并切换备用线路。</p></div>

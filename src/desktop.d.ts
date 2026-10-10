@@ -21,7 +21,7 @@ type AnalysisRuntimeStatus = {
   alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean; models: Array<{ id: string; label: string; description: string; ready: boolean }> }
   model: string
   modelReady: boolean
-  installSelection: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; alignmentModels: string[] }
+  installSelection: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; harmonyModels: string[]; alignmentModels: string[] }
   runtimeDirectory: string
   modelDirectory: string
   baseRuntimeVersion: string
@@ -54,7 +54,7 @@ declare global {
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
       removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
-      installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121'; installSelection?: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; alignmentModels: string[] } }) => Promise<AnalysisRuntimeStatus>
+      installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121'; installSelection?: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; harmonyModels: string[]; alignmentModels: string[] } }) => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
       prepareHarmonyModel: (model: string) => Promise<AnalysisRuntimeStatus>
       removeHarmonyModel: (model: string) => Promise<AnalysisRuntimeStatus>

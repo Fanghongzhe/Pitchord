@@ -97,6 +97,7 @@ const alignmentModelCatalog = [
 const defaultInstallSelection = {
   pitchMethods: ['pyin', 'torchcrepe'],
   separationModels: ['htdemucs'],
+  harmonyModels: [],
   alignmentModels: ['small'],
 }
 
@@ -106,11 +107,12 @@ function normalizeInstallSelection(value, requireComplete = false) {
   const selection = {
     pitchMethods: uniqueSupported(source.pitchMethods, ['pyin', 'torchcrepe']),
     separationModels: uniqueSupported(source.separationModels, separationModelCatalog.map(model => model.id)),
+    harmonyModels: uniqueSupported(source.harmonyModels, harmonyModelCatalog.map(model => model.id)),
     alignmentModels: uniqueSupported(source.alignmentModels, alignmentModelCatalog.map(model => model.id)),
   }
   if (!selection.pitchMethods.length || !selection.separationModels.length || !selection.alignmentModels.length) {
     if (requireComplete) throw new Error('音高识别、人声分离和歌词对齐至少需要各选择一项。')
-    return { ...defaultInstallSelection, pitchMethods: [...defaultInstallSelection.pitchMethods], separationModels: [...defaultInstallSelection.separationModels], alignmentModels: [...defaultInstallSelection.alignmentModels] }
+    return { ...defaultInstallSelection, pitchMethods: [...defaultInstallSelection.pitchMethods], separationModels: [...defaultInstallSelection.separationModels], harmonyModels: [], alignmentModels: [...defaultInstallSelection.alignmentModels] }
   }
   return selection
 }
@@ -430,8 +432,9 @@ async function analysisRuntimeStatus() {
     (!installSelection.alignmentModels.length || !!probe?.fasterWhisper)
   )
   const selectedSeparationModelsReady = installSelection.separationModels.every(id => models.some(model => model.id === id && model.ready))
+  const selectedHarmonyModelsReady = installSelection.harmonyModels.every(id => harmonyModels.some(model => model.id === id && model.ready))
   const selectedAlignmentModelsReady = installSelection.alignmentModels.every(id => alignmentModels.some(model => model.id === id && model.ready))
-  const completeReady = requiredPackagesReady && selectedSeparationModelsReady && selectedAlignmentModelsReady
+  const completeReady = requiredPackagesReady && selectedSeparationModelsReady && selectedHarmonyModelsReady && selectedAlignmentModelsReady
   const detectedGpu = await detectNvidiaGpu()
   const computeProfile = await configuredComputeProfile()
   return {
@@ -628,13 +631,16 @@ async function chooseModelSource(model) {
 function environmentPlan(computeProfile, packageSource = officialPackageSource, installSelection = defaultInstallSelection) {
   const pitchLabels = installSelection.pitchMethods.map(id => id === 'pyin' ? 'pYIN' : 'TorchCrepe').join('、')
   const separationLabels = installSelection.separationModels.map(id => separationModelCatalog.find(model => model.id === id)?.label || id).join('、')
+  const harmonyLabels = installSelection.harmonyModels.map(id => harmonyModelCatalog.find(model => model.id === id)?.label || id).join('、')
   const alignmentLabels = installSelection.alignmentModels.map(id => alignmentModelCatalog.find(model => model.id === id)?.label || id).join('、')
+  const withHarmony = installSelection.harmonyModels.length > 0
   return [
     { id: 'base-runtime', label: 'Python 与高速安装工具', detail: `内置 Python 3.12、uv 并行安装器 · ${packageSource.label}`, weight: 0.08 },
-    { id: 'compute', label: computeProfile === 'cuda121' ? 'GPU 计算组件' : 'CPU 计算组件', detail: computeProfile === 'cuda121' ? 'PyTorch · CUDA 12.1' : 'PyTorch · CPU', weight: 0.32 },
-    { id: 'dependencies', label: '音频分析依赖', detail: `音高：${pitchLabels} · 按选择安装运行组件`, weight: 0.28 },
-    { id: 'separation-model', label: '人声分离模型', detail: separationLabels, weight: 0.12 },
-    { id: 'alignment-model', label: '歌词对齐模型', detail: alignmentLabels, weight: 0.17 },
+    { id: 'compute', label: computeProfile === 'cuda121' ? 'GPU 计算组件' : 'CPU 计算组件', detail: computeProfile === 'cuda121' ? 'PyTorch · CUDA 12.1' : 'PyTorch · CPU', weight: withHarmony ? 0.30 : 0.32 },
+    { id: 'dependencies', label: '音频分析依赖', detail: `音高：${pitchLabels} · 按选择安装运行组件`, weight: withHarmony ? 0.25 : 0.28 },
+    { id: 'separation-model', label: '人声分离模型', detail: separationLabels, weight: withHarmony ? 0.11 : 0.12 },
+    ...(withHarmony ? [{ id: 'harmony-model', label: '提取主唱、剥离和声模型', detail: harmonyLabels, weight: 0.10 }] : []),
+    { id: 'alignment-model', label: '歌词对齐模型', detail: alignmentLabels, weight: withHarmony ? 0.13 : 0.17 },
     { id: 'verify', label: '完整性检查', detail: '运行环境、模型与计算设备', weight: 0.03 },
   ]
 }
@@ -931,6 +937,34 @@ async function ensureRecommendedAlignmentModel(python, modelId, onProgress, task
   onProgress?.(1, `${selectedModel.label} 歌词对齐模型已准备完成。`)
 }
 
+async function ensureRecommendedHarmonyModel(modelId, onProgress) {
+  const model = harmonyModelCatalog.find(item => item.id === modelId)
+  if (!model) throw new Error('不支持的去和声模型。')
+  if (!fs.existsSync(path.join(msstRoot, 'inference.py'))) throw new Error('当前安装包缺少去和声推理组件。')
+  await requireFreeSpace(512 * 1024 * 1024, '准备去和声模型')
+  const directory = path.join(modelRoot(), 'harmony', model.id)
+  await mkdir(directory, { recursive: true })
+  const files = [
+    { name: model.configName, hash: model.configSha256, size: model.configSize, label: '模型配置' },
+    { name: model.checkpointName, hash: model.checkpointSha256, size: model.checkpointSize, label: '去和声权重' },
+  ]
+  onProgress?.(0.01, `正在准备 ${model.label}…`)
+  for (const [index, file] of files.entries()) {
+    const destination = path.join(directory, file.name)
+    try { await verifyLocalFile(destination, file.hash, file.size) }
+    catch {
+      await fs.promises.rm(destination, { force: true })
+      const url = `https://huggingface.co/${model.repository}/resolve/${model.revision}/${file.name}`
+      await downloadVerifiedFile(url, destination, file.hash, file.size, (progress, message, telemetry) => {
+        onProgress?.((index + progress) / files.length, message, '', telemetry)
+      }, file.label)
+    }
+    onProgress?.((index + 1) / files.length, `${file.label}已校验。`)
+  }
+  await writeFile(path.join(directory, 'pitchord-model.json'), JSON.stringify({ model: model.id, source: `https://huggingface.co/${model.repository}`, revision: model.revision, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+  onProgress?.(1, `${model.label} 已准备完成。`)
+}
+
 const projectRoot = () => path.join(app.getPath('documents'), 'Pitchord Projects')
 const requireProject = () => {
   if (!activeProject) throw new Error('请先新建或打开工程，再导入媒体和运行分析。')
@@ -1161,7 +1195,7 @@ app.whenReady().then(async () => {
         ? resolvedProfile === 'cuda121' ? 5 * 1024 * 1024 * 1024 : 3 * 1024 * 1024 * 1024
         : resolvedProfile === 'cuda121' ? 8 * 1024 * 1024 * 1024 : 5 * 1024 * 1024 * 1024
       await requireFreeSpace(requiredBytes, '安装分析环境')
-      report('base-runtime', 0.01, `已选择${packageSource.label}，将一次准备 6 项完整能力。`)
+      report('base-runtime', 0.01, `已选择${packageSource.label}，将一次准备 ${plan.length} 项完整能力。`)
       let python
       if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message, telemetry) => report('base-runtime', progress * 0.8, message, '', telemetry))
       else python = (await findBootstrapPython())?.executable
@@ -1301,12 +1335,15 @@ app.whenReady().then(async () => {
       for (const [index, modelId] of installSelection.separationModels.entries()) {
         await ensureRecommendedSeparationModel(python, modelId, (progress, message, detail, telemetry) => report('separation-model', (index + progress) / installSelection.separationModels.length, message, detail, telemetry))
       }
+      for (const [index, modelId] of installSelection.harmonyModels.entries()) {
+        await ensureRecommendedHarmonyModel(modelId, (progress, message, detail, telemetry) => report('harmony-model', (index + progress) / installSelection.harmonyModels.length, message, detail, telemetry))
+      }
       for (const [index, modelId] of installSelection.alignmentModels.entries()) {
         await ensureRecommendedAlignmentModel(python, modelId, (progress, message, detail, telemetry) => report('alignment-model', (index + progress) / installSelection.alignmentModels.length, message, detail, telemetry))
       }
       report('verify', 0.25, '正在检查全部组件与推荐模型…')
       const finalStatus = await analysisRuntimeStatus()
-      const selectedModelsReady = installSelection.separationModels.every(id => finalStatus.separationModels.find(model => model.id === id)?.ready) && installSelection.alignmentModels.every(id => finalStatus.alignment.models.find(model => model.id === id)?.ready)
+      const selectedModelsReady = installSelection.separationModels.every(id => finalStatus.separationModels.find(model => model.id === id)?.ready) && installSelection.harmonyModels.every(id => finalStatus.harmonyModels.find(model => model.id === id)?.ready) && installSelection.alignmentModels.every(id => finalStatus.alignment.models.find(model => model.id === id)?.ready)
       if (!finalStatus.runtimeReady || !selectedModelsReady) throw new Error('完整环境安装结束，但部分所选模型未通过检查。请点击修复后重试。')
       report('verify', 1, '完整分析环境已准备完成。')
       sendAnalysisProgress('complete', '完整分析环境已准备完成。', { overallProgress: 1, componentProgress: 1, components: plan.map(item => ({ id: item.id, label: item.label, detail: item.detail, status: 'complete', progress: 1 })) })
@@ -1376,28 +1413,14 @@ app.whenReady().then(async () => {
     const model = harmonyModelCatalog.find(item => item.id === modelId)
     if (!model) throw new Error('不支持的去和声模型。')
     analysisInstallTask = (async () => {
-      await requireFreeSpace(512 * 1024 * 1024, '准备去和声模型')
       const python = await preferredPythonPath()
       const probe = await probePython(python)
       if (!python || !probe?.demucs || !fs.existsSync(path.join(msstRoot, 'inference.py'))) throw new Error('请先安装或修复分析环境。')
-      const directory = path.join(modelRoot(), 'harmony', model.id)
-      await mkdir(directory, { recursive: true })
-      const files = [
-        { name: model.configName, hash: model.configSha256, size: model.configSize, label: '模型配置' },
-        { name: model.checkpointName, hash: model.checkpointSha256, size: model.checkpointSize, label: '去和声权重' },
-      ]
       sendTaskProgress('environment-model', '准备去和声模型', 'running', `正在准备 ${model.label}…`, 0.01)
-      for (const [index, file] of files.entries()) {
-        const destination = path.join(directory, file.name)
-        try { await verifyLocalFile(destination, file.hash, file.size); continue } catch { /* download or replace the managed copy */ }
-        await fs.promises.rm(destination, { force: true })
-        const url = `https://huggingface.co/${model.repository}/resolve/${model.revision}/${file.name}`
-        await downloadVerifiedFile(url, destination, file.hash, file.size, (progress, message, telemetry) => {
-          sendAnalysisProgress('model', message, telemetry)
-          sendTaskProgress('environment-model', '准备去和声模型', 'running', message, (index + progress) / files.length)
-        }, file.label)
-      }
-      await writeFile(path.join(directory, 'pitchord-model.json'), JSON.stringify({ model: model.id, source: `https://huggingface.co/${model.repository}`, revision: model.revision, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      await ensureRecommendedHarmonyModel(modelId, (progress, message, _detail, telemetry) => {
+        sendAnalysisProgress('model', message, telemetry)
+        sendTaskProgress('environment-model', '准备去和声模型', 'running', message, progress)
+      })
       sendTaskProgress('environment-model', '准备去和声模型', 'success', `${model.label} 已准备完成`, 1)
       return { ...await analysisRuntimeStatus(), busy: false }
     })()
