@@ -56,6 +56,18 @@ class ReferenceAlignmentTests(unittest.TestCase):
         self.assertTrue(all(char["end"] - char["start"] >= 0.059 for char in middle))
         self.assertGreater(result["segments"][0]["end"] - result["segments"][0]["start"], 1.0)
 
+    def test_character_timing_evidence_records_direct_asr_and_interpolation(self):
+        reference = lyrics("你好，世界")
+        recognized = tokens("你好世界", 1)
+        recognized[0]["probability"] = 0.42
+        recognized = recognized[:1] + recognized[2:]
+        result = aligner.align_segments(reference, recognized, 5)
+        chars = result["segments"][0]["chars"]
+        self.assertEqual(chars[0]["timingEvidence"]["source"], "asr")
+        self.assertEqual(chars[0]["timingEvidence"]["asrProbability"], 0.42)
+        self.assertEqual(chars[1]["timingEvidence"]["source"], "interpolated")
+        self.assertEqual(chars[2]["timingEvidence"]["source"], "punctuation")
+
     def test_repeated_chorus_and_punctuation_keep_order_and_bounds(self):
         reference = lyrics("你还记得吗，", "我依然在这里", "你还记得吗，", "我依然在这里")
         recognized = tokens("你还记得吗我依然在这里", 2) + tokens("你还记得吗我依然在这里", 9)

@@ -5,6 +5,8 @@ import type { CharSpan, LyricSegment } from '@/lib/lyrics'
 import type { PitchPoint } from '@/lib/pitch'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import type { AcousticAnalysis } from '@/lib/acoustics'
+import { snapAcousticBoundary, type BoundaryReview } from '@/lib/alignment-quality'
 
 type Clip = LyricSegment | CharSpan
 type Drag = { id: string; mode: 'move' | 'start' | 'end'; x: number; start: number; end: number; index: number; moved: boolean; lastX: number; lastStep: number; detached: boolean; frozen?: ClipPreview[]; preview?: ClipPreview[] }
@@ -17,6 +19,10 @@ type Props = {
   selectedIds: string[]
   duration: number
   peaks: number[]
+  vocalPeaks?: number[]
+  acoustics?: AcousticAnalysis | null
+  showSpectrogram?: boolean
+  reviews?: BoundaryReview[]
   pitchPoints: PitchPoint[]
   zoom: number
   playhead: number
@@ -32,6 +38,7 @@ type Props = {
   onRetimeLines: (updates: ClipPreview[]) => void
   onRetimeChar: (id: string, start: number, end: number) => void
   onRetimeChars?: (updates: ClipPreview[]) => void
+  onClipPreview?: (updates: ClipPreview[] | null) => void
   rangeAdjusting?: boolean
   rangeDraft?: ClipPreview | null
   onRangePreview?: (range: ClipPreview) => void
@@ -42,7 +49,7 @@ type Props = {
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, time: number, id?: string) => void
 }
 
-export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, pitchPoints, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, guideLine, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
+export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, vocalPeaks = [], acoustics = null, showSpectrogram = false, reviews = [], pitchPoints, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, guideLine, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, onClipPreview, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
   const start = mode === 'chars' && activeSegment ? activeSegment.start : 0
   const end = mode === 'chars' && activeSegment ? activeSegment.end : Math.max(duration, 1)
   const span = Math.max(end - start, 0.2)
@@ -51,6 +58,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   const clips = useMemo<Clip[]>(() => mode === 'chars' ? activeSegment?.chars ?? [] : segments, [mode, activeSegment, segments])
   const activeClipId = mode === 'lines' ? activeSegment?.id : selectedIds[0]
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const spectrogramRef = useRef<HTMLCanvasElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const previousGeometryRef = useRef({ scale, start })
   const seenCenterRequestRef = useRef(0)
@@ -58,6 +66,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   const dragRef = useRef<Drag | null>(null)
   const clickSequenceRef = useRef<{ id: string; startedSelected: boolean; lastPointerAt: number } | null>(null)
   const [preview, setPreview] = useState<ClipPreview[] | null>(null)
+  useEffect(() => onClipPreview?.(preview), [preview, onClipPreview])
+  useEffect(() => () => onClipPreview?.(null), [onClipPreview])
   const clipNodesRef = useRef<Record<string, HTMLDivElement | null>>({})
   const ticks = useMemo(() => {
     const interval = scale >= 80 ? 1 : scale >= 35 ? 2 : 5
@@ -99,9 +109,10 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
     viewport.scrollLeft = clamp((playhead - start) * scale - viewport.clientWidth / 2, 0, viewport.scrollWidth - viewport.clientWidth)
   }, [seekCenterRequest, playhead, mode, start, end, scale])
 
+  const shownPeaks = mode === 'chars' && vocalPeaks.length ? vocalPeaks : peaks
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas || !peaks.length) return
+    if (!canvas || !shownPeaks.length) return
     const actualWidth = Math.min(Math.round(width), 30000)
     const actualHeight = 112
     canvas.width = actualWidth
@@ -109,20 +120,46 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
     const ctx = canvas.getContext('2d')
     if (!ctx) return
     ctx.clearRect(0, 0, actualWidth, actualHeight)
-    const viewStartIndex = Math.floor(start / Math.max(duration, 0.001) * peaks.length)
-    const viewEndIndex = Math.ceil(end / Math.max(duration, 0.001) * peaks.length)
+    const viewStartIndex = Math.floor(start / Math.max(duration, 0.001) * shownPeaks.length)
+    const viewEndIndex = Math.ceil(end / Math.max(duration, 0.001) * shownPeaks.length)
     const count = Math.max(1, viewEndIndex - viewStartIndex)
     const columns = Math.ceil(actualWidth / 2)
     ctx.fillStyle = '#858c97'
     for (let x = 0; x < columns; x++) {
       const from = viewStartIndex + Math.floor(x / columns * count)
-      const to = Math.min(peaks.length, viewStartIndex + Math.ceil((x + 1) / columns * count))
+      const to = Math.min(shownPeaks.length, viewStartIndex + Math.ceil((x + 1) / columns * count))
       let peak = 0
-      for (let i = from; i < to; i++) peak = Math.max(peak, peaks[i] ?? 0)
+      for (let i = from; i < to; i++) peak = Math.max(peak, shownPeaks[i] ?? 0)
       const height = Math.max(2, Math.round(peak * 94))
       ctx.fillRect(x * 2, (actualHeight - height) / 2, 1, height)
     }
-  }, [peaks, width, start, end, duration])
+  }, [shownPeaks, width, start, end, duration])
+
+  useEffect(() => {
+    const canvas = spectrogramRef.current
+    if (!canvas || !acoustics || !showSpectrogram || mode !== 'chars') return
+    const actualWidth = Math.min(Math.round(width), 30000)
+    const height = 96
+    canvas.width = actualWidth
+    canvas.height = height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const image = ctx.createImageData(actualWidth, height)
+    const count = acoustics.rms.length
+    for (let x = 0; x < actualWidth; x++) {
+      const frame = Math.min(count - 1, Math.max(0, Math.floor((start + x / scale) / acoustics.step)))
+      for (let y = 0; y < height; y++) {
+        const band = Math.min(acoustics.bands - 1, Math.floor((1 - y / height) * acoustics.bands))
+        const intensity = acoustics.spectrum[frame * acoustics.bands + band] ?? 0
+        const offset = (y * actualWidth + x) * 4
+        image.data[offset] = Math.min(255, intensity * 1.25)
+        image.data[offset + 1] = Math.min(255, intensity * 0.7 + 10)
+        image.data[offset + 2] = Math.min(255, intensity * 1.4 + 22)
+        image.data[offset + 3] = 255
+      }
+    }
+    ctx.putImageData(image, 0, 0)
+  }, [acoustics, showSpectrogram, mode, width, start, scale])
 
   const pointerDown = (event: PointerEvent<HTMLDivElement>, clip: Clip, modeOfDrag: Drag['mode']) => {
     if (event.button !== 0) return
@@ -133,6 +170,17 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       clickSequenceRef.current = { id: clip.id, startedSelected: selectedIds.includes(clip.id), lastPointerAt: event.timeStamp }
     } else sequence.lastPointerAt = event.timeStamp
     onSelect(clip.id, event.ctrlKey || event.metaKey, event.shiftKey)
+    if (mode === 'chars') {
+      const word = clip as CharSpan
+      const index = clips.findIndex(item => item.id === clip.id)
+      const previous = clips[index - 1] as CharSpan | undefined
+      const next = clips[index + 1] as CharSpan | undefined
+      const startShared = previous && Math.abs(previous.end - word.start) < 0.003
+      const endShared = next && Math.abs(next.start - word.end) < 0.003
+      if (modeOfDrag === 'move' && (word.startLocked || word.endLocked || startShared && previous.endLocked || endShared && next.startLocked)) return
+      if (modeOfDrag === 'start' && (word.startLocked || startShared && previous.endLocked)) return
+      if (modeOfDrag === 'end' && (word.endLocked || endShared && next.startLocked)) return
+    }
     if (rangeAdjusting && (clip.id !== activeClipId || modeOfDrag === 'move')) return
     if (event.ctrlKey || event.metaKey || event.shiftKey) return
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -203,12 +251,14 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
     const result: ClipPreview[] = clips.map(clip => ({ id: clip.id, start: clip.start, end: clip.end }))
     if (edge === 'start') {
       result[index].start = value
+      if (mode === 'chars' && index > 0 && Math.abs(clips[index - 1].end - clips[index].start) < 0.003) result[index - 1].end = value
       for (let current = index - 1; current >= 0 && result[current].end > result[current + 1].start; current--) {
         result[current].end = result[current + 1].start
         if (result[current].end - result[current].start < MIN_SPAN) result[current].start = result[current].end - MIN_SPAN
       }
     } else {
       result[index].end = value
+      if (mode === 'chars' && index + 1 < result.length && Math.abs(clips[index + 1].start - clips[index].end) < 0.003) result[index + 1].start = value
       for (let current = index + 1; current < result.length && result[current].start < result[current - 1].end; current++) {
         result[current].start = result[current - 1].end
         if (result[current].end - result[current].start < MIN_SPAN) result[current].end = result[current].start + MIN_SPAN
@@ -220,9 +270,11 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   const boundedResizePreview = (drag: Drag, edge: 'start' | 'end', value: number) => {
     const lowerBound = mode === 'chars' ? start : 0
     const upperBound = mode === 'chars' ? end : duration
+    const sharedLeft = mode === 'chars' && drag.index > 0 && Math.abs(clips[drag.index - 1].end - clips[drag.index].start) < 0.003
+    const sharedRight = mode === 'chars' && drag.index + 1 < clips.length && Math.abs(clips[drag.index + 1].start - clips[drag.index].end) < 0.003
     const bounded = edge === 'start'
-      ? clamp(value, lowerBound + drag.index * MIN_SPAN, drag.end - MIN_SPAN)
-      : clamp(value, drag.start + MIN_SPAN, upperBound - (clips.length - drag.index - 1) * MIN_SPAN)
+      ? clamp(value, Math.max(lowerBound + drag.index * MIN_SPAN, sharedLeft ? clips[drag.index - 1].start + MIN_SPAN : lowerBound), drag.end - MIN_SPAN)
+      : clamp(value, drag.start + MIN_SPAN, Math.min(upperBound - (clips.length - drag.index - 1) * MIN_SPAN, sharedRight ? clips[drag.index + 1].end - MIN_SPAN : upperBound))
     return buildResizePreview(drag.index, edge, bounded)
   }
 
@@ -252,7 +304,11 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   }
 
   const hasNeighborChanges = (preview: ClipPreview[], index: number) => preview.some((clip, clipIndex) => clipIndex !== index && (clip.start !== clips[clipIndex].start || clip.end !== clips[clipIndex].end))
-  const snapBoundary = (value: number) => guideLine !== null && Math.abs(value - guideLine) * scale <= 12 ? guideLine : value
+  const snapBoundary = (value: number, disabled = false) => {
+    if (disabled) return value
+    if (guideLine !== null && Math.abs(value - guideLine) * scale <= 12) return guideLine
+    return mode === 'chars' ? snapAcousticBoundary(value, acoustics?.candidates ?? [], scale)?.time ?? value : value
+  }
 
   const pointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
@@ -267,8 +323,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       if (drag.mode === 'move') return
       const lowerBound = mode === 'chars' ? start : 0
       const upperBound = mode === 'chars' ? end : duration
-      const nextStart = drag.mode === 'start' ? clamp(snapBoundary(drag.start + delta), lowerBound, drag.end - MIN_SPAN) : drag.start
-      const nextEnd = drag.mode === 'end' ? clamp(snapBoundary(drag.end + delta), drag.start + MIN_SPAN, upperBound) : drag.end
+      const nextStart = drag.mode === 'start' ? clamp(snapBoundary(drag.start + delta, event.altKey), lowerBound, drag.end - MIN_SPAN) : drag.start
+      const nextEnd = drag.mode === 'end' ? clamp(snapBoundary(drag.end + delta, event.altKey), drag.start + MIN_SPAN, upperBound) : drag.end
       const nextRange = { id: drag.id, start: roundTime(nextStart), end: roundTime(nextEnd) }
       setPreview([nextRange])
       onRangePreview?.(nextRange)
@@ -284,7 +340,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       if (!drag.detached) {
         const target = drag.start + delta
         const next = boundedMovePreview(drag.index, target)
-        if (directionChanged && drag.preview && hasNeighborChanges(drag.preview, drag.index)) {
+        if (mode === 'lines' && directionChanged && drag.preview && hasNeighborChanges(drag.preview, drag.index)) {
           drag.detached = true
           drag.frozen = drag.preview
         }
@@ -294,10 +350,10 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       return
     }
     if (drag.mode === 'start' || drag.mode === 'end') {
-      const target = snapBoundary((drag.mode === 'start' ? drag.start : drag.end) + delta)
+      const target = snapBoundary((drag.mode === 'start' ? drag.start : drag.end) + delta, event.altKey)
       if (!drag.detached) {
         const next = boundedResizePreview(drag, drag.mode, target)
-        if (directionChanged && drag.preview && hasNeighborChanges(drag.preview, drag.index)) {
+        if (mode === 'lines' && directionChanged && drag.preview && hasNeighborChanges(drag.preview, drag.index)) {
           drag.detached = true
           drag.frozen = drag.preview
         }
@@ -338,6 +394,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
 
   const visiblePlayhead = playhead >= start && playhead <= end
   const visiblePitch = pitchPoints.filter(point => point.voiced && point.time >= start && point.time <= end)
+  const visibleCandidates = mode === 'chars' ? acoustics?.candidates.filter(candidate => candidate.time >= start && candidate.time <= end && candidate.strength >= 0.35) ?? [] : []
+  const reviewById = new Map(reviews.map(review => [review.charId, review]))
   const floatingClip = selectedIds.length === 1 ? clips.find(clip => clip.id === activeClipId) : null
   const floatingRange = floatingClip ? (rangeAdjusting && rangeDraft?.id === floatingClip.id ? rangeDraft : floatingClip) : null
   const floatingLeft = floatingRange ? clamp(((floatingRange.start + floatingRange.end) / 2 - start) * scale, 76, width - 76) : 0
@@ -360,13 +418,15 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
         </div>
         <div className="relative h-32 cursor-crosshair border-b border-border bg-muted/40" onPointerDown={seekAt}>
           {ticks.map(time => <div key={time} className="absolute top-0 bottom-0 border-l border-border/40" style={{ left: (time - start) * scale }} />)}
-          {peaks.length > 0 ? <canvas ref={canvasRef} className="absolute inset-0 h-28 w-full" style={{ width }} /> : <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">{waveformStatus}</div>}
+          {shownPeaks.length > 0 ? <canvas ref={canvasRef} className="absolute inset-0 h-28 w-full" style={{ width }} /> : <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">{waveformStatus}</div>}
           {visiblePitch.length > 1 && <svg className="pointer-events-none absolute inset-0 h-28" style={{ width }} viewBox={`0 0 ${Math.max(1, width)} 112`} preserveAspectRatio="none" aria-label="连续音高轨"><polyline fill="none" stroke="hsl(var(--primary))" strokeOpacity=".9" strokeWidth="2" points={visiblePitch.map(point => `${(point.time - start) * scale},${102 - Math.min(88, Math.max(0, Math.log2(Math.max(65, point.hz) / 65) / Math.log2(1100 / 65) * 88))}`).join(' ')} /></svg>}
-          <div className="absolute left-4 bottom-2 rounded bg-background/80 px-2 py-1 text-xs text-muted-foreground">{mode === 'chars' ? '当前句音频' : '原媒体波形'}</div>
+          <div className="absolute left-4 bottom-2 rounded bg-background/80 px-2 py-1 text-xs text-muted-foreground">{mode === 'chars' && vocalPeaks.length ? '纯人声波形 · F0' : '原媒体波形 · F0'}</div>
         </div>
+        {mode === 'chars' && showSpectrogram && acoustics && <div className="relative h-24 border-b border-border bg-black" onPointerDown={seekAt}><canvas ref={spectrogramRef} className="absolute inset-0 h-24" style={{ width }} /><div className="pointer-events-none absolute bottom-1 left-4 rounded bg-black/70 px-2 py-0.5 text-[10px] text-white/80">纯人声频谱 · 低频在下</div></div>}
         <div className="relative h-30 border-b border-border bg-card/60" onPointerDown={seekAt}>
           {ticks.map(time => <div key={time} className="absolute top-0 bottom-0 border-l border-border/40" style={{ left: (time - start) * scale }} />)}
           <div className="absolute top-2 left-4 text-xs text-muted-foreground">{mode === 'lines' ? '句级歌词轨' : '单字时间轨'}</div>
+          {visibleCandidates.map(candidate => <div key={`${candidate.kind}-${candidate.time}`} className="pointer-events-none absolute top-8 bottom-2 z-0 border-l border-dashed border-fuchsia-400/40" style={{ left: (candidate.time - start) * scale }} title={candidate.reason} />)}
           {clips.map((clip, index) => {
             const shown = preview?.find(item => item.id === clip.id) ?? (rangeAdjusting && rangeDraft?.id === clip.id ? rangeDraft : clip)
             const selected = selectedIds.includes(clip.id)
@@ -376,7 +436,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
               key={clip.id}
               ref={node => { clipNodesRef.current[clip.id] = node }}
               data-clip-id={clip.id}
-              className={cn('timeline-clip absolute top-9 h-16 overflow-visible rounded-md border text-left shadow-sm transition-colors', selected ? 'z-30 border-primary bg-primary/25 text-foreground' : 'z-10 border-border bg-secondary text-secondary-foreground hover:border-primary/60', rangeAdjusting && rangeDraft?.id !== clip.id && 'cursor-not-allowed opacity-25', rangeAdjusting && rangeDraft?.id === clip.id && 'ring-2 ring-amber-400')}
+              className={cn('timeline-clip absolute top-9 h-16 overflow-visible rounded-md border text-left shadow-sm transition-colors', selected ? 'z-30 border-primary bg-primary/25 text-foreground' : 'z-10 border-border bg-secondary text-secondary-foreground hover:border-primary/60', mode === 'chars' && (reviewById.get(clip.id)?.score ?? 0) >= 40 && 'ring-2 ring-orange-400', rangeAdjusting && rangeDraft?.id !== clip.id && 'cursor-not-allowed opacity-25', rangeAdjusting && rangeDraft?.id === clip.id && 'ring-2 ring-amber-400')}
               style={{ left, width: clipWidth, zIndex: selected ? 30 : 10 } as CSSProperties}
               onPointerDown={event => pointerDown(event, clip, 'move')}
               onPointerMove={pointerMove}
@@ -385,11 +445,11 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
               onClick={event => { if (event.detail >= 3) activateClip(clip.id, true) }}
               onContextMenu={event => { event.preventDefault(); event.stopPropagation(); const rect = event.currentTarget.parentElement?.getBoundingClientRect(); const time = rect ? roundTime(clamp(start + (event.clientX - rect.left) / scale, start, end)) : shown.start; onContextMenu?.(event, time, clip.id) }}
               onDoubleClick={() => { if (rangeAdjusting && clip.id !== rangeDraft?.id) return; const sequence = clickSequenceRef.current; activateClip(clip.id, sequence?.id === clip.id && sequence.startedSelected) }}
-              title={`${clip.text} · ${formatTime(shown.start)}–${formatTime(shown.end)}`}
+              title={`${clip.text} · ${formatTime(shown.start)}–${formatTime(shown.end)}${mode === 'chars' && reviewById.get(clip.id)?.reasons.length ? ` · 疑点：${reviewById.get(clip.id)?.reasons.join('、')}` : ''}`}
             >
               <div className={cn('timeline-handle absolute inset-y-0 z-40 border-r border-foreground/30 bg-foreground/10 hover:bg-primary/50', selected ? '-left-2 w-4' : 'left-0 w-2')} onPointerDown={event => { event.stopPropagation(); pointerDown(event, clip, 'start') }} />
               <div className="flex h-full flex-col justify-center overflow-hidden px-3">
-                <span className="truncate font-medium">{clip.text}</span>
+                <span className="truncate font-medium">{clip.text}{mode === 'chars' && ((clip as CharSpan).startLocked || (clip as CharSpan).endLocked) ? ' 🔒' : ''}</span>
                 <span className="truncate font-mono text-[10px] text-muted-foreground">{formatTime(shown.start)} · {index + 1}</span>
               </div>
               <div className={cn('timeline-handle absolute inset-y-0 z-40 border-l border-foreground/30 bg-foreground/10 hover:bg-primary/50', selected ? '-right-2 w-4' : 'right-0 w-2')} onPointerDown={event => { event.stopPropagation(); pointerDown(event, clip, 'end') }} />

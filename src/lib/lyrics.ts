@@ -9,6 +9,13 @@ export type CharSpan = {
   end: number
   origin: 'estimated' | 'manual'
   pitchOverride?: PitchAnnotation
+  timingEvidence?: {
+    source: 'asr' | 'interpolated' | 'lrc' | 'punctuation'
+    asrProbability?: number
+    matched: boolean
+  }
+  startLocked?: boolean
+  endLocked?: boolean
 }
 
 export type LyricSegment = {

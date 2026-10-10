@@ -31,6 +31,10 @@ export type SubtitleStyle = {
   colorBand: PitchColorBand
   showDot: boolean
   showPitch: boolean
+  dotSize: number
+  dotOffset: number
+  dotColorMode: 'pitch' | 'custom'
+  dotColor: string
 }
 
 export const defaultSubtitleStyle: SubtitleStyle = {
@@ -58,6 +62,10 @@ export const defaultSubtitleStyle: SubtitleStyle = {
   colorBand: 'rainbow',
   showDot: true,
   showPitch: true,
+  dotSize: 32,
+  dotOffset: 0,
+  dotColorMode: 'pitch',
+  dotColor: '#FFFFFF',
 }
 
 export type WordTimedSubtitle = {
@@ -126,16 +134,79 @@ function escapeAss(text: string) {
   return text.replace(/\\/g, '＼').replace(/{/g, '｛').replace(/}/g, '｝').replace(/\r?\n/g, '\\N')
 }
 
-function displayedText(segment: LyricSegment, activeId: string, color: string) {
+function displayedText(segment: LyricSegment, colors: string[]) {
   let cursor = 0
   let output = ''
-  for (const word of segment.chars) {
+  for (const [index, word] of segment.chars.entries()) {
     output += escapeAss(segment.text.slice(cursor, word.startOffset))
     const content = escapeAss(segment.text.slice(word.startOffset, word.endOffset) || word.text)
-    output += word.id === activeId ? `{\\c${assColor(color)}&}${content}{\\r}` : content
+    output += `{\\c${assColor(colors[index])}&}${content}{\\r}`
     cursor = word.endOffset
   }
   return output + escapeAss(segment.text.slice(cursor))
+}
+
+type TimedNote = { start: number; end: number; hz: number; label: string }
+
+function timedNotes(word: LyricSegment['chars'][number], points: PitchPoint[]): TimedNote[] {
+  const annotation = pitchForChar(word, points)
+  return annotation.notes.map((note, index) => ({
+    start: word.start + (word.end - word.start) * note.start,
+    end: word.start + (word.end - word.start) * note.end,
+    hz: noteHz(note.note) ?? 0,
+    label: annotation.motion === 'vibrato' && index === 0 ? `${note.note}~` : note.note,
+  }))
+}
+
+function noteAt(notes: TimedNote[], time: number): TimedNote | null {
+  if (!notes.length) return null
+  return notes.find(note => time >= note.start && time < note.end) ?? (time < notes[0].start ? notes[0] : notes[notes.length - 1])
+}
+
+export type SubtitleFrame = {
+  segment: LyricSegment
+  activeIndex: number
+  colors: string[]
+  currentHz: number | null
+  currentLabel: string
+  progress: number
+  dotColor: string
+}
+
+export type PreparedSubtitleSegment = { segment: LyricSegment; notes: TimedNote[][] }
+
+export function prepareSubtitleTimeline(segments: LyricSegment[], points: PitchPoint[]): PreparedSubtitleSegment[] {
+  return segments.map(segment => ({ segment, notes: segment.chars.map(char => timedNotes(char, points)) }))
+}
+
+function frameForSegment(segment: LyricSegment, time: number, style: SubtitleStyle, notes: TimedNote[][]): SubtitleFrame {
+  const activeIndex = segment.chars.findIndex(char => time >= char.start && time < char.end)
+  const colors = notes.map(items => {
+    const note = noteAt(items, time)
+    return note?.hz ? pitchColor(note.hz, style) : style.baseColor
+  })
+  const activeChar = segment.chars[activeIndex]
+  const currentNote = activeIndex >= 0 ? noteAt(notes[activeIndex], time) : null
+  const previousIndex = segment.chars.findLastIndex(char => char.end <= time)
+  const heldNote = currentNote ?? (previousIndex >= 0 ? noteAt(notes[previousIndex], time) : null)
+  return {
+    segment, activeIndex, colors,
+    currentHz: heldNote?.hz || null,
+    currentLabel: heldNote?.label ?? '',
+    progress: activeChar ? clamp01((time - activeChar.start) / Math.max(0.001, activeChar.end - activeChar.start)) : 0,
+    dotColor: style.dotColorMode === 'custom' ? style.dotColor : activeIndex >= 0 ? colors[activeIndex] : style.baseColor,
+  }
+}
+
+export function subtitleFrameFromTimeline(prepared: PreparedSubtitleSegment[], time: number, partialStyle: Partial<SubtitleStyle> = {}): SubtitleFrame | null {
+  const style = { ...defaultSubtitleStyle, ...partialStyle }
+  const item = prepared.find(({ segment }) => time >= segment.start && time < segment.end)
+  if (!item || !item.segment.chars.length) return null
+  return frameForSegment(item.segment, time, style, item.notes)
+}
+
+export function subtitleFrameAt(segments: LyricSegment[], points: PitchPoint[], time: number, partialStyle: Partial<SubtitleStyle> = {}): SubtitleFrame | null {
+  return subtitleFrameFromTimeline(prepareSubtitleTimeline(segments, points), time, partialStyle)
 }
 
 function activeX(segment: LyricSegment, charIndex: number, style: SubtitleStyle) {
@@ -198,32 +269,35 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
   const bold = style.bold ? -1 : 0
   const italic = style.italic ? -1 : 0
   const assAlignment = alignment(style)
-  const header = `[Script Info]\nTitle: Pitchord word timed subtitles\nScriptType: v4.00+\nPlayResX: ${style.width}\nPlayResY: ${style.height}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontName},${style.fontSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,${style.spacing},0,${borderStyle},${mainOutline},${mainShadow},${assAlignment},${style.marginHorizontal},${style.marginHorizontal},${style.marginBottom},1\nStyle: Pitch,${style.fontName},${Math.round(style.fontSize * 0.45)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,2,10,10,10,1\nStyle: Dot,${style.fontName},${Math.round(style.fontSize * 0.55)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},0,0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,8,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
+  const header = `[Script Info]\nTitle: Pitchord word timed subtitles\nScriptType: v4.00+\nPlayResX: ${style.width}\nPlayResY: ${style.height}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontName},${style.fontSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,${style.spacing},0,${borderStyle},${mainOutline},${mainShadow},${assAlignment},${style.marginHorizontal},${style.marginHorizontal},${style.marginBottom},1\nStyle: Pitch,${style.fontName},${Math.round(style.fontSize * 0.45)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,2,10,10,10,1\nStyle: Dot,${style.fontName},${style.dotSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},0,0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,8,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   const events: string[] = []
-  const fade = style.fadeMs > 0 ? `{\\fad(${Math.round(style.fadeMs)},${Math.round(style.fadeMs)})}` : ''
   for (const segment of segments) {
-    segment.chars.forEach((word, index) => {
-      const nextStart = segment.chars[index + 1]?.start ?? segment.end
-      const displayEnd = Math.max(word.end, nextStart)
-      const annotation = pitchForChar(word, points)
-      const slices = annotation.notes.length ? annotation.notes.map((item, noteIndex) => ({
-        start: word.start + (word.end - word.start) * item.start,
-        end: word.start + (word.end - word.start) * item.end,
-        hz: noteHz(item.note) ?? 0,
-        label: annotation.motion === 'vibrato' && noteIndex === 0 ? `${item.note}~` : item.note,
-      })) : [{ start: word.start, end: word.end, hz: 0, label: '' }]
-      const x = activeX(segment, index, style)
-      const activeLineY = lineY(style)
-      slices[slices.length - 1].end = displayEnd
-      for (const slice of slices) {
-        const color = slice.hz > 0 ? pitchColor(slice.hz, style) : style.baseColor
-        const start = assTime(slice.start)
-        const end = assTime(slice.end)
-        events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${fade}${displayedText(segment, word.id, color)}`)
-        if (style.showPitch && slice.hz > 0) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,${fade}{\\pos(${x},${activeLineY - style.fontSize - 16})\\c${assColor(color)}&}${escapeAss(slice.label)}`)
-        if (style.showDot) events.push(`Dialogue: 1,${start},${end},Dot,,0,0,0,,${fade}{\\pos(${x},${activeLineY + Math.round(style.fontSize * 0.72)})\\c${assColor(color)}&}・`)
-      }
-    })
+    if (!segment.chars.length) continue
+    const notes = segment.chars.map(char => timedNotes(char, points))
+    const boundaries = [...new Set([
+      segment.start, segment.end,
+      ...segment.chars.flatMap(char => [char.start, char.end]),
+      ...notes.flatMap(items => items.flatMap(item => [item.start, item.end])),
+    ])].filter(time => time >= segment.start && time <= segment.end).sort((a, b) => a - b)
+    for (let index = 0; index < boundaries.length - 1; index++) {
+      const from = boundaries[index]
+      const to = boundaries[index + 1]
+      if (to - from < 0.005) continue
+      const frame = frameForSegment(segment, (from + to) / 2, style, notes)
+      const start = assTime(from)
+      const end = assTime(to)
+      const fadeMs = Math.min(style.fadeMs, Math.max(0, Math.round((to - from) * 400)))
+      const edgeFade = fadeMs > 0 && (index === 0 || index === boundaries.length - 2)
+        ? `{\\fad(${index === 0 ? fadeMs : 0},${index === boundaries.length - 2 ? fadeMs : 0})}` : ''
+      events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${edgeFade}${displayedText(segment, frame.colors)}`)
+      const labelIndex = frame.activeIndex >= 0 ? frame.activeIndex : segment.chars.findLastIndex(char => char.end <= from)
+      if (labelIndex < 0) continue
+      const x = activeX(segment, labelIndex, style)
+      const y = lineY(style)
+      const activeColor = frame.colors[labelIndex]
+      if (style.showPitch && frame.currentLabel) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${y - style.fontSize - 16})\\c${assColor(activeColor)}&}${escapeAss(frame.currentLabel)}`)
+      if (frame.activeIndex >= 0 && style.showDot) events.push(`Dialogue: 1,${start},${end},Dot,,0,0,0,,{\\pos(${x},${y + Math.round(style.fontSize * 0.72) + style.dotOffset})\\c${assColor(frame.dotColor)}&}・`)
+    }
   }
   return `${header}\n${events.join('\n')}\n`
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import {
   Activity, AlertCircle, AudioLines, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download,
   FileAudio2, FilePlus2, FileText, FolderOpen, Grid2X2, HardDrive, Home, List, LoaderCircle, Maximize2, Merge, Pause, Pencil,
@@ -17,6 +17,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Timeline } from '@/components/Timeline'
+import { LiveSubtitlePreview } from '@/components/LiveSubtitlePreview'
 import {
   carryPitchOverrides, clamp, createSegment, formatTime, getAdjacentSelection, lyricUnits, mergeSegments,
   MIN_SPAN, parseLyrics, parseTime, replaceText, retimeSegment, roundTime, splitSegment, suggestSplitOffset,
@@ -28,6 +29,8 @@ import { defaultSubtitleStyle, generatePitchAss, sentenceSrt, wordTimedSubtitles
 import type { SubtitleStyle } from '@/lib/subtitles'
 import { StemMixer } from '@/lib/stem-mixer'
 import { resolveRangeConflict } from '@/lib/range-conflict'
+import { analyzeVocalAcoustics, type AcousticAnalysis } from '@/lib/acoustics'
+import { mergeAlignmentKeepingLocks, reapplyUnlockedLine, scoreCharTiming, type BoundaryReview } from '@/lib/alignment-quality'
 
 type History = { present: LyricSegment[]; past: LyricSegment[][]; future: LyricSegment[][] }
 type View = 'lines' | 'chars'
@@ -130,9 +133,9 @@ const installOptionSizes = {
 
 const subtitleStylePresets: Record<string, Partial<SubtitleStyle>> = {
   karaoke: { fontSize: 64, bold: true, italic: false, outline: 4, shadow: 1, backgroundStyle: 'outline', colorBand: 'rainbow', showPitch: true, showDot: true, fadeMs: 80 },
-  clean: { fontSize: 54, bold: true, italic: false, outline: 3, shadow: 0, backgroundStyle: 'outline', colorBand: 'cool', showPitch: false, showDot: false, fadeMs: 100 },
-  cinema: { fontSize: 52, bold: true, italic: false, outline: 2, shadow: 0, backgroundStyle: 'box', backgroundColor: '#000000', backgroundOpacity: 68, colorBand: 'warm', showPitch: false, showDot: false, fadeMs: 160 },
-  minimal: { fontSize: 48, bold: false, italic: false, outline: 0, shadow: 0, backgroundStyle: 'none', colorBand: 'custom', lowColor: '#FFFFFF', highColor: '#FFFFFF', showPitch: false, showDot: false, fadeMs: 60 },
+  clean: { fontSize: 54, bold: true, italic: false, outline: 3, shadow: 0, backgroundStyle: 'outline', colorBand: 'cool', showPitch: false, showDot: true, fadeMs: 100 },
+  cinema: { fontSize: 52, bold: true, italic: false, outline: 2, shadow: 0, backgroundStyle: 'box', backgroundColor: '#000000', backgroundOpacity: 68, colorBand: 'warm', showPitch: false, showDot: true, fadeMs: 160 },
+  minimal: { fontSize: 48, bold: false, italic: false, outline: 0, shadow: 0, backgroundStyle: 'none', colorBand: 'custom', lowColor: '#FFFFFF', highColor: '#FFFFFF', showPitch: false, showDot: true, fadeMs: 60 },
 }
 
 function copyInstallSelection(selection: InstallSelection): InstallSelection {
@@ -203,11 +206,17 @@ export default function App() {
   const [masterVolume, setMasterVolume] = useState(100)
   const [mediaName, setMediaName] = useState(savedDraft?.mediaName ?? '')
   const [mediaIsVideo, setMediaIsVideo] = useState(false)
+  const [videoAspect, setVideoAspect] = useState(16 / 9)
   const [duration, setDuration] = useState(savedDraft?.duration ?? 0)
   const [playhead, setPlayhead] = useState(0)
+  const [playbackRate, setPlaybackRate] = useState(1)
+  const [timelinePreview, setTimelinePreview] = useState<TimelinePreview[] | null>(null)
   const [guideLine, setGuideLine] = useState<number | null>(null)
   const [playing, setPlaying] = useState(false)
   const [peaks, setPeaks] = useState<number[]>([])
+  const [vocalPeaks, setVocalPeaks] = useState<number[]>([])
+  const [acoustics, setAcoustics] = useState<AcousticAnalysis | null>(null)
+  const [showSpectrogram, setShowSpectrogram] = useState(true)
   const [waveformStatus, setWaveformStatus] = useState('导入音频或视频后显示波形')
   const [pitchPoints, setPitchPoints] = useState<PitchPoint[]>([])
   const [pitchStatus, setPitchStatus] = useState('尚未分析音高')
@@ -248,7 +257,6 @@ export default function App() {
   const [alignmentResults, setAlignmentResults] = useState<AlignmentResult[]>(savedDraft?.alignmentResults ?? [])
   const [activeAlignmentResultId, setActiveAlignmentResultId] = useState(savedDraft?.activeAlignmentResultId ?? '')
   const [alignmentStatus, setAlignmentStatus] = useState('尚未匹配')
-  const [subtitleOpen, setSubtitleOpen] = useState(false)
   const [subtitleStudioOpen, setSubtitleStudioOpen] = useState(false)
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>({ ...defaultSubtitleStyle, ...savedDraft?.subtitleStyle })
   const [lastRenderedSignature, setLastRenderedSignature] = useState('')
@@ -285,11 +293,13 @@ export default function App() {
   const environmentSetupPromptedRef = useRef(false)
   const projectInputRef = useRef<HTMLInputElement>(null)
   const mediaRef = useRef<HTMLMediaElement | null>(null)
+  const videoPreviewRef = useRef<HTMLDivElement | null>(null)
   const mixerRef = useRef<StemMixer | null>(null)
   const mediaFileRef = useRef<File | null>(null)
   const pendingMediaRef = useRef<File | null>(null)
   const audioBufferRef = useRef<AudioBuffer | null>(null)
   const mediaToken = useRef(0)
+  const vocalToken = useRef(0)
   const auditionRef = useRef<{ start: number; end: number } | null>(null)
   const timelineSeekRef = useRef(false)
   const lastRangeEdgeRef = useRef<'start' | 'end' | null>(null)
@@ -300,11 +310,24 @@ export default function App() {
   const workflowExecutionRef = useRef<'automatic' | 'separation' | 'pitch' | 'alignment' | 'render' | null>(null)
   const getMixer = () => mixerRef.current ?? (mixerRef.current = new StemMixer())
   const activeLine = segments.find(segment => selectedLineIds.includes(segment.id)) ?? null
+  const effectiveSegments = useMemo(() => {
+    if (!timelinePreview?.length) return segments
+    const updates = new Map(timelinePreview.map(item => [item.id, item]))
+    return view === 'lines'
+      ? segments.map(segment => { const update = updates.get(segment.id); return update ? retimeSegment(segment, update.start, update.end) : segment })
+      : segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => { const update = updates.get(char.id); return update ? { ...char, start: update.start, end: update.end } : char }) } : segment)
+  }, [segments, timelinePreview, view, activeLine?.id])
   const editingLocked = rangeAdjusting || charRangeAdjusting || conflictOpen
   const mergeIndexes = getAdjacentSelection(segments, selectedLineIds)
   const splitBoundaries = useMemo(() => activeLine ? lyricUnits(activeLine.text).slice(0, -1).map(unit => unit.endOffset) : [], [activeLine])
   const pitchMatches = useMemo(() => matchPitchToChars(segments, pitchPoints), [segments, pitchPoints])
   const voicedPitchPoints = useMemo(() => pitchPoints.filter(point => point.voiced && point.hz > 0), [pitchPoints])
+  const activeAlignment = alignmentResults.find(result => result.id === activeAlignmentResultId)
+  const reviewQueue = useMemo(() => {
+    const peak = acoustics?.rms.reduce((highest, value) => Math.max(highest, value), 0) ?? 1
+    return segments.flatMap((line, lineIndex) => line.chars.map(char => ({ line, char, review: scoreCharTiming(line, char, acoustics, pitchPoints, !!activeAlignment?.lowConfidenceLines?.includes(lineIndex), Math.max(peak, 0.001)) })))
+  }, [segments, acoustics, pitchPoints, activeAlignment])
+  const timingReviews: BoundaryReview[] = useMemo(() => reviewQueue.filter(item => item.line.id === activeLine?.id).map(item => item.review), [reviewQueue, activeLine?.id])
   const selectedSeparationModel = analysisEnvironment?.separationModels.find(model => model.id === separationModel)
 
   const updateWork = useCallback((id: string, title: string, status: WorkItem['status'], message: string, progress?: number) => {
@@ -502,11 +525,15 @@ export default function App() {
     setMediaUrl(URL.createObjectURL(file))
     setMediaName(file.name)
     setMediaIsVideo(file.type.startsWith('video/'))
+    setVideoAspect(16 / 9)
     if (!reconnect) setDuration(0)
     setPlayhead(0)
     setGuideLine(null)
     setPlaying(false)
     setPeaks([])
+    setVocalPeaks([])
+    setAcoustics(null)
+    vocalToken.current++
     setPitchPoints([])
     setPitchStatus('尚未分析音高')
     setSeparationStatus('未运行')
@@ -626,10 +653,19 @@ export default function App() {
 
   const loadVocalTrack = async (file: File, persist = true, clearPitch = true) => {
     if (!file.type.startsWith('audio/')) { setNotice('人声分析轨需要音频文件。'); return }
+    const token = ++vocalToken.current
     try {
       if (persist && window.pitchordDesktop && projectDirectory) await window.pitchordDesktop.storeAsset('vocals', file.name, await file.arrayBuffer())
       const audio = await getMixer().load('vocals', file)
+      if (token !== vocalToken.current) return
       audioBufferRef.current = audio
+      setVocalPeaks(samplePeaks(audio))
+      setAcoustics(null)
+      void analyzeVocalAcoustics(audio).then(result => {
+        if (token === vocalToken.current) setAcoustics(result)
+      }).catch(() => {
+        if (token === vocalToken.current) setNotice('人声已载入；频谱分析暂不可用，时间轴仍可正常编辑。')
+      })
       setAudioReady(true)
       setVocalTrackReady(true)
       setStemReady(current => ({ ...current, vocals: true }))
@@ -764,7 +800,7 @@ export default function App() {
       }
       setAlignmentResults(current => [saved, ...current])
       setActiveAlignmentResultId(saved.id)
-      commit(carryPitchOverrides(result.segments, segments))
+      commit(mergeAlignmentKeepingLocks(carryPitchOverrides(result.segments, segments), segments))
       setSelectedLineIds([])
       setSelectedCharIds([])
       const uncertain = result.lowConfidenceLines || []
@@ -795,7 +831,7 @@ export default function App() {
     const result = alignmentResults.find(item => item.id === id)
     if (!result) return
     setActiveAlignmentResultId(id)
-    commit(carryPitchOverrides(result.segments, segments))
+    commit(mergeAlignmentKeepingLocks(carryPitchOverrides(result.segments, segments), segments))
     setAlignmentStatus(`${result.modelLabel} 的历史匹配结果已应用，覆盖率 ${Math.round(result.coverage * 100)}% · ${result.lowConfidenceLines?.length || 0} 句建议复核`)
     setNotice('已切换并应用歌词时间戳匹配结果，可通过撤回返回切换前的时间。')
   }
@@ -967,8 +1003,8 @@ export default function App() {
     if (value > 0) setMasterMuted(false)
   }
   const openFullscreenPreview = () => {
-    const media = mediaRef.current
-    if (mediaIsVideo && media?.requestFullscreen) void media.requestFullscreen().catch(() => setNotice('当前系统无法进入全屏预览。'))
+    const preview = videoPreviewRef.current
+    if (mediaIsVideo && preview?.requestFullscreen) void preview.requestFullscreen().catch(() => setNotice('当前系统无法进入全屏预览。'))
   }
   const seekAndPlay = async (time: number) => {
     const focused = view === 'lines' ? rangeDraft : charRangeDraft
@@ -1158,14 +1194,16 @@ export default function App() {
   const updateLineText = () => {
     if (editingLocked) return
     if (!activeLine || textDraft === activeLine.text) return
+    const hadLocks = activeLine.chars.some(char => char.startLocked || char.endLocked)
     const next = segments.map(segment => segment.id === activeLine.id ? replaceText(segment, textDraft) : segment)
     commit(next)
-    setNotice('歌词文本已更新；新增或改写的字已生成时间建议，请复核。')
+    setNotice(`歌词文本已更新；新增或改写的字已生成时间建议，请复核。${hadLocks ? '保留的相同字沿用锁定状态，改写字的锁定状态可能失效。' : ''}`)
   }
 
   const updateLineTimes = () => {
     if (editingLocked) return
     if (!activeLine) return
+    if (activeLine.chars.some(char => char.startLocked || char.endLocked)) { setStartDraft(formatTime(activeLine.start)); setEndDraft(formatTime(activeLine.end)); setNotice('本句含锁定的逐字边界，不能整体移动或缩放；请先解锁。'); return }
     const start = parseTime(startDraft)
     const end = parseTime(endDraft)
     const index = segments.findIndex(segment => segment.id === activeLine.id)
@@ -1184,6 +1222,7 @@ export default function App() {
   const applyRangeResult = (range: TimelinePreview, strategy: 'compress' | 'push') => {
     const previews = resolveRangeConflict(segments, range, { start: 0, end: duration }, strategy)
     if (!previews) return false
+    if (segments.some(segment => segment.chars.some(char => char.startLocked || char.endLocked) && previews.some(item => item.id === segment.id && (Math.abs(item.start - segment.start) > 0.001 || Math.abs(item.end - segment.end) > 0.001)))) return false
     commit(segments.map(segment => {
       const next = previews.find(item => item.id === segment.id)!
       return next.start === segment.start && next.end === segment.end ? segment : retimeSegment(segment, roundTime(next.start), roundTime(next.end))
@@ -1223,6 +1262,7 @@ export default function App() {
   const shiftAll = (delta: number, force = false) => {
     if (editingLocked) return
     if (!segments.length || !duration) return
+    if (segments.some(segment => segment.chars.some(char => char.startLocked || char.endLocked))) { setNotice('已有锁定的逐字边界，整体移动可能破坏锚点；请先解锁。'); return }
     const next = segments.map(segment => ({ ...segment, start: segment.start + delta, end: segment.end + delta }))
     const overflow = delta > 0 ? Math.max(0, next.at(-1)!.end - duration) : Math.max(0, -next[0].start)
     if (overflow > 0 && !force) { setPendingShift(delta); setShiftConfirmOpen(true); return }
@@ -1270,6 +1310,10 @@ export default function App() {
   const retimeLines = (updates: { id: string; start: number; end: number }[]) => {
     if (!updates.length) return
     const updateMap = new Map(updates.map(update => [update.id, update]))
+    if (segments.some(segment => updateMap.has(segment.id) && segment.chars.some(char => char.startLocked || char.endLocked))) {
+      setNotice('该句含已锁定的字边界；请先解锁，再调整整句范围。')
+      return
+    }
     commit(segments.map(segment => {
       const update = updateMap.get(segment.id)
       return update ? retimeSegment(segment, update.start, update.end) : segment
@@ -1281,6 +1325,7 @@ export default function App() {
     if (index < 0) return
     const lower = index > 0 ? activeLine.chars[index - 1].end : activeLine.start
     const upper = index < activeLine.chars.length - 1 ? activeLine.chars[index + 1].start : activeLine.end
+    if (activeLine.chars[index].startLocked && Math.abs(start - activeLine.chars[index].start) > 0.001 || activeLine.chars[index].endLocked && Math.abs(end - activeLine.chars[index].end) > 0.001) return
     if (start < lower - 0.001 || end > upper + 0.001 || end - start < MIN_SPAN) return
     commit(segments.map(segment => segment.id === activeLine.id ? {
       ...segment, chars: segment.chars.map(char => char.id === id ? { ...char, start: roundTime(start), end: roundTime(end), origin: 'manual' as const } : char),
@@ -1289,9 +1334,39 @@ export default function App() {
   const retimeChars = (updates: TimelinePreview[]) => {
     if (!activeLine || !updates.length) return
     const updateMap = new Map(updates.map(update => [update.id, update]))
+    const proposed = activeLine.chars.map(char => updateMap.get(char.id) ?? char)
+    if (proposed.some((item, index) => {
+      const previous = activeLine.chars[index]
+      const minSpan = /[\p{Script=Han}A-Za-z0-9]/u.test(previous.text) ? MIN_SPAN : 0.001
+      return item.start < activeLine.start - 0.001 || item.end > activeLine.end + 0.001 || item.end - item.start < minSpan - 0.001 ||
+        (index > 0 && item.start < proposed[index - 1].end - 0.001) ||
+        (previous.startLocked && Math.abs(item.start - previous.start) > 0.001) ||
+        (previous.endLocked && Math.abs(item.end - previous.end) > 0.001)
+    })) { setNotice('调整会越过句范围或已锁定边界，未保存；可先解锁或缩小拖动范围。'); return }
     commit(segments.map(segment => segment.id === activeLine.id ? {
       ...segment, chars: segment.chars.map(char => { const update = updateMap.get(char.id); return update ? { ...char, start: roundTime(update.start), end: roundTime(update.end), origin: 'manual' as const } : char }),
     } : segment))
+  }
+  const toggleCharBoundaryLock = (edge: 'start' | 'end') => {
+    if (!activeLine || !activeChar) return
+    const index = activeLine.chars.findIndex(char => char.id === activeChar.id)
+    if (index < 0) return
+    const next = activeLine.chars.map(char => ({ ...char }))
+    const key = edge === 'start' ? 'startLocked' : 'endLocked'
+    const locked = !next[index][key]
+    next[index][key] = locked
+    const neighborIndex = edge === 'start' ? index - 1 : index + 1
+    const neighborKey = edge === 'start' ? 'endLocked' : 'startLocked'
+    if (neighborIndex >= 0 && neighborIndex < next.length && Math.abs(next[index][edge] - next[neighborIndex][edge === 'start' ? 'end' : 'start']) < 0.003) next[neighborIndex][neighborKey] = locked
+    commit(segments.map(segment => segment.id === activeLine.id ? { ...segment, chars: next } : segment))
+  }
+  const reapplyActiveLine = () => {
+    if (!activeLine || !activeAlignment) return
+    const suggestion = activeAlignment.segments.find(line => line.id === activeLine.id)
+    const next = suggestion && reapplyUnlockedLine(activeLine, suggestion)
+    if (!next) { setNotice('当前句与保存的对齐版本不兼容，或锁定边界之间空间不足；未改动时间。'); return }
+    commit(segments.map(segment => segment.id === activeLine.id ? next : segment))
+    setNotice('已按保存的对齐结果局部重排未锁定区间；已确认边界保持不动，可撤回。')
   }
 
   const exportLrc = async () => {
@@ -1339,7 +1414,6 @@ export default function App() {
       updateWork('subtitle-render', '嵌入视频字幕', 'success', '带字幕视频已生成', 1)
       setLastRenderedSignature(subtitleSignature(mediaName, segmentsToRender, pitchToRender, subtitleStyle))
       setNotice(`带字幕视频已生成：${result.video}`)
-      setSubtitleOpen(false)
       setSubtitleStudioOpen(false)
     } catch (error) {
       updateWork('subtitle-render', '嵌入视频字幕', 'error', error instanceof Error ? error.message : String(error))
@@ -1378,11 +1452,11 @@ export default function App() {
       let alignment = alignmentResults.find(result => result.inputResultId === separation.id && result.modelId === alignmentModel) ?? null
       if (alignment) {
         setActiveAlignmentResultId(alignment.id)
-        commit(carryPitchOverrides(alignment.segments, segments))
+        commit(mergeAlignmentKeepingLocks(carryPitchOverrides(alignment.segments, segments), segments))
         updateWork('alignment', '歌词时间戳匹配', 'success', `已复用 ${alignment.modelLabel} 的现有结果`, 1)
       } else alignment = await runLyricAlignment(separation, pitch, true)
       if (!alignment) return
-      const finalSegments = carryPitchOverrides(alignment.segments, segments)
+      const finalSegments = mergeAlignmentKeepingLocks(carryPitchOverrides(alignment.segments, segments), segments)
       commit(finalSegments)
       updateWork('subtitle-generate', '生成精准字幕', 'success', '已生成带逐字时间与音高的默认字幕', 1)
       const targetSignature = subtitleSignature(mediaName, finalSegments, pitch.points, subtitleStyle)
@@ -1413,6 +1487,9 @@ export default function App() {
       const importedPitchResults = Array.isArray(project.pitchResults) ? project.pitchResults : []
       const importedAlignmentResults = Array.isArray(project.alignmentResults) ? project.alignmentResults : []
       if (!preserveMedia) {
+        vocalToken.current++
+        setVocalPeaks([])
+        setAcoustics(null)
         mediaRef.current?.pause()
         mediaToken.current++
         setMediaUrl('')
@@ -1468,6 +1545,7 @@ export default function App() {
   const resetProjectState = () => {
     mediaRef.current?.pause()
     mediaToken.current++
+    vocalToken.current++
     auditionRef.current = null
     setMediaUrl('')
     mixerRef.current?.clear()
@@ -1475,8 +1553,11 @@ export default function App() {
     setStemReady({ vocals: false, accompaniment: false })
     mediaFileRef.current = null
     setMediaName('')
+    setVideoAspect(16 / 9)
     setDuration(0)
     setPeaks([])
+    setVocalPeaks([])
+    setAcoustics(null)
     setPitchPoints([])
     setPitchResults([])
     setActivePitchResultId('')
@@ -1682,9 +1763,11 @@ export default function App() {
     if (!media) return
     media.muted = masterMuted
     media.volume = masterVolume / 100
+    media.playbackRate = playbackRate
     getMixer().attachMedia(media)
   }
   const onMediaMetadata = (media: HTMLMediaElement) => {
+    if (media instanceof HTMLVideoElement && media.videoWidth > 0 && media.videoHeight > 0) setVideoAspect(media.videoWidth / media.videoHeight)
     if (!Number.isFinite(media.duration) || media.duration <= 0) {
       setNotice('无法读取媒体时长，请换用支持的文件格式。')
       return
@@ -1754,8 +1837,17 @@ export default function App() {
   const hasCharConflict = (range: TimelinePreview) => !!activeLine?.chars.some(char => char.id !== range.id && char.end > range.start && char.start < range.end)
   const applyCharRangeResult = (range: TimelinePreview, strategy: 'compress' | 'push') => {
     if (!activeLine) return false
-    const previews = resolveRangeConflict(activeLine.chars, range, { start: activeLine.start, end: activeLine.end }, strategy)
+    const minimumById = new Map(activeLine.chars.map(char => [char.id, /[\p{Script=Han}A-Za-z0-9]/u.test(char.text) ? MIN_SPAN : 0.001]))
+    const previews = resolveRangeConflict(activeLine.chars, range, { start: activeLine.start, end: activeLine.end }, strategy, clip => minimumById.get(clip.id) ?? MIN_SPAN)
     if (!previews) return false
+    const index = activeLine.chars.findIndex(char => char.id === range.id)
+    if (index > 0 && Math.abs(activeLine.chars[index - 1].end - activeLine.chars[index].start) < 0.003 && previews[index].start !== activeLine.chars[index].start) previews[index - 1].end = previews[index].start
+    if (index >= 0 && index + 1 < previews.length && Math.abs(activeLine.chars[index + 1].start - activeLine.chars[index].end) < 0.003 && previews[index].end !== activeLine.chars[index].end) previews[index + 1].start = previews[index].end
+    if (previews.some((item, position) => {
+      const original = activeLine.chars[position]
+      return item.end - item.start < (minimumById.get(original.id) ?? MIN_SPAN) - 0.001 || position > 0 && item.start < previews[position - 1].end - 0.001 ||
+        original.startLocked && Math.abs(item.start - original.start) > 0.001 || original.endLocked && Math.abs(item.end - original.end) > 0.001
+    })) return false
     const updates = new Map(previews.map(item => [item.id, item]))
     commit(segments.map(segment => segment.id === activeLine.id ? {
       ...segment, chars: segment.chars.map(char => {
@@ -1952,10 +2044,10 @@ export default function App() {
 
           <section className="min-w-0 rounded-xl border border-border bg-card p-3">
             <div className="relative flex min-h-64 items-center justify-center overflow-hidden rounded-lg bg-neutral-950">
-              {mediaUrl ? mediaIsVideo ? <video key={mediaUrl} ref={bindMedia} src={mediaUrl} className="max-h-[330px] w-full object-contain" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} /> : <div className="flex flex-col items-center gap-4 text-white/60"><AudioLines className="size-16" /><span>{mediaName}</span></div> : <button type="button" onClick={() => mediaInputRef.current?.click()} className="flex flex-col items-center gap-3 text-white/55 hover:text-white"><Upload className="size-8" /><span>导入音频或视频开始</span></button>}
+              {mediaUrl ? mediaIsVideo ? <div ref={videoPreviewRef} className="video-preview-shell relative flex h-[330px] w-full items-center justify-center" style={{ '--video-aspect': videoAspect } as CSSProperties}><div className="video-preview-frame relative max-h-full max-w-full" style={{ width: `min(100%, ${330 * videoAspect}px)`, aspectRatio: videoAspect }}><video key={mediaUrl} ref={bindMedia} src={mediaUrl} className="h-full w-full object-contain" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} /><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div></div> : <div className="relative flex min-h-64 w-full flex-col items-center justify-center gap-4 text-white/60"><audio key={mediaUrl} ref={bindMedia} src={mediaUrl} className="hidden" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} /><AudioLines className="size-16" /><span>{mediaName}</span><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div> : <button type="button" onClick={() => mediaInputRef.current?.click()} className="flex flex-col items-center gap-3 text-white/55 hover:text-white"><Upload className="size-8" /><span>导入音频或视频开始</span></button>}
             </div>
             <div className="px-1 pt-3"><input type="range" min={0} max={Math.max(duration, 0.01)} step={0.01} value={Math.min(playhead, Math.max(duration, 0.01))} onChange={event => seek(Number(event.target.value))} disabled={!mediaUrl} className="h-1.5 w-full cursor-pointer accent-primary disabled:cursor-default" aria-label="媒体播放进度" /></div>
-            <div className="flex items-center justify-between gap-2 px-1 py-2"><span className="w-32 font-mono text-xs tabular-nums text-primary">{formatTime(playhead)} <span className="text-muted-foreground">/ {formatTime(duration)}</span></span><div className="flex items-center gap-1"><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={() => skipPlayback(-5)} disabled={!mediaUrl} aria-label="后退 5 秒"><RotateCcw /></Button></TooltipTrigger><TooltipContent>后退 5 秒</TooltipContent></Tooltip><Button size="icon" onClick={() => void togglePlayback()} disabled={!mediaUrl} aria-label={playing ? '暂停' : '播放'}>{playing ? <Pause /> : <Play />}</Button><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={() => skipPlayback(5)} disabled={!mediaUrl} aria-label="前进 5 秒"><RotateCw /></Button></TooltipTrigger><TooltipContent>前进 5 秒</TooltipContent></Tooltip></div><div className="flex w-32 items-center justify-end gap-1"><Button size="icon" variant="ghost" onClick={toggleMasterMute} disabled={!mediaUrl} aria-label={masterMuted ? '取消静音' : '静音'}>{masterMuted ? <VolumeX /> : <Volume2 />}</Button><input type="range" min={0} max={100} step={1} value={masterVolume} onChange={event => changeMasterVolume(Number(event.target.value))} disabled={!mediaUrl} className="w-16 accent-primary" aria-label="总音量" />{mediaIsVideo && <Button size="icon" variant="ghost" onClick={openFullscreenPreview} disabled={!mediaUrl} aria-label="全屏预览"><Maximize2 /></Button>}</div></div>
+            <div className="flex items-center justify-between gap-2 px-1 py-2"><span className="w-32 font-mono text-xs tabular-nums text-primary">{formatTime(playhead)} <span className="text-muted-foreground">/ {formatTime(duration)}</span></span><div className="flex items-center gap-1"><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={() => skipPlayback(-5)} disabled={!mediaUrl} aria-label="后退 5 秒"><RotateCcw /></Button></TooltipTrigger><TooltipContent>后退 5 秒</TooltipContent></Tooltip><Button size="icon" onClick={() => void togglePlayback()} disabled={!mediaUrl} aria-label={playing ? '暂停' : '播放'}>{playing ? <Pause /> : <Play />}</Button><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={() => skipPlayback(5)} disabled={!mediaUrl} aria-label="前进 5 秒"><RotateCw /></Button></TooltipTrigger><TooltipContent>前进 5 秒</TooltipContent></Tooltip></div><div className="flex items-center justify-end gap-2"><label className="flex items-center gap-1 text-[11px] text-muted-foreground">速度 <select aria-label="播放速度" value={playbackRate} onChange={event => { const rate = Number(event.target.value); setPlaybackRate(rate); if (mediaRef.current) mediaRef.current.playbackRate = rate }} className="rounded border border-border bg-background px-1 py-0.5"><option value={0.5}>0.5×</option><option value={0.75}>0.75×</option><option value={1}>1×</option><option value={1.25}>1.25×</option></select></label><Button size="icon" variant="ghost" onClick={toggleMasterMute} disabled={!mediaUrl} aria-label={masterMuted ? '取消静音' : '静音'}>{masterMuted ? <VolumeX /> : <Volume2 />}</Button><input type="range" min={0} max={100} step={1} value={masterVolume} onChange={event => changeMasterVolume(Number(event.target.value))} disabled={!mediaUrl} className="w-16 accent-primary" aria-label="总音量" />{mediaIsVideo && <Button size="icon" variant="ghost" onClick={openFullscreenPreview} disabled={!mediaUrl} aria-label="全屏预览"><Maximize2 /></Button>}</div></div>
             <div className="flex items-center justify-end gap-1 border-t border-border py-1"><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={undo} disabled={!history.past.length || editingLocked}><Undo2 /></Button></TooltipTrigger><TooltipContent>撤回</TooltipContent></Tooltip><Tooltip><TooltipTrigger asChild><Button size="icon" variant="ghost" onClick={redo} disabled={!history.future.length || editingLocked}><Redo2 /></Button></TooltipTrigger><TooltipContent>重做</TooltipContent></Tooltip></div>
             <div className="workflow-rail grid grid-cols-7 border-t border-border pt-3">{workflowSteps.map((step, index) => <div key={step.label} className="relative flex min-w-0 flex-col items-center gap-1 text-center"><span className={`z-10 flex size-6 items-center justify-center rounded-full border text-[11px] ${step.done ? 'border-emerald-500 bg-emerald-500 text-white' : step.running || index === activeWorkflowIndex ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-card text-muted-foreground'}`}>{step.done ? <CheckCircle2 className="size-3.5" /> : index + 1}</span><span className={`truncate text-[11px] ${step.done || step.running || index === activeWorkflowIndex ? 'text-foreground' : 'text-muted-foreground'}`}>{step.label}</span>{index < workflowSteps.length - 1 && <span className={`absolute left-[58%] right-[-42%] top-3 h-px ${step.done ? 'bg-emerald-500' : 'bg-border'}`} />}</div>)}</div>
           </section>
@@ -1999,7 +2091,7 @@ export default function App() {
                 </div>
               </div>
               {mediaUrl && <div className="mt-4 overflow-hidden rounded-lg border border-border bg-background">
-                {mediaIsVideo ? <video key={mediaUrl} ref={bindMedia} src={mediaUrl} className="max-h-64 w-full bg-black object-contain" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} controls /> : <audio key={mediaUrl} ref={bindMedia} src={mediaUrl} className="w-full" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} controls />}
+                <span className="sr-only">播放器位于上方主预览区</span>
                 <p className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground"><span>播放器的静音与音量是全部已开启音轨的总开关和总响度；下方滑杆调整各音轨的相对响度。</span><span className="font-mono text-foreground" data-master-volume>{masterMuted ? '总音频：静音' : `总音量：${masterVolume}%`}</span></p>
               </div>}
               {!mediaUrl && <div className="mt-4 flex h-28 items-center justify-center gap-3 rounded-lg border border-dashed border-border text-muted-foreground"><FileAudio2 className="size-5" /><span>导入音频或视频以开始</span><Video className="size-5" /></div>}
@@ -2059,10 +2151,10 @@ export default function App() {
                   <Button size="sm" variant="secondary" onClick={mergeSelected} disabled={!mergeIndexes || editingLocked}><Merge />合并</Button>
                   <Button size="sm" variant="secondary" onClick={openSplit} disabled={!activeLine || !splitBoundaries.length || editingLocked}><Scissors />分割</Button>
                   <Button size="sm" variant="destructive" onClick={deleteSelected} disabled={!selectedLineIds.length || editingLocked}><Trash2 />删除</Button>
-                </div> : <div className="flex items-center gap-1"><Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button><span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span><Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button></div>}
+                </div> : <div className="flex flex-wrap items-center gap-2"><label className="flex w-36 items-center gap-2 text-xs text-muted-foreground">缩放<Slider min={40} max={320} step={5} value={[zoom]} onValueChange={values => setZoom(values[0])} /></label><Button size="sm" variant={showSpectrogram ? 'secondary' : 'outline'} onClick={() => setShowSpectrogram(value => !value)} disabled={!acoustics}>频谱</Button><Button size="sm" variant="outline" onClick={reapplyActiveLine} disabled={!activeAlignment || editingLocked}>局部重排未锁定区间</Button><Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button><span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span><Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button></div>}
               </div>
-              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive, range)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{view === 'lines' ? '选择多句' : '选择多个字'}：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>矩形所指向的音频始终来自原媒体</span></div>
+              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} vocalPeaks={vocalPeaks} acoustics={acoustics} showSpectrogram={showSpectrogram} reviews={timingReviews} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive, range)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} onClipPreview={setTimelinePreview} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{view === 'lines' ? '选择多句' : '选择多个字'}：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>{view === 'chars' ? '紫色虚线是声学候选，不代表真实换字；接近时吸附，按 Alt 临时关闭。' : '矩形所指向的音频始终来自原媒体'}</span></div>
             </section>
 
             {activeLine && <section className="rounded-xl border border-border bg-card p-4">
@@ -2074,9 +2166,12 @@ export default function App() {
                 {view === 'chars' && <div ref={pitchEditorRef} className="space-y-2 border-t border-border pt-4">
                   <div className="flex items-center justify-between"><p className="text-sm font-medium">逐字时间与完整音高序列</p><Badge variant="outline">{activeLine.chars.length} 字/词</Badge></div>
                   <p className="text-xs text-muted-foreground">右侧音高序列就是字幕实际使用的结果。点击某字可修改；拖动上方矩形调整字级时间边界。</p>
+                  {timingReviews.some(item => item.score >= 25) && <div className="rounded-md border border-orange-400/50 bg-orange-400/5 p-2"><p className="mb-2 text-xs font-medium">建议优先复核的字（规则评分，仅作提示）</p><div className="flex flex-wrap gap-1">{timingReviews.filter(item => item.score >= 25).sort((a, b) => b.score - a.score).slice(0, 12).map(review => { const char = activeLine.chars.find(item => item.id === review.charId)!; return <Button key={review.charId} size="sm" variant="outline" title={review.reasons.join('、')} onClick={() => { setSelectedCharIds([char.id]); seek(char.start); setCenterTargetId(char.id); setCenterRequest(value => value + 1) }}>{char.text} · {review.score}</Button> })}</div></div>}
                   <div className="max-h-72 space-y-1 overflow-y-auto">{activeLine.chars.map(char => { const lockedOut = editingLocked && charRangeDraft?.id !== char.id; const currentPitch = char.pitchOverride ?? pitchMatches[char.id]?.annotation ?? { motion: 'unvoiced' as const, notes: [] }; return <Button key={char.id} type="button" variant="ghost" disabled={lockedOut} onClick={() => { if (editingLocked) return; setSelectedCharIds([char.id]); playNormally(char.start, `已从「${char.text}」起点开始播放；进入范围调整后才会循环试听。`) }} onDoubleClick={() => activateChar(char.id)} className={`flex h-auto w-full items-center justify-start gap-2 px-2 py-1.5 text-left font-normal ${selectedCharIds.includes(char.id) ? 'bg-primary/15' : ''} ${lockedOut ? 'opacity-30' : ''}`}><span className="w-8 shrink-0 truncate font-medium">{char.text}</span><span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">{formatTime(char.start)} — {formatTime(char.end)}</span><span className="max-w-[45%] break-all text-right font-mono text-xs text-primary" title={pitchNotation(currentPitch)}>{pitchNotation(currentPitch)}</span><span className="shrink-0 text-[10px] text-muted-foreground">{char.pitchOverride ? '人工音高' : pitchPoints.length ? '模型音高' : '待分析'}</span></Button> })}</div>
                   {activeChar && activePitchAnnotation && <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3">
                     <div className="flex items-center justify-between gap-2"><p className="text-sm font-medium">「{activeChar.text}」字幕音高</p><Badge variant={activeChar.pitchOverride ? 'secondary' : 'outline'}>{activeChar.pitchOverride ? '人工修改' : '模型建议'}</Badge></div>
+                    <div className="flex flex-wrap gap-2"><Button size="sm" variant={activeChar.startLocked ? 'secondary' : 'outline'} onClick={() => toggleCharBoundaryLock('start')} disabled={editingLocked}>{activeChar.startLocked ? '已锁定起点' : '锁定起点'}</Button><Button size="sm" variant={activeChar.endLocked ? 'secondary' : 'outline'} onClick={() => toggleCharBoundaryLock('end')} disabled={editingLocked}>{activeChar.endLocked ? '已锁定终点' : '锁定终点'}</Button><span className="self-center text-xs text-muted-foreground">相邻字共用的边界会一起锁定。</span></div>
+                    {timingReviews.find(item => item.charId === activeChar.id)?.reasons.length ? <p className="text-xs text-orange-600">复核提示：{timingReviews.find(item => item.charId === activeChar.id)?.reasons.join('、')}</p> : null}
                     <div className="grid gap-2 text-xs sm:grid-cols-2"><div><p className="text-muted-foreground">模型建议</p><p className="mt-1 font-mono">{activePitchSuggestion ? pitchNotation(activePitchSuggestion) : '—'}</p></div><div><p className="text-muted-foreground">当前字幕</p><p className="mt-1 font-mono text-primary">{pitchNotation(activePitchAnnotation)}</p></div></div>
                     <label className="block space-y-2 text-xs text-muted-foreground">修改音高简写<Input value={pitchNotationDraft} onChange={event => setPitchNotationEdit({ id: activeChar.id, base: activePitchNotation, value: event.target.value })} onBlur={savePitchNotation} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="E4 / E4-F4-E4 / E4~" className="font-mono text-foreground" disabled={editingLocked} /></label>
                     <p className="text-xs text-muted-foreground">单音 E4；转音 E4-F4-E4；颤音 E4~；无音高 —。失去焦点时保存，ASS 与字级 JSON 同步使用当前字幕音高。</p>
@@ -2101,6 +2196,7 @@ export default function App() {
                 {!segments.length && <p className="py-8 text-center text-muted-foreground">这里会显示每句歌词，方便快速选择和核对。</p>}
               </div>
             </section>
+            {reviewQueue.some(item => item.review.score >= 25) && <section className="rounded-xl border border-orange-400/40 bg-card p-4"><div className="mb-2 flex items-center justify-between"><h2 className="font-semibold">优先复核</h2><Badge variant="outline">{reviewQueue.filter(item => item.review.score >= 25).length} 处</Badge></div><p className="mb-3 text-xs text-muted-foreground">规则评分用于安排校对顺序，并非自动认定错误。</p><div className="max-h-64 space-y-1 overflow-y-auto">{reviewQueue.filter(item => item.review.score >= 25).sort((a, b) => b.review.score - a.review.score).slice(0, 12).map(item => <Button key={item.char.id} size="sm" variant="ghost" className="h-auto w-full justify-start gap-2 text-left" title={item.review.reasons.join('、')} disabled={editingLocked} onClick={() => { setView('chars'); setSelectedLineIds([item.line.id]); setSelectedCharIds([item.char.id]); seek(item.char.start); setCenterTargetId(item.char.id); setCenterRequest(value => value + 1) }}><span className="w-8 shrink-0 font-medium text-orange-500">{item.review.score}</span><span className="w-8 shrink-0 truncate">{item.char.text}</span><span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.review.reasons[0]}</span><span className="font-mono text-[10px] text-muted-foreground">{formatTime(item.char.start)}</span></Button>)}</div></section>}
           </aside>
         </div>
         </div>
@@ -2163,7 +2259,6 @@ export default function App() {
       <Dialog open={!!pendingModelDownload} onOpenChange={open => { if (!open) setPendingModelDownload(null) }}><DialogContent><DialogHeader><DialogTitle>准备模型</DialogTitle><DialogDescription>将从模型提供方联网下载所需权重，并保存到 Pitchord 自己的 environment/models 中。不会写入系统模型目录，也不要求填写 HF Token。</DialogDescription></DialogHeader><p className="text-sm">模型：{pendingModelDownload?.startsWith('alignment:') ? analysisEnvironment?.alignment.models.find(model => model.id === pendingModelDownload.slice('alignment:'.length))?.label : analysisEnvironment?.separationModels.find(model => model.id === pendingModelDownload)?.label}</p><DialogFooter><Button variant="outline" onClick={() => setPendingModelDownload(null)}>取消</Button><Button onClick={() => { const id = pendingModelDownload; setPendingModelDownload(null); if (!id) return; if (id.startsWith('alignment:')) void prepareAlignmentModel(id.slice('alignment:'.length)); else void prepareAnalysisModel(id) }}>开始下载</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={!!pendingModelRemoval} onOpenChange={open => { if (!open) setPendingModelRemoval(null) }}><DialogContent><DialogHeader><DialogTitle>删除 Pitchord 中的模型？</DialogTitle><DialogDescription>只删除 Pitchord 环境内管理的副本。用户最初选择的模型文件不会被删除，工程中的历史分析结果也会保留。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setPendingModelRemoval(null)}>取消</Button><Button variant="destructive" onClick={() => { if (!pendingModelRemoval) return; if (pendingModelRemoval.startsWith('alignment:')) void removeAlignmentModel(pendingModelRemoval.slice('alignment:'.length)); else void removeAnalysisModel(pendingModelRemoval) }}>确认删除</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={subtitleOpen} onOpenChange={setSubtitleOpen}><DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl"><DialogHeader><DialogTitle>字级字幕与视频</DialogTitle><DialogDescription>按已经校准的逐字时间生成 ASS。默认样式会高亮当前字、在下方显示“・”，并在字的上方显示字级编辑中确认的音高。</DialogDescription></DialogHeader><div className="grid gap-4 md:grid-cols-2"><div className="space-y-3"><label className="block space-y-2 text-sm">色带<Select value={subtitleStyle.colorBand} onValueChange={value => setSubtitleStyle(current => ({ ...current, colorBand: value as SubtitleStyle['colorBand'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="rainbow">音高彩虹</SelectItem><SelectItem value="cool">冷色带</SelectItem><SelectItem value="warm">暖色带</SelectItem><SelectItem value="custom">自定义两端颜色</SelectItem></SelectContent></Select></label><div className="grid grid-cols-2 gap-3"><label className="space-y-2 text-sm">低音颜色<Input type="color" value={subtitleStyle.lowColor} onChange={event => setSubtitleStyle(current => ({ ...current, lowColor: event.target.value }))} /></label><label className="space-y-2 text-sm">高音颜色<Input type="color" value={subtitleStyle.highColor} onChange={event => setSubtitleStyle(current => ({ ...current, highColor: event.target.value }))} /></label><label className="space-y-2 text-sm">普通文字<Input type="color" value={subtitleStyle.baseColor} onChange={event => setSubtitleStyle(current => ({ ...current, baseColor: event.target.value }))} /></label><label className="space-y-2 text-sm">描边<Input type="color" value={subtitleStyle.outlineColor} onChange={event => setSubtitleStyle(current => ({ ...current, outlineColor: event.target.value }))} /></label></div><label className="block space-y-2 text-sm">字体<Input value={subtitleStyle.fontName} onChange={event => setSubtitleStyle(current => ({ ...current, fontName: event.target.value }))} /></label><label className="block space-y-2 text-sm">字号：{subtitleStyle.fontSize}<Slider min={28} max={96} step={2} value={[subtitleStyle.fontSize]} onValueChange={values => setSubtitleStyle(current => ({ ...current, fontSize: values[0] }))} /></label><label className="block space-y-2 text-sm">底部距离：{subtitleStyle.marginBottom}px<Slider min={40} max={240} step={8} value={[subtitleStyle.marginBottom]} onValueChange={values => setSubtitleStyle(current => ({ ...current, marginBottom: values[0] }))} /></label><div className="flex gap-2"><Button size="sm" variant={subtitleStyle.showDot ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(current => ({ ...current, showDot: !current.showDot }))}>下方强调点</Button><Button size="sm" variant={subtitleStyle.showPitch ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(current => ({ ...current, showPitch: !subtitleStyle.showPitch }))}>上方音高</Button></div></div><div className="space-y-3"><div className="relative flex min-h-64 items-center justify-center overflow-hidden rounded-lg bg-black p-8 text-center"><div><p className="text-sm font-semibold text-cyan-300">{subtitleStyle.showPitch ? activePitchNotation || '—' : ''}</p><p className="mt-2 text-3xl font-bold" style={{ color: subtitleStyle.baseColor, fontFamily: subtitleStyle.fontName }}><span>示例歌</span><span className="text-cyan-300">词</span></p><p className="text-2xl text-cyan-300">{subtitleStyle.showDot ? '・' : ''}</p></div></div><div className="rounded-lg border border-border bg-muted/30 p-3 text-xs text-muted-foreground"><p>字级时间：{segments.reduce((sum, segment) => sum + segment.chars.length, 0)} 个单位</p><p className="mt-1">音高结果：{pitchPoints.length ? `${pitchPoints.length} 个时间点` : '无；仍可导出逐字时间，颜色保持普通文字色'}</p><p className="mt-1">预览显示当前选中字的音高简写；实际 ASS 按逐音时值依次显示。</p><p className="mt-1">当前字结束到下一字开始之间，会保留该字最后一个音高。</p></div></div></div><DialogFooter><Button variant="outline" onClick={() => void exportWordSubtitles('json')} disabled={!segments.length}><Download />导出字级 JSON</Button><Button variant="outline" onClick={() => void exportWordSubtitles('ass')} disabled={!segments.length}><Download />导出 ASS</Button><Button onClick={() => void burnSubtitleVideo()} disabled={!segments.length || !mediaIsVideo || !projectDirectory}><Video />嵌入视频</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={subtitleStudioOpen} onOpenChange={setSubtitleStudioOpen}>
         <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-5xl">
           <DialogHeader>
@@ -2222,6 +2317,19 @@ export default function App() {
                   <label className="block space-y-1.5 text-xs text-muted-foreground">音高色带<Select value={subtitleStyle.colorBand} onValueChange={value => setSubtitleStyle(style => ({ ...style, colorBand: value as SubtitleStyle['colorBand'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="rainbow">音高彩虹</SelectItem><SelectItem value="cool">冷色带</SelectItem><SelectItem value="warm">暖色带</SelectItem><SelectItem value="custom">自定义</SelectItem></SelectContent></Select></label>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="space-y-1.5 text-xs text-muted-foreground">低音色<Input type="color" value={subtitleStyle.lowColor} onChange={event => setSubtitleStyle(style => ({ ...style, lowColor: event.target.value, colorBand: 'custom' }))} /></label>
+                  <label className="space-y-1.5 text-xs text-muted-foreground">高音色<Input type="color" value={subtitleStyle.highColor} onChange={event => setSubtitleStyle(style => ({ ...style, highColor: event.target.value, colorBand: 'custom' }))} /></label>
+                </div>
+                <div className="rounded-lg border border-border p-3">
+                  <p className="mb-3 text-xs font-medium">当前字强调点</p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="block space-y-2 text-xs text-muted-foreground">大小：{subtitleStyle.dotSize}px<Slider min={12} max={72} step={2} value={[subtitleStyle.dotSize]} onValueChange={values => setSubtitleStyle(style => ({ ...style, dotSize: values[0] }))} /></label>
+                    <label className="block space-y-2 text-xs text-muted-foreground">垂直偏移：{subtitleStyle.dotOffset}px<Slider min={-20} max={40} step={2} value={[subtitleStyle.dotOffset]} onValueChange={values => setSubtitleStyle(style => ({ ...style, dotOffset: values[0] }))} /></label>
+                    <label className="block space-y-1.5 text-xs text-muted-foreground">点的颜色<Select value={subtitleStyle.dotColorMode} onValueChange={value => setSubtitleStyle(style => ({ ...style, dotColorMode: value as SubtitleStyle['dotColorMode'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="pitch">跟随字的音高</SelectItem><SelectItem value="custom">自定义</SelectItem></SelectContent></Select></label>
+                    {subtitleStyle.dotColorMode === 'custom' && <label className="space-y-1.5 text-xs text-muted-foreground">自定义点颜色<Input type="color" value={subtitleStyle.dotColor} onChange={event => setSubtitleStyle(style => ({ ...style, dotColor: event.target.value }))} /></label>}
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
                   <label className="block space-y-2 text-xs text-muted-foreground">描边宽度：{subtitleStyle.outline}<Slider min={0} max={8} step={1} value={[subtitleStyle.outline]} onValueChange={values => setSubtitleStyle(style => ({ ...style, outline: values[0] }))} /></label>
                   <label className="block space-y-2 text-xs text-muted-foreground">阴影：{subtitleStyle.shadow}<Slider min={0} max={8} step={1} value={[subtitleStyle.shadow]} onValueChange={values => setSubtitleStyle(style => ({ ...style, shadow: values[0] }))} /></label>
                   <label className="block space-y-2 text-xs text-muted-foreground">背景不透明度：{subtitleStyle.backgroundOpacity}%<Slider min={0} max={100} step={5} value={[subtitleStyle.backgroundOpacity]} onValueChange={values => setSubtitleStyle(style => ({ ...style, backgroundOpacity: values[0] }))} /></label>
@@ -2231,13 +2339,8 @@ export default function App() {
             </div>
 
             <div className="space-y-4">
-              <div className="relative aspect-video overflow-hidden rounded-xl bg-gradient-to-br from-neutral-800 to-black shadow-inner">
-                <div className={`absolute flex max-w-[88%] flex-col ${subtitleStyle.horizontalPosition === 'left' ? 'items-start text-left' : subtitleStyle.horizontalPosition === 'right' ? 'items-end text-right' : 'items-center text-center'} ${subtitleStyle.verticalPosition === 'top' ? 'top-5' : subtitleStyle.verticalPosition === 'middle' ? 'top-1/2 -translate-y-1/2' : 'bottom-5'} ${subtitleStyle.horizontalPosition === 'left' ? 'left-5' : subtitleStyle.horizontalPosition === 'right' ? 'right-5' : 'left-1/2 -translate-x-1/2'}`}>
-                  {subtitleStyle.showPitch && <span className="mb-1 text-xs font-semibold text-cyan-300">{activePitchNotation || 'C4'}</span>}
-                  <span className="rounded px-2 py-1 text-xl" style={{ color: subtitleStyle.baseColor, fontFamily: subtitleStyle.fontName, fontWeight: subtitleStyle.bold ? 700 : 400, fontStyle: subtitleStyle.italic ? 'italic' : 'normal', letterSpacing: `${subtitleStyle.spacing}px`, WebkitTextStroke: subtitleStyle.backgroundStyle === 'outline' ? `${Math.max(1, subtitleStyle.outline / 2)}px ${subtitleStyle.outlineColor}` : undefined, backgroundColor: subtitleStyle.backgroundStyle === 'box' ? `${subtitleStyle.backgroundColor}${Math.round(subtitleStyle.backgroundOpacity * 2.55).toString(16).padStart(2, '0')}` : 'transparent', textShadow: subtitleStyle.shadow ? `0 ${subtitleStyle.shadow}px ${subtitleStyle.shadow * 2}px #000` : undefined }}>示例歌<span className="text-cyan-300">词</span></span>
-                  {subtitleStyle.showDot && <span className="text-lg text-cyan-300">・</span>}
-                </div>
-              </div>
+              <div className="relative aspect-video overflow-hidden rounded-xl bg-neutral-950 shadow-inner"><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div>
+              <p className="text-xs text-muted-foreground">预览跟随当前播放头；视频区同时显示实际画面。拖动字边界时字幕立即更新。</p>
               <div className="space-y-2">
                 <div className="rounded-lg border border-border p-3"><p className="text-sm font-medium">LRC</p><p className="mt-1 text-xs text-muted-foreground">每句开始时间与歌词；适合音乐播放器，不含结束时间、字级时间和样式。</p></div>
                 <div className="rounded-lg border border-border p-3"><p className="text-sm font-medium">SRT</p><p className="mt-1 text-xs text-muted-foreground">每句开始/结束时间与歌词；兼容性最好，不含字级音高和视觉样式。</p></div>

@@ -70,3 +70,14 @@ details > summary svg:last-child { transition: transform 150ms ease; }
   .workspace-overview > aside:last-child { grid-column: 1 / -1; min-height: auto; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+.video-preview-shell:fullscreen {
+  width: 100vw !important;
+  height: 100vh !important;
+  background: #000;
+}
+
+.video-preview-shell:fullscreen .video-preview-frame {
+  width: min(100vw, calc(100vh * var(--video-aspect))) !important;
+  max-width: 100vw;
+  max-height: 100vh;
+}

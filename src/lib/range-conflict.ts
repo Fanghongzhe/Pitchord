@@ -2,9 +2,9 @@ import { MIN_SPAN, roundTime } from './lyrics'
 
 export type TimeRange = { id: string; start: number; end: number }
 
-export function resolveRangeConflict(clips: TimeRange[], target: TimeRange, bounds: { start: number; end: number }, strategy: 'compress' | 'push'): TimeRange[] | null {
+export function resolveRangeConflict(clips: TimeRange[], target: TimeRange, bounds: { start: number; end: number }, strategy: 'compress' | 'push', minimumSpan: (clip: TimeRange) => number = () => MIN_SPAN): TimeRange[] | null {
   const index = clips.findIndex(clip => clip.id === target.id)
-  if (index < 0 || target.start < bounds.start || target.end > bounds.end || target.end - target.start < MIN_SPAN) return null
+  if (index < 0 || target.start < bounds.start || target.end > bounds.end || target.end - target.start < minimumSpan(clips[index])) return null
   const result = clips.map(clip => ({ ...clip }))
   result[index] = { ...target }
 
@@ -18,7 +18,7 @@ export function resolveRangeConflict(clips: TimeRange[], target: TimeRange, boun
       current.end -= shift
     } else {
       current.end = next.start
-      current.start = Math.min(current.start, current.end - MIN_SPAN)
+      current.start = Math.min(current.start, current.end - minimumSpan(clips[i]))
     }
   }
   for (let i = index + 1; i < result.length; i++) {
@@ -31,11 +31,11 @@ export function resolveRangeConflict(clips: TimeRange[], target: TimeRange, boun
       current.end += shift
     } else {
       current.start = previous.end
-      current.end = Math.max(current.end, current.start + MIN_SPAN)
+      current.end = Math.max(current.end, current.start + minimumSpan(clips[i]))
     }
   }
   const rounded = result.map(clip => ({ id: clip.id, start: roundTime(clip.start), end: roundTime(clip.end) }))
   if (rounded[0].start < bounds.start - 0.0005 || rounded.at(-1)!.end > bounds.end + 0.0005 ||
-      rounded.some((clip, i) => clip.end - clip.start < MIN_SPAN - 0.0005 || (i > 0 && clip.start < rounded[i - 1].end - 0.0005))) return null
+      rounded.some((clip, i) => clip.end - clip.start < minimumSpan(clips[i]) - 0.0005 || (i > 0 && clip.start < rounded[i - 1].end - 0.0005))) return null
   return rounded
 }

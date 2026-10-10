@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSegment, retimeSegment } from './lyrics'
-import { generatePitchAss, sentenceSrt, wordTimedSubtitles } from './subtitles'
+import { generatePitchAss, sentenceSrt, subtitleFrameAt, wordTimedSubtitles } from './subtitles'
 
 describe('word timed subtitle export', () => {
   it('keeps the edited timing for every lyric unit', () => {
@@ -34,6 +34,25 @@ describe('word timed subtitle export', () => {
       { time: 0.2, hz: 440, confidence: 1, rms: 0.2, voiced: true },
     ])
     expect(output).toContain('0:00:01.25,Pitch')
+    expect(subtitleFrameAt([segment], [], 0.8)?.activeIndex).toBe(-1)
+    expect(output).not.toContain('Dialogue: 1,0:00:00.50,0:00:01.25,Dot')
+  })
+
+  it('colors glyphs by pitch and shows the emphasis dot only under the active character', () => {
+    const segment = createSegment('你好', 0, 2)
+    segment.chars[0].pitchOverride = { motion: 'glide', notes: [
+      { note: 'C4', start: 0, end: 0.5 },
+      { note: 'C5', start: 0.5, end: 1 },
+    ] }
+    const style = { colorBand: 'custom' as const, lowColor: '#0000ff', highColor: '#ff0000', dotSize: 44, dotColorMode: 'custom' as const, dotColor: '#00ff00' }
+    const early = subtitleFrameAt([segment], [], 0.2, style)!
+    const late = subtitleFrameAt([segment], [], 0.7, style)!
+    expect(early.colors[0]).not.toBe(late.colors[0])
+    expect(early.activeIndex).toBe(0)
+    expect(late.dotColor).toBe('#00ff00')
+    const ass = generatePitchAss([segment], [], style)
+    expect(ass).toContain('Style: Dot,Microsoft YaHei,44')
+    expect(ass).toContain('\\c&H0000FF00&}・')
   })
 
   it('exports the same manually edited pitch sequence and durations to JSON and ASS', () => {

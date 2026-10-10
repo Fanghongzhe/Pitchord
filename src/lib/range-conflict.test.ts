@@ -19,4 +19,11 @@ describe('range adjustment conflicts', () => {
       { id: 'a', start: -0.2, end: 0.8 }, { id: 'b', start: 0.8, end: 3.2 }, { id: 'c', start: 3.2, end: 4.2 },
     ])
   })
+
+  it('allows a brief punctuation marker while adjusting neighboring lyric characters', () => {
+    const words = [{ id: 'a', start: 0, end: 0.5 }, { id: 'comma', start: 0.5, end: 0.502 }, { id: 'b', start: 0.502, end: 1 }]
+    const result = resolveRangeConflict(words, { id: 'b', start: 0.55, end: 1 }, { start: 0, end: 1 }, 'compress', clip => clip.id === 'comma' ? 0.001 : 0.04)
+    expect(result?.[1]).toEqual(words[1])
+    expect(result?.[2].start).toBe(0.55)
+  })
 })

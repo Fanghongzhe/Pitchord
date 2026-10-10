@@ -46,7 +46,7 @@ def text_units(text: str) -> list[dict]:
     return result
 
 
-def split_asr_word(text: str, start: float, end: float) -> list[dict]:
+def split_asr_word(text: str, start: float, end: float, probability: float | None = None) -> list[dict]:
     units = [unit for unit in text_units(text) if unit["key"]]
     if not units:
         return []
@@ -59,7 +59,7 @@ def split_asr_word(text: str, start: float, end: float) -> list[dict]:
         unit_start = start + span * elapsed / total
         elapsed += weight
         unit_end = start + span * elapsed / total
-        result.append({"key": unit["key"], "text": unit["text"], "start": unit_start, "end": unit_end})
+        result.append({"key": unit["key"], "text": unit["text"], "start": unit_start, "end": unit_end, "probability": probability})
     return result
 
 
@@ -547,6 +547,7 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
 
         content_times = token_intervals(content_indexes, recognized, matches, accepted[segment_index], line_start, line_end)
         content_by_unit = {flat_reference[index]["unit"]: content_times[index] for index in content_indexes}
+        reference_by_unit = {flat_reference[index]["unit"]: index for index in content_indexes}
         timed_units: list[tuple[float, float]] = []
         for unit_index in range(len(units)):
             if unit_index in content_by_unit:
@@ -561,6 +562,15 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
         chars = []
         for unit_index, (unit, timing) in enumerate(zip(units, timed_units)):
             old = old_chars[unit_index] if unit_index < len(old_chars) else {}
+            reference_index = reference_by_unit.get(unit_index)
+            direct_match = reference_index is not None and reference_index in accepted[segment_index]
+            token = recognized[matches[reference_index]] if direct_match else None
+            evidence = {
+                "source": "asr" if direct_match else "punctuation" if not unit["key"] else "lrc" if segment.get("timingSource") == "lrc" and not accepted[segment_index] else "interpolated",
+                "matched": direct_match,
+            }
+            if token and isinstance(token.get("probability"), (int, float)):
+                evidence["asrProbability"] = max(0.0, min(1.0, float(token["probability"])))
             chars.append({
                 "id": old.get("id") or str(uuid.uuid4()),
                 "text": unit["text"],
@@ -569,6 +579,9 @@ def align_segments(segments: list[dict], recognized: list[dict], duration: float
                 "start": round(max(line_start, min(line_end, timing[0])), 3),
                 "end": round(max(line_start, min(line_end, timing[1])), 3),
                 "origin": "estimated",
+                "timingEvidence": evidence,
+                **({"startLocked": True} if old.get("startLocked") else {}),
+                **({"endLocked": True} if old.get("endLocked") else {}),
                 **({"pitchOverride": old["pitchOverride"]} if old.get("text") == unit["text"] and old.get("pitchOverride") else {}),
             })
         aligned_segments.append({
@@ -632,7 +645,8 @@ def transcribe(audio: str, model_name: str, language: str | None, model_root: st
     for segment in stream:
         if segment.words:
             for word in segment.words:
-                tokens.extend(split_asr_word(word.word, float(word.start), float(word.end)))
+                probability = getattr(word, "probability", None)
+                tokens.extend(split_asr_word(word.word, float(word.start), float(word.end), float(probability) if probability is not None else None))
         else:
             # Whisper sometimes supplies segment text without word timings.
             fallback = [unit for unit in text_units(segment.text or "") if unit["key"]]
@@ -673,6 +687,7 @@ def main() -> None:
         raise RuntimeError("没有从人声音轨中识别到可用于对齐的歌词。")
     emit_progress(0.86, "正在把识别时间戳匹配到输入歌词…")
     result = align_segments(segments, recognized, duration, vocal_activity(args.audio, payload.get("pitchPoints")))
+    result["asrTokens"] = recognized
     result.update({"model": args.model, "language": detected_language, "device": device, "source": "faster-whisper-monotonic-text-alignment"})
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
