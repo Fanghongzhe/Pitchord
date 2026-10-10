@@ -41,7 +41,7 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   readProjectAsset: kind => ipcRenderer.invoke('pitchord:read-project-asset', kind),
   openProjectFolder: () => ipcRenderer.invoke('pitchord:open-project-folder'),
   separateVocals: source => ipcRenderer.invoke('pitchord:separate-vocals', source),
-  analyzePitch: algorithm => ipcRenderer.invoke('pitchord:analyze-pitch', algorithm),
+  analyzePitch: (algorithm, vocals) => ipcRenderer.invoke('pitchord:analyze-pitch', algorithm, vocals),
   alignLyrics: request => ipcRenderer.invoke('pitchord:align-lyrics', request),
   readAnalysisFile: file => ipcRenderer.invoke('pitchord:read-analysis-file', file),
   activateSeparationResult: result => ipcRenderer.invoke('pitchord:activate-separation-result', result),

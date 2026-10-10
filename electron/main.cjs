@@ -5,6 +5,7 @@ const { spawn } = require('node:child_process')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { createHash } = require('node:crypto')
+const { resolvePitchInput } = require('./pitch-input.cjs')
 
 let ffmpegPath = null
 try { ffmpegPath = require('ffmpeg-static') } catch { ffmpegPath = null }
@@ -1646,13 +1647,12 @@ app.whenReady().then(async () => {
     return { vocals: { name: path.basename(vocals), path: vocals, data: await readFile(vocals) }, accompaniment: { name: path.basename(accompaniment), path: accompaniment, data: await readFile(accompaniment) } }
   })
 
-  ipcMain.handle('pitchord:analyze-pitch', async (event, algorithm = 'pyin') => {
+  ipcMain.handle('pitchord:analyze-pitch', async (event, algorithm = 'pyin', selectedVocals) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (!['pyin', 'torchcrepe'].includes(algorithm)) throw new Error('当前音高算法尚不可用。')
     pendingTaskCancellations.delete('pitch')
     const project = requireProject()
-    if (!project.assets.vocals) throw new Error('请先运行人声分离或导入纯人声轨。')
-    const input = projectAssetPath(project, project.assets.vocals)
+    const input = resolvePitchInput(project, selectedVocals)
     const output = path.join(project.directory, 'analysis', `pitch-${algorithm}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
     const python = await preferredPythonPath()
     const probe = await probePython(python)

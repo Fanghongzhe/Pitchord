@@ -604,7 +604,9 @@ export default function App() {
     setTrackEnabled(current => ({ ...current, [kind]: !current[kind] }))
   }
 
-  const analyzePitch = async (sourceResultId = pitchInputResultId, fromPipeline = false): Promise<PitchResult | null> => {
+  const analyzePitch = async (sourceResult: string | SeparationResult = pitchInputResultId, fromPipeline = false): Promise<PitchResult | null> => {
+    const sourceResultId = typeof sourceResult === 'string' ? sourceResult : sourceResult.id
+    const selectedInput = typeof sourceResult === 'string' ? separationResults.find(result => result.id === sourceResult) : sourceResult
     const buffer = audioBufferRef.current
     if (!buffer) { setPitchStatus('请先准备纯人声轨。'); setNotice('音高识别只使用纯人声轨。请先运行人声分离，或导入外部人声结果。'); return null }
     if (workflowExecutionRef.current && !fromPipeline) { setNotice('已有流程正在运行，请等待当前阶段完成。'); return null }
@@ -616,7 +618,7 @@ export default function App() {
     await new Promise<void>(resolve => window.setTimeout(resolve, 0))
     try {
       const desktopResult = window.pitchordDesktop?.analyzePitch && projectDirectory
-        ? await window.pitchordDesktop.analyzePitch(pitchAlgorithm)
+        ? await window.pitchordDesktop.analyzePitch(pitchAlgorithm, selectedInput?.vocals)
         : null
       const points = desktopResult?.points ?? analyzeAudioBuffer(buffer)
       setPitchPoints(points)
@@ -1447,7 +1449,7 @@ export default function App() {
         setActivePitchResultId(pitch.id)
         setPitchPoints(pitch.points)
         updateWork('pitch', '连续音高识别', 'success', `已复用 ${pitch.label} 的现有结果`, 1)
-      } else pitch = await analyzePitch(separation.id, true)
+      } else pitch = await analyzePitch(separation, true)
       if (!pitch) return
       let alignment = alignmentResults.find(result => result.inputResultId === separation.id && result.modelId === alignmentModel) ?? null
       if (alignment) {
