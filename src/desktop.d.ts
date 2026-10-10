@@ -16,6 +16,7 @@ type AnalysisRuntimeStatus = {
   completeReady: boolean
   mediaTools: { ffmpeg: boolean; ffprobe: boolean }
   separationModels: Array<{ id: string; label: string; description: string; bundled: boolean; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
+  harmonyModels: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   pitchMethods: Array<{ id: string; label: string; description: string; ready: boolean; runnable?: boolean; source?: 'recommended' | 'custom'; canDelete?: boolean; provider?: string }>
   alignment: { manual: boolean; pitchMatching: boolean; forcedAlignment: boolean; models: Array<{ id: string; label: string; description: string; ready: boolean }> }
   model: string
@@ -49,15 +50,17 @@ declare global {
       chooseAnalysisDirectory: (currentPath?: string) => Promise<string | null>
       configureAnalysisEnvironment: (request: { mode: 'managed'; root: string; computeProfile: 'auto' | 'cpu' | 'cuda121' } | { mode: 'custom'; pythonPath: string }) => Promise<AnalysisRuntimeStatus>
       analysisStatus: () => Promise<AnalysisRuntimeStatus>
-      cancelAnalysisTask: (taskId: 'environment' | 'separation' | 'pitch' | 'alignment') => Promise<boolean>
+      cancelAnalysisTask: (taskId: 'environment' | 'separation' | 'harmony' | 'pitch' | 'alignment') => Promise<boolean>
       analysisStorageStatus: () => Promise<AnalysisStorageStatus>
       removeAnalysisData: (target: 'runtime' | 'models' | 'cache' | 'legacy' | 'all') => Promise<AnalysisStorageStatus>
       prepareBaseRuntime: () => Promise<AnalysisRuntimeStatus>
       installAnalysisRuntime: (request?: { root?: string; computeProfile?: 'auto' | 'cpu' | 'cuda121'; installSelection?: { pitchMethods: Array<'pyin' | 'torchcrepe'>; separationModels: string[]; alignmentModels: string[] } }) => Promise<AnalysisRuntimeStatus>
       prepareAnalysisModel: (model?: string) => Promise<AnalysisRuntimeStatus>
+      prepareHarmonyModel: (model: string) => Promise<AnalysisRuntimeStatus>
+      removeHarmonyModel: (model: string) => Promise<AnalysisRuntimeStatus>
       prepareAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
       removeAlignmentModel: (model: string) => Promise<AnalysisRuntimeStatus>
-      importAnalysisModel: (kind: 'separation' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
+      importAnalysisModel: (kind: 'separation' | 'harmony' | 'pitch') => Promise<AnalysisRuntimeStatus | null>
       removeAnalysisModel: (model: string) => Promise<AnalysisRuntimeStatus>
       openAnalysisFolder: () => Promise<string>
       onAnalysisProgress: (callback: (progress: { stage: string; message: string; componentId?: string; componentProgress?: number; overallProgress?: number; detail?: string; components?: Array<{ id: string; label: string; detail: string; status: 'pending' | 'running' | 'complete'; progress: number }>; speedBytesPerSecond?: number; downloadedBytes?: number; totalBytes?: number; etaSeconds?: number; transferState?: 'downloading' | 'cache' | 'installing' }) => void) => () => void
@@ -70,15 +73,16 @@ declare global {
       storeLyricsSource: (name: string, content: string) => Promise<string>
       openLyricsFolder: () => Promise<string>
       pickLyricsBackup: () => Promise<{ name: string; content: string } | null>
-      storeAsset: (kind: 'media' | 'vocals' | 'accompaniment', name: string, data: ArrayBuffer) => Promise<string>
-      readProjectAsset: (kind: 'media' | 'vocals' | 'accompaniment') => Promise<{ name: string; data: Uint8Array } | null>
+      storeAsset: (kind: 'media' | 'vocals' | 'harmonies' | 'accompaniment', name: string, data: ArrayBuffer) => Promise<string>
+      readProjectAsset: (kind: 'media' | 'vocals' | 'harmonies' | 'accompaniment') => Promise<{ name: string; data: Uint8Array } | null>
       openProjectFolder: () => Promise<string>
       separateVocals: (source: { name: string; data: ArrayBuffer; model?: string }) => Promise<{ vocals: { name: string; path: string; data: Uint8Array }; accompaniment: { name: string; path: string; data: Uint8Array } } | null>
+      separateHarmonies: (request: { vocals: string; model: string }) => Promise<{ lead: { name: string; path: string; data: Uint8Array }; harmonies: { name: string; path: string; data: Uint8Array }; modelId: string; modelLabel: string }>
       analyzePitch: (algorithm: 'pyin' | 'torchcrepe', vocals?: string) => Promise<{ algorithm: string; path: string; device: string; points: Array<{ time: number; hz: number; confidence: number; rms: number; voiced: boolean }> }>
       alignLyrics: (request: { segments: import('./lib/lyrics').LyricSegment[]; duration: number; model: string; language: string; vocals?: string; pitchPoints?: import('./lib/pitch').PitchPoint[] }) => Promise<{ segments: import('./lib/lyrics').LyricSegment[]; coverage: number; matchedTokens: number; referenceTokens: number; recognizedTokens: number; lowConfidenceLines: number[]; model: string; language?: string; path: string; input: string }>
       readAnalysisFile: (file: string) => Promise<Uint8Array>
       activateSeparationResult: (result: { vocals: string; accompaniment: string }) => Promise<boolean>
-      activateVocalResult: (result: { vocals: string }) => Promise<boolean>
+      activateVocalResult: (result: { vocals: string; harmonies?: string }) => Promise<boolean>
       burnSubtitles: (request: { ass: string; outputName: string }) => Promise<{ video: string; subtitle: string }>
     }
   }

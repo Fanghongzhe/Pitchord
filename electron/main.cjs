@@ -6,6 +6,7 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { createHash } = require('node:crypto')
 const { resolvePitchInput } = require('./pitch-input.cjs')
+const { findGeneratedStem } = require('./harmony-stems.cjs')
 
 let ffmpegPath = null
 try { ffmpegPath = require('ffmpeg-static') } catch { ffmpegPath = null }
@@ -26,7 +27,7 @@ const offlineAnalysisRoot = () => app.isPackaged ? path.join(process.resourcesPa
 let mainWindow
 let activeProject = null
 const activeAnalysisTasks = new Map()
-const cancellableAnalysisTasks = new Set(['environment', 'separation', 'pitch', 'alignment'])
+const cancellableAnalysisTasks = new Set(['environment', 'separation', 'harmony', 'pitch', 'alignment'])
 const pendingTaskCancellations = new Set()
 
 class TaskCancelledError extends Error {
@@ -75,6 +76,20 @@ const separationModelCatalog = [
   { id: 'htdemucs_ft', label: 'HTDemucs FT', description: '微调高质量方案，速度较慢，需要另行准备模型。', bundled: false },
   { id: 'mdx_extra_q', label: 'MDX Extra Q', description: '体积较小、速度较快的量化方案，需要另行准备模型。', bundled: false },
 ]
+const harmonyModelCatalog = [{
+  id: 'bs-roformer-karaoke-frazer',
+  label: 'BS-RoFormer Karaoke（Frazer / becruily）',
+  description: '从已分离的人声中提取主唱，余量保留为和声／残留人声试听轨；贴近主唱的和声仍可能残留，也可能误剥主唱。',
+  provider: 'msst', modelType: 'bs_roformer', bundled: false,
+  revision: 'f7849ae934209184dc288d1018cd8a76a7fc8b3c',
+  repository: 'becruily/bs-roformer-karaoke',
+  checkpointName: 'bs_roformer_karaoke_frazer_becruily.ckpt',
+  checkpointSha256: 'eb90ee24c1154d83fbcfd27e96182f19e061557cc6e4746953125e08c29389f9',
+  checkpointSize: 204436907,
+  configName: 'config_karaoke_frazer_becruily.yaml',
+  configSha256: '1d3b58b473025183d0d3c91e7a444cb5f1418d9f34e8f46b8d2fb10d2cc8ab34',
+  configSize: 1903,
+}]
 const alignmentModelCatalog = [
   { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。', revision: '536b0662742c02347bc0e980a01041f333bce120' },
   { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。', revision: 'ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66' },
@@ -144,9 +159,20 @@ async function writeCustomModels(models) {
 }
 
 function separationModel(modelId) {
-  const model = [...separationModelCatalog, ...readCustomModels()].find(item => item.id === modelId)
+  const model = [...separationModelCatalog, ...readCustomModels().filter(item => item.kind !== 'harmony' && item.kind !== 'pitch')].find(item => item.id === modelId)
   if (!model) throw new Error('不支持的人声分离模型。')
   if (model.runnable === false) throw new Error('这个模型已纳入 Pitchord 环境，但当前还没有与它匹配的推理提供者或配置。')
+  return model
+}
+
+function harmonyModel(modelId) {
+  const model = [...harmonyModelCatalog.map(item => ({
+    ...item,
+    checkpoint: path.join(modelRoot(), 'harmony', item.id, item.checkpointName),
+    config: path.join(modelRoot(), 'harmony', item.id, item.configName),
+  })), ...readCustomModels().filter(item => item.kind === 'harmony')].find(item => item.id === modelId)
+  if (!model || model.runnable === false) throw new Error('所选去和声模型不可运行。')
+  if (!fs.existsSync(model.checkpoint) || !fs.existsSync(model.config)) throw new Error('请先在模型管理中准备去和声模型。')
   return model
 }
 
@@ -377,7 +403,15 @@ async function analysisRuntimeStatus() {
     return { ...model, ready, runnable: true, source: 'recommended', canDelete: !model.bundled, provider: 'demucs' }
   }))
   const customModels = readCustomModels()
-  for (const model of customModels.filter(item => item.kind !== 'pitch')) models.push({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })
+  for (const model of customModels.filter(item => item.kind !== 'pitch' && item.kind !== 'harmony')) models.push({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })
+  const harmonyModels = harmonyModelCatalog.map(model => {
+    const directory = path.join(modelRoot(), 'harmony', model.id)
+    let marker = null
+    try { marker = JSON.parse(fs.readFileSync(path.join(directory, 'pitchord-model.json'), 'utf8')) } catch { /* not prepared */ }
+    return { id: model.id, label: model.label, description: model.description, provider: model.provider, source: 'recommended', canDelete: true,
+      ready: marker?.model === model.id && fs.existsSync(path.join(directory, model.checkpointName)) && fs.existsSync(path.join(directory, model.configName)), runnable: true }
+  })
+  for (const model of customModels.filter(item => item.kind === 'harmony')) harmonyModels.push({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })
   const bundledFfmpeg = resolveBundledBinary(ffmpegPath, 'ffmpeg-static')
   const bundledFfprobe = resolveBundledBinary(ffprobePath, 'ffprobe-static')
   const alignmentModels = alignmentModelCatalog.map(model => ({
@@ -425,6 +459,7 @@ async function analysisRuntimeStatus() {
     completeReady,
     mediaTools: { ffmpeg: !!(bundledFfmpeg && fs.existsSync(bundledFfmpeg)), ffprobe: !!(bundledFfprobe && fs.existsSync(bundledFfprobe)) },
     separationModels: models,
+    harmonyModels,
     pitchMethods: [
       { id: 'pyin', label: 'pYIN', ready: !!probe?.librosa, description: '概率 YIN 与时间连续性平滑，适合干净纯人声。' },
       { id: 'torchcrepe', label: 'TorchCrepe', ready: !!probe?.torchcrepe, description: '神经网络音高识别，适合复杂唱法和弱基频。' },
@@ -660,7 +695,21 @@ async function findBootstrapPython() {
   return null
 }
 
-async function downloadVerifiedFile(url, destination, expectedHash, expectedSize, onProgress) {
+async function downloadVerifiedFile(url, destination, expectedHash, expectedSize, onProgress, label = '内置 Python') {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { return await downloadVerifiedFileAttempt(url, destination, expectedHash, expectedSize, onProgress, label) }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (attempt === 4 || !/ERR_|ECONN|ETIMEDOUT|fetch failed|network|连接|HTTP (?:429|5\d\d)/i.test(message)) throw error
+      let partialSize = 0
+      try { partialSize = (await fs.promises.stat(`${destination}.part`)).size } catch { /* retry from zero */ }
+      onProgress?.(Math.min(1, partialSize / expectedSize), `${label}连接中断，正在从已下载位置重试（${attempt + 1}/4）…`, { downloadedBytes: partialSize, totalBytes: expectedSize, transferState: 'downloading' })
+      await new Promise(resolve => setTimeout(resolve, Math.min(8000, 1000 * 2 ** attempt)))
+    }
+  }
+}
+
+async function downloadVerifiedFileAttempt(url, destination, expectedHash, expectedSize, onProgress, label) {
   const partial = `${destination}.part`
   let existingSize = 0
   try { existingSize = (await fs.promises.stat(partial)).size } catch { /* no resumable download */ }
@@ -668,7 +717,7 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
     try {
       await verifyLocalFile(partial, expectedHash, expectedSize)
       await fs.promises.rename(partial, destination)
-      onProgress?.(1, '已复用完整的 Python 下载缓存。', { downloadedBytes: expectedSize, totalBytes: expectedSize, transferState: 'cache' })
+      onProgress?.(1, `已复用完整的${label}下载缓存。`, { downloadedBytes: expectedSize, totalBytes: expectedSize, transferState: 'cache' })
       return
     } catch {
       await fs.promises.rm(partial, { force: true })
@@ -679,13 +728,13 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
     existingSize = 0
   }
   let response = await net.fetch(url, existingSize ? { headers: { Range: `bytes=${existingSize}-` } } : undefined)
-  if (!response.ok || !response.body) throw new Error(`基础运行时下载失败（HTTP ${response.status}）。`)
+  if (!response.ok || !response.body) throw new Error(`${label}下载失败（HTTP ${response.status}）。`)
   if (existingSize && response.status !== 206) {
     await response.body.cancel()
     await fs.promises.rm(partial, { force: true })
     existingSize = 0
     response = await net.fetch(url)
-    if (!response.ok || !response.body) throw new Error(`基础运行时下载失败（HTTP ${response.status}）。`)
+    if (!response.ok || !response.body) throw new Error(`${label}下载失败（HTTP ${response.status}）。`)
   }
   const responseSize = Number(response.headers.get('content-length')) || 0
   const total = existingSize + responseSize || expectedSize
@@ -705,7 +754,7 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
         if (done) break
         const chunk = Buffer.from(value)
         received += chunk.length
-        if (received > expectedSize + 1024) throw new Error('基础运行时下载大小异常。')
+        if (received > expectedSize + 1024) throw new Error(`${label}下载大小异常。`)
         hash.update(chunk)
         await handle.write(chunk)
         const percent = Math.min(100, Math.floor(received / total * 100))
@@ -719,7 +768,7 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
             lastSampleAt = sampledAt
             lastSampleBytes = received
           }
-          const message = `${existingSize ? '正在续传' : '正在下载'}内置 Python… ${percent}%`
+          const message = `${existingSize ? '正在续传' : '正在下载'}${label}… ${percent}%`
           const telemetry = { downloadedBytes: received, totalBytes: expectedSize, transferState: 'downloading', ...(speedBytesPerSecond ? { speedBytesPerSecond, etaSeconds: Math.max(0, Math.round((expectedSize - received) / speedBytesPerSecond)) } : {}) }
           if (onProgress) onProgress(percent / 100, message, telemetry)
           else sendAnalysisProgress('base-runtime', message)
@@ -732,12 +781,12 @@ async function downloadVerifiedFile(url, destination, expectedHash, expectedSize
   }
   if (received !== expectedSize) {
     if (received > expectedSize) await fs.promises.rm(partial, { force: true })
-    throw new Error(`基础运行时下载不完整：应为 ${expectedSize} 字节，实际为 ${received} 字节。`)
+    throw new Error(`${label}下载不完整：应为 ${expectedSize} 字节，实际为 ${received} 字节。`)
   }
   const digest = hash.digest('hex')
   if (digest !== expectedHash) {
     await fs.promises.rm(partial, { force: true })
-    throw new Error('基础运行时校验失败，文件已丢弃。请检查网络后重试。')
+    throw new Error(`${label}校验失败，文件已丢弃。请检查网络后重试。`)
   }
   await fs.promises.rename(partial, destination)
 }
@@ -1321,6 +1370,53 @@ app.whenReady().then(async () => {
     } finally { analysisInstallTask = null }
   })
 
+  ipcMain.handle('pitchord:prepare-harmony-model', async (event, modelId = harmonyModelCatalog[0].id) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
+    const model = harmonyModelCatalog.find(item => item.id === modelId)
+    if (!model) throw new Error('不支持的去和声模型。')
+    analysisInstallTask = (async () => {
+      await requireFreeSpace(512 * 1024 * 1024, '准备去和声模型')
+      const python = await preferredPythonPath()
+      const probe = await probePython(python)
+      if (!python || !probe?.demucs || !fs.existsSync(path.join(msstRoot, 'inference.py'))) throw new Error('请先安装或修复分析环境。')
+      const directory = path.join(modelRoot(), 'harmony', model.id)
+      await mkdir(directory, { recursive: true })
+      const files = [
+        { name: model.configName, hash: model.configSha256, size: model.configSize, label: '模型配置' },
+        { name: model.checkpointName, hash: model.checkpointSha256, size: model.checkpointSize, label: '去和声权重' },
+      ]
+      sendTaskProgress('environment-model', '准备去和声模型', 'running', `正在准备 ${model.label}…`, 0.01)
+      for (const [index, file] of files.entries()) {
+        const destination = path.join(directory, file.name)
+        try { await verifyLocalFile(destination, file.hash, file.size); continue } catch { /* download or replace the managed copy */ }
+        await fs.promises.rm(destination, { force: true })
+        const url = `https://huggingface.co/${model.repository}/resolve/${model.revision}/${file.name}`
+        await downloadVerifiedFile(url, destination, file.hash, file.size, (progress, message, telemetry) => {
+          sendAnalysisProgress('model', message, telemetry)
+          sendTaskProgress('environment-model', '准备去和声模型', 'running', message, (index + progress) / files.length)
+        }, file.label)
+      }
+      await writeFile(path.join(directory, 'pitchord-model.json'), JSON.stringify({ model: model.id, source: `https://huggingface.co/${model.repository}`, revision: model.revision, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+      sendTaskProgress('environment-model', '准备去和声模型', 'success', `${model.label} 已准备完成`, 1)
+      return { ...await analysisRuntimeStatus(), busy: false }
+    })()
+    try { return await analysisInstallTask }
+    catch (error) {
+      sendTaskProgress('environment-model', '准备去和声模型', 'error', error instanceof Error ? error.message : String(error))
+      throw error
+    } finally { analysisInstallTask = null }
+  })
+
+  ipcMain.handle('pitchord:remove-harmony-model', async (event, modelId) => {
+    if (event.sender !== mainWindow?.webContents || !harmonyModelCatalog.some(model => model.id === modelId)) throw new Error('Invalid harmony model removal request')
+    const root = path.resolve(modelRoot(), 'harmony')
+    const directory = path.resolve(root, modelId)
+    if (!directory.startsWith(root + path.sep)) throw new Error('Invalid harmony model path')
+    await fs.promises.rm(directory, { recursive: true, force: true })
+    return analysisRuntimeStatus()
+  })
+
   ipcMain.handle('pitchord:prepare-alignment-model', async (event, requestedModel = 'small') => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     if (analysisInstallTask) throw new Error('分析环境正在执行另一项操作，请稍候。')
@@ -1358,9 +1454,9 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('pitchord:import-analysis-model', async (event, kind = 'separation') => {
-    if (event.sender !== mainWindow?.webContents || !['separation', 'pitch'].includes(kind)) throw new Error('Invalid model import request')
+    if (event.sender !== mainWindow?.webContents || !['separation', 'harmony', 'pitch'].includes(kind)) throw new Error('Invalid model import request')
     const picked = await dialog.showOpenDialog(mainWindow, {
-      title: kind === 'separation' ? '选择人声分离模型及配套配置' : '选择音高模型及配套配置',
+      title: kind === 'pitch' ? '选择音高模型及配套配置' : kind === 'harmony' ? '选择去和声模型及配套配置' : '选择人声分离模型及配套配置',
       properties: ['openFile', 'multiSelections'],
       filters: [{ name: '模型与配置', extensions: ['th', 'ckpt', 'pt', 'onnx', 'yaml', 'yml', 'json'] }],
     })
@@ -1383,7 +1479,7 @@ app.whenReady().then(async () => {
     const model = {
       id,
       label: names.length === 1 ? names[0] : `${names[0]} 等 ${names.length} 个文件`,
-      description: provider === 'msst' && runnable ? `用户导入的 MSST ${modelType} 人声模型；权重与 YAML 已复制到 Pitchord 环境。` : runnable ? '用户导入的 Demucs 本地模型；文件已复制到 Pitchord 环境。' : provider === 'msst' && yaml && modelType && !supportsVocals ? '这个 MSST 配置不包含 vocals 输出，不能用于 Pitchord 的人声分离步骤。' : provider === 'msst' ? 'MSST 权重已复制到 Pitchord 环境；还需要配套 YAML，且文件名需能识别 MelBandRoformer 或 BSRoformer 架构。' : '模型文件已复制到 Pitchord 环境；当前版本尚无可识别的推理提供者。',
+      description: provider === 'msst' && runnable ? `用户导入的 MSST ${modelType} ${kind === 'harmony' ? '去和声' : '人声'}模型；权重与 YAML 已复制到 Pitchord 环境。` : runnable ? '用户导入的 Demucs 本地模型；文件已复制到 Pitchord 环境。' : provider === 'msst' && yaml && modelType && !supportsVocals ? '这个 MSST 配置不包含 vocals 输出，不能用于当前步骤。' : provider === 'msst' ? 'MSST 权重已复制到 Pitchord 环境；还需要配套 YAML，且文件名需能识别 MelBandRoformer 或 BSRoformer 架构。' : '模型文件已复制到 Pitchord 环境；当前版本尚无可识别的推理提供者。',
       bundled: false,
       ready: true,
       runnable,
@@ -1526,7 +1622,7 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('pitchord:store-asset', async (event, { kind, name, data }) => {
-    if (event.sender !== mainWindow?.webContents || !['media', 'vocals', 'accompaniment'].includes(kind) || typeof name !== 'string' || !(data instanceof ArrayBuffer)) throw new Error('Invalid asset request')
+    if (event.sender !== mainWindow?.webContents || !['media', 'vocals', 'harmonies', 'accompaniment'].includes(kind) || typeof name !== 'string' || !(data instanceof ArrayBuffer)) throw new Error('Invalid asset request')
     const project = requireProject()
     const folder = kind === 'media' ? 'media' : 'analysis'
     const baseName = `${kind === 'media' ? '' : `${kind}-`}${safeAssetName(name)}`
@@ -1536,12 +1632,13 @@ app.whenReady().then(async () => {
       : initial
     await writeFile(projectAssetPath(project, relative), Buffer.from(data))
     project.assets[kind] = relative
+    if (kind === 'vocals') delete project.assets.harmonies
     await saveProjectAssets(project)
     return projectAssetPath(project, relative)
   })
 
   ipcMain.handle('pitchord:read-project-asset', async (event, kind) => {
-    if (event.sender !== mainWindow?.webContents || !['media', 'vocals', 'accompaniment'].includes(kind)) throw new Error('Invalid asset request')
+    if (event.sender !== mainWindow?.webContents || !['media', 'vocals', 'harmonies', 'accompaniment'].includes(kind)) throw new Error('Invalid asset request')
     const project = requireProject()
     const relative = project.assets[kind]
     return relative ? { name: path.basename(relative), data: await readFile(projectAssetPath(project, relative)) } : null
@@ -1639,12 +1736,72 @@ app.whenReady().then(async () => {
     await fs.promises.rename(generatedVocals, vocals)
     await fs.promises.rename(generatedAccompaniment, accompaniment)
     project.assets.vocals = path.relative(project.directory, vocals)
+    delete project.assets.harmonies
     project.assets.accompaniment = path.relative(project.directory, accompaniment)
     await mkdir(path.dirname(modelMarker(selectedModel.id)), { recursive: true })
     await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
     await saveProjectAssets(project)
     sendTaskProgress('separation', '人声分离', 'success', `${selectedModel.label} 已生成人声和伴奏`, 1)
     return { vocals: { name: path.basename(vocals), path: vocals, data: await readFile(vocals) }, accompaniment: { name: path.basename(accompaniment), path: accompaniment, data: await readFile(accompaniment) } }
+  })
+
+  ipcMain.handle('pitchord:separate-harmonies', async (event, request) => {
+    if (event.sender !== mainWindow?.webContents || typeof request?.vocals !== 'string' || typeof request?.model !== 'string') throw new Error('Invalid harmony separation request')
+    pendingTaskCancellations.delete('harmony')
+    const project = requireProject()
+    const input = resolvePitchInput(project, request.vocals, '去和声')
+    const selectedModel = harmonyModel(request.model)
+    const workDir = path.join(project.directory, 'analysis', `harmony-${selectedModel.id}-${new Date().toISOString().replace(/[:.]/g, '-')}`)
+    const inputDirectory = path.join(workDir, 'input')
+    await mkdir(inputDirectory, { recursive: true })
+    await fs.promises.copyFile(input, path.join(inputDirectory, 'vocals.wav'))
+    const python = await preferredPythonPath()
+    const probe = await probePython(python)
+    if (!python || !probe?.demucs) throw new Error('请先安装或修复分析环境。')
+    const args = [
+      path.join(msstRoot, 'inference.py'),
+      '--model_type', selectedModel.modelType,
+      '--config_path', selectedModel.config,
+      '--start_check_point', selectedModel.checkpoint,
+      '--input_folder', inputDirectory,
+      '--store_dir', workDir,
+      '--extract_instrumental',
+      '--disable_detailed_pbar',
+    ]
+    if (!probe.cudaAvailable) args.push('--force_cpu')
+    sendTaskProgress('harmony', '提取主唱并剥离和声', 'running', `正在使用 ${selectedModel.label} 处理人声轨…`, 0.02)
+    try {
+      await runProcess(python, args, {
+        env: analysisEnvironment(python), taskId: 'harmony', taskTitle: '提取主唱并剥离和声',
+        onOutput: chunk => {
+          const line = String(chunk).trim().split(/\r?\n/).at(-1)
+          const percentage = line?.match(/(\d{1,3})%/)?.[1]
+          if (line) sendTaskProgress('harmony', '提取主唱并剥离和声', 'running', line.slice(-240), percentage ? Math.min(0.95, Number(percentage) / 100) : undefined)
+        },
+      })
+      const leadFile = await findGeneratedStem(workDir, 'vocals.wav')
+      const harmonyFile = await findGeneratedStem(workDir, 'instrumental.wav')
+      if (!leadFile || !harmonyFile) throw new Error('去和声模型没有生成主唱与和声两条音轨。')
+      const lead = path.join(workDir, 'lead-vocals.wav')
+      const harmonies = path.join(workDir, 'harmonies.wav')
+      await fs.promises.rename(leadFile, lead)
+      await fs.promises.rename(harmonyFile, harmonies)
+      project.assets.vocals = path.relative(project.directory, lead)
+      project.assets.harmonies = path.relative(project.directory, harmonies)
+      await saveProjectAssets(project)
+      sendTaskProgress('harmony', '提取主唱并剥离和声', 'success', '主唱已作为音高与歌词对齐输入；和声已单独保留', 1)
+      return {
+        lead: { name: path.basename(lead), path: lead, data: await readFile(lead) },
+        harmonies: { name: path.basename(harmonies), path: harmonies, data: await readFile(harmonies) },
+        modelId: selectedModel.id, modelLabel: selectedModel.label,
+      }
+    } catch (error) {
+      if (isTaskCancelled(error)) {
+        await fs.promises.rm(workDir, { recursive: true, force: true })
+        sendTaskProgress('harmony', '提取主唱并剥离和声', 'cancelled', '已取消运行')
+      } else sendTaskProgress('harmony', '提取主唱并剥离和声', 'error', error instanceof Error ? error.message : String(error))
+      throw error
+    }
   })
 
   ipcMain.handle('pitchord:analyze-pitch', async (event, algorithm = 'pyin', selectedVocals) => {
@@ -1762,6 +1919,7 @@ app.whenReady().then(async () => {
     const accompaniment = path.resolve(result.accompaniment)
     if (!vocals.startsWith(analysisDirectory + path.sep) || !accompaniment.startsWith(analysisDirectory + path.sep) || !fs.existsSync(vocals) || !fs.existsSync(accompaniment)) throw new Error('这个分离结果文件已经不存在。')
     project.assets.vocals = path.relative(project.directory, vocals)
+    delete project.assets.harmonies
     project.assets.accompaniment = path.relative(project.directory, accompaniment)
     await saveProjectAssets(project)
     return true
@@ -1773,7 +1931,11 @@ app.whenReady().then(async () => {
     const analysisDirectory = path.resolve(project.directory, 'analysis')
     const vocals = path.resolve(result.vocals)
     if (!vocals.startsWith(analysisDirectory + path.sep) || !fs.existsSync(vocals)) throw new Error('这个纯人声结果文件已经不存在。')
+    const harmonies = result.harmonies ? path.resolve(result.harmonies) : null
+    if (harmonies && (!harmonies.startsWith(analysisDirectory + path.sep) || !fs.existsSync(harmonies))) throw new Error('这个和声结果文件已经不存在。')
     project.assets.vocals = path.relative(project.directory, vocals)
+    if (harmonies) project.assets.harmonies = path.relative(project.directory, harmonies)
+    else delete project.assets.harmonies
     await saveProjectAssets(project)
     return true
   })

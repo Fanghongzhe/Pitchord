@@ -25,6 +25,10 @@ The complete portable bundle contains the pinned Python packages listed in `scri
 
 Pitchord includes an inference-only copy of MSST model and utility modules. Imports used only by training and spectrogram drawing are optional in this copy; the upstream license is included at `vendor/msst/LICENSE`.
 
+## Optional lead/backing vocal model
+
+Pitchord can download the BS-RoFormer Karaoke checkpoint and matching YAML from [becruily/bs-roformer-karaoke](https://huggingface.co/becruily/bs-roformer-karaoke) on demand. The model files are not bundled with Pitchord. Downloads are pinned to revision `f7849ae934209184dc288d1018cd8a76a7fc8b3c` and verified by SHA-256 before use. The checkpoint repository does not currently provide a model card or explicit license metadata; verify your rights before redistributing the weights. This optional model is used after the first vocal/instrumental split; its residual output is stored separately as a backing-vocal review track, not silently mixed into the accompaniment.
+
 The lyric timestamp matcher was independently implemented from the alignment approach documented by ComfyUI Audio SRT Aligner (MIT): https://github.com/ahkimkoo/ComfyUI-Audio-Srt-Aligner. Pitchord uses faster-whisper timestamps, monotonic text matching, and duration-aware estimates for missing lyric lines and units. When an LRC provides approximate timestamps, Pitchord uses them as weak temporal weights to disambiguate repeated text. Very long references use unique-token anchors and sequence matching between anchors.
 
 Pitchord uses `librosa.pyin` for the pYIN option. The optional RMVPE entry is a capability placeholder only; no RMVPE implementation or model weights are currently distributed.

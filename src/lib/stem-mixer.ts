@@ -1,12 +1,12 @@
-export type StemKind = 'original' | 'vocals' | 'accompaniment'
+export type StemKind = 'original' | 'vocals' | 'harmonies' | 'accompaniment'
 type BufferStemKind = Exclude<StemKind, 'original'>
 
 /** Decoded stems share one audio clock. The media element remains the video and seek clock. */
 export class StemMixer {
   private readonly context = new AudioContext({ latencyHint: 'interactive' })
   private readonly gains: Record<StemKind, GainNode>
-  private readonly buffers: Record<BufferStemKind, AudioBuffer | null> = { vocals: null, accompaniment: null }
-  private readonly sources: Record<BufferStemKind, AudioBufferSourceNode | null> = { vocals: null, accompaniment: null }
+  private readonly buffers: Record<BufferStemKind, AudioBuffer | null> = { vocals: null, harmonies: null, accompaniment: null }
+  private readonly sources: Record<BufferStemKind, AudioBufferSourceNode | null> = { vocals: null, harmonies: null, accompaniment: null }
   private readonly mediaNodes = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>()
   private attachedMediaNode: MediaElementAudioSourceNode | null = null
   private media: HTMLMediaElement | null = null
@@ -19,14 +19,17 @@ export class StemMixer {
   constructor() {
     const original = this.context.createGain()
     const vocals = this.context.createGain()
+    const harmonies = this.context.createGain()
     const accompaniment = this.context.createGain()
     original.gain.value = 1
     vocals.gain.value = 0
+    harmonies.gain.value = 0
     accompaniment.gain.value = 0
     original.connect(this.context.destination)
     vocals.connect(this.context.destination)
+    harmonies.connect(this.context.destination)
     accompaniment.connect(this.context.destination)
-    this.gains = { original, vocals, accompaniment }
+    this.gains = { original, vocals, harmonies, accompaniment }
   }
 
   attachMedia(media: HTMLMediaElement) {
@@ -52,6 +55,11 @@ export class StemMixer {
 
   has(kind: BufferStemKind) { return !!this.buffers[kind] }
 
+  unload(kind: BufferStemKind) {
+    this.stopTrack(kind)
+    this.buffers[kind] = null
+  }
+
   setGain(kind: StemKind, enabled: boolean, volume: number) {
     const gain = this.gains[kind].gain
     const now = this.context.currentTime
@@ -71,6 +79,7 @@ export class StemMixer {
     this.generation++
     this.running = false
     this.stopTrack('vocals')
+    this.stopTrack('harmonies')
     this.stopTrack('accompaniment')
   }
 
@@ -80,6 +89,7 @@ export class StemMixer {
     this.attachedMediaNode = null
     this.media = null
     this.buffers.vocals = null
+    this.buffers.harmonies = null
     this.buffers.accompaniment = null
   }
 
@@ -96,7 +106,7 @@ export class StemMixer {
     const drift = media.currentTime - this.estimatedPosition
     if (Math.abs(drift) > 0.75) { this.startAll(media); return }
     this.effectiveRate = media.playbackRate * (1 + Math.max(-0.01, Math.min(0.01, drift * 0.08)))
-    for (const kind of ['vocals', 'accompaniment'] as const) {
+    for (const kind of ['vocals', 'harmonies', 'accompaniment'] as const) {
       this.sources[kind]?.playbackRate.setTargetAtTime(this.effectiveRate, now, 0.05)
     }
   }
@@ -107,6 +117,7 @@ export class StemMixer {
 
   private startAll(media: HTMLMediaElement) {
     this.stopTrack('vocals')
+    this.stopTrack('harmonies')
     this.stopTrack('accompaniment')
     this.media = media
     this.running = true
@@ -114,6 +125,7 @@ export class StemMixer {
     this.lastContextTime = this.context.currentTime
     this.effectiveRate = media.playbackRate
     this.startTrack('vocals', media.currentTime, media.playbackRate)
+    this.startTrack('harmonies', media.currentTime, media.playbackRate)
     this.startTrack('accompaniment', media.currentTime, media.playbackRate)
   }
 
