@@ -5,6 +5,10 @@
     "version": "3.12.14+20260901",
     "archive": "cpython-3.12.14+20260901-x86_64-pc-windows-msvc-install_only.tar.gz",
     "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz",
+    "mirrors": [
+      { "label": "阿里云开源镜像", "url": "https://mirrors.aliyun.com/github/releases/astral-sh/python-build-standalone/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz" },
+      { "label": "南京大学开源镜像", "url": "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only.tar.gz" }
+    ],
     "sha256": "e90c1b6419da3bd812dd73bb3de40287a21abf153438147639ec5e20375ea93f",
     "size": 46184075
   },

@@ -5,7 +5,7 @@ import path from 'node:path'
 import packageJson from '../package.json' with { type: 'json' }
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
-const output = path.join(projectRoot, 'release-desktop-bundle')
+const output = path.join(projectRoot, `release-desktop-v${packageJson.version}`)
 const unpacked = path.join(output, 'win-unpacked')
 const bundleRoot = path.join(output, 'Pitchord')
 const archive = path.join(output, `Pitchord-${packageJson.version}-windows-x64.zip`)

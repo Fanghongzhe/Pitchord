@@ -4,6 +4,6 @@ const packageJson = require('../package.json')
 module.exports = {
   ...packageJson.build,
   electronDist: path.join(__dirname, '..', 'node_modules', 'electron', 'dist'),
-  directories: { ...packageJson.build.directories, output: 'release-desktop-bundle' },
+  directories: { ...packageJson.build.directories, output: `release-desktop-v${packageJson.version}` },
   win: { ...packageJson.build.win, target: ['dir'] },
 }

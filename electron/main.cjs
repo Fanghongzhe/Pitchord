@@ -7,6 +7,7 @@ const { pathToFileURL } = require('node:url')
 const { createHash } = require('node:crypto')
 const { resolvePitchInput } = require('./pitch-input.cjs')
 const { findGeneratedStem } = require('./harmony-stems.cjs')
+const { orderedDownloadSources, downloadFromSources } = require('./download-sources.cjs')
 
 let ffmpegPath = null
 try { ffmpegPath = require('ffmpeg-static') } catch { ffmpegPath = null }
@@ -701,18 +702,30 @@ async function findBootstrapPython() {
   return null
 }
 
-async function downloadVerifiedFile(url, destination, expectedHash, expectedSize, onProgress, label = '内置 Python') {
-  for (let attempt = 0; attempt < 5; attempt++) {
+async function downloadVerifiedFile(url, destination, expectedHash, expectedSize, onProgress, label = '内置 Python', maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try { return await downloadVerifiedFileAttempt(url, destination, expectedHash, expectedSize, onProgress, label) }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (attempt === 4 || !/ERR_|ECONN|ETIMEDOUT|fetch failed|network|连接|HTTP (?:429|5\d\d)/i.test(message)) throw error
+      if (attempt === maxAttempts - 1 || !/ERR_|ECONN|ETIMEDOUT|fetch failed|network|连接|超时|abort|HTTP (?:429|5\d\d)/i.test(message)) throw error
       let partialSize = 0
       try { partialSize = (await fs.promises.stat(`${destination}.part`)).size } catch { /* retry from zero */ }
-      onProgress?.(Math.min(1, partialSize / expectedSize), `${label}连接中断，正在从已下载位置重试（${attempt + 1}/4）…`, { downloadedBytes: partialSize, totalBytes: expectedSize, transferState: 'downloading' })
+      onProgress?.(Math.min(1, partialSize / expectedSize), `${label}连接中断，正在从已下载位置重试（${attempt + 1}/${maxAttempts - 1}）…`, { downloadedBytes: partialSize, totalBytes: expectedSize, transferState: 'downloading' })
       await new Promise(resolve => setTimeout(resolve, Math.min(8000, 1000 * 2 ** attempt)))
     }
   }
+}
+
+async function fetchDownloadResponse(url, start, label) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 20000)
+  try {
+    const response = await net.fetch(url, { signal: controller.signal, ...(start ? { headers: { Range: `bytes=${start}-` } } : {}) })
+    return { response, controller }
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`${label}连接超时（20 秒未收到响应）。`)
+    throw error
+  } finally { clearTimeout(timeout) }
 }
 
 async function downloadVerifiedFileAttempt(url, destination, expectedHash, expectedSize, onProgress, label) {
@@ -733,13 +746,13 @@ async function downloadVerifiedFileAttempt(url, destination, expectedHash, expec
     await fs.promises.rm(partial, { force: true })
     existingSize = 0
   }
-  let response = await net.fetch(url, existingSize ? { headers: { Range: `bytes=${existingSize}-` } } : undefined)
+  let { response, controller } = await fetchDownloadResponse(url, existingSize, label)
   if (!response.ok || !response.body) throw new Error(`${label}下载失败（HTTP ${response.status}）。`)
   if (existingSize && response.status !== 206) {
     await response.body.cancel()
     await fs.promises.rm(partial, { force: true })
     existingSize = 0
-    response = await net.fetch(url)
+    ;({ response, controller } = await fetchDownloadResponse(url, 0, label))
     if (!response.ok || !response.body) throw new Error(`${label}下载失败（HTTP ${response.status}）。`)
   }
   const responseSize = Number(response.headers.get('content-length')) || 0
@@ -753,11 +766,18 @@ async function downloadVerifiedFileAttempt(url, destination, expectedHash, expec
   let lastSampleAt = Date.now()
   let lastSampleBytes = received
   let speedBytesPerSecond = 0
+  let idleTimeout
+  const resetIdleTimeout = () => {
+    clearTimeout(idleTimeout)
+    idleTimeout = setTimeout(() => controller.abort(), 30000)
+  }
   try {
     try {
+      resetIdleTimeout()
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        resetIdleTimeout()
         const chunk = Buffer.from(value)
         received += chunk.length
         if (received > expectedSize + 1024) throw new Error(`${label}下载大小异常。`)
@@ -780,9 +800,10 @@ async function downloadVerifiedFileAttempt(url, destination, expectedHash, expec
           else sendAnalysisProgress('base-runtime', message)
         }
       }
-    } finally { await handle.close() }
+    } finally { clearTimeout(idleTimeout); await handle.close() }
   } catch (error) {
     if (received > expectedSize) await fs.promises.rm(partial, { force: true })
+    if (controller.signal.aborted) throw new Error(`${label}等待下载数据超时（30 秒），已保留下载进度。`)
     throw error
   }
   if (received !== expectedSize) {
@@ -805,7 +826,7 @@ async function verifyLocalFile(file, expectedHash, expectedSize) {
   if (hash.digest('hex') !== expectedHash) throw new Error('离线基础运行时校验失败，请重新下载安装包。')
 }
 
-async function ensureBaseRuntime(force = false, onProgress) {
+async function ensureBaseRuntime(force = false, onProgress, preferDomestic = true) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('当前自动下载基础运行时仅支持 Windows 64 位。')
   if (!force && await probePython(basePythonPath())) {
     onProgress?.(1, '内置 Python 已存在，无需重复下载。')
@@ -820,11 +841,19 @@ async function ensureBaseRuntime(force = false, onProgress) {
   await fs.promises.rm(staging, { recursive: true, force: true })
   await fs.promises.rm(baseRuntimeRoot(), { recursive: true, force: true })
   const bundledArchive = path.join(offlineAnalysisRoot(), 'base-runtime', baseRuntime.archive)
+  let selectedSource = { label: '安装包内置文件', url: baseRuntime.url }
   if (fs.existsSync(bundledArchive)) {
     report(0.15, '正在读取完整版内置 Python…')
     await verifyLocalFile(bundledArchive, baseRuntime.sha256, baseRuntime.size)
     await fs.promises.copyFile(bundledArchive, archive)
-  } else await downloadVerifiedFile(baseRuntime.url, archive, baseRuntime.sha256, baseRuntime.size, (progress, message, telemetry) => report(progress * 0.75, message, telemetry))
+  } else {
+    const official = { label: 'GitHub 官方线路', url: baseRuntime.url }
+    const sources = orderedDownloadSources(official, baseRuntime.mirrors || [], preferDomestic)
+    selectedSource = await downloadFromSources(sources, async source => {
+      report(0.02, `正在通过${source.label}准备内置 Python…`, { transferState: 'downloading' })
+      await downloadVerifiedFile(source.url, archive, baseRuntime.sha256, baseRuntime.size, (progress, message, telemetry) => report(progress * 0.75, `${source.label}：${message}`, telemetry))
+    }, (source, reason, next) => report(0.02, `${source.label}未完成（${reason.slice(-120)}），正在切换至${next.label}…`, { transferState: 'downloading' }))
+  }
   report(0.8, '下载校验通过，正在解压内置 Python…', { transferState: 'installing' })
   await mkdir(staging, { recursive: true })
   try {
@@ -836,7 +865,7 @@ async function ensureBaseRuntime(force = false, onProgress) {
     await fs.promises.rename(staging, baseRuntimeRoot())
     await writeFile(path.join(baseRuntimeRoot(), 'pitchord-base-runtime.json'), JSON.stringify({
       version: baseRuntime.version,
-      source: baseRuntime.url,
+      source: selectedSource.url,
       sha256: baseRuntime.sha256,
       sourceProject: 'astral-sh/python-build-standalone',
       sourceLicense: 'MPL-2.0; bundled CPython and components retain their respective licenses',
@@ -954,10 +983,16 @@ async function ensureRecommendedHarmonyModel(modelId, onProgress) {
     try { await verifyLocalFile(destination, file.hash, file.size) }
     catch {
       await fs.promises.rm(destination, { force: true })
-      const url = `https://huggingface.co/${model.repository}/resolve/${model.revision}/${file.name}`
-      await downloadVerifiedFile(url, destination, file.hash, file.size, (progress, message, telemetry) => {
-        onProgress?.((index + progress) / files.length, message, '', telemetry)
-      }, file.label)
+      const sourcePath = `${model.repository}/resolve/${model.revision}/${file.name}`
+      await downloadFromSources([
+        { label: 'HF Mirror 国内线路', url: `https://hf-mirror.com/${sourcePath}` },
+        { label: 'Hugging Face 官方线路', url: `https://huggingface.co/${sourcePath}` },
+      ], async source => {
+        onProgress?.(index / files.length, `正在通过${source.label}下载${file.label}…`, '', { transferState: 'downloading' })
+        await downloadVerifiedFile(source.url, destination, file.hash, file.size, (progress, message, telemetry) => {
+          onProgress?.((index + progress) / files.length, `${source.label}：${message}`, '', telemetry)
+        }, file.label)
+      }, (source, reason, next) => onProgress?.(index / files.length, `${source.label}未完成，正在切换至${next.label}…`, reason.slice(-240), { transferState: 'downloading' }))
     }
     onProgress?.((index + 1) / files.length, `${file.label}已校验。`)
   }
@@ -1197,7 +1232,7 @@ app.whenReady().then(async () => {
       await requireFreeSpace(requiredBytes, '安装分析环境')
       report('base-runtime', 0.01, `已选择${packageSource.label}，将一次准备 ${plan.length} 项完整能力。`)
       let python
-      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message, telemetry) => report('base-runtime', progress * 0.8, message, '', telemetry))
+      if (process.platform === 'win32' && process.arch === 'x64') python = await ensureBaseRuntime(false, (progress, message, telemetry) => report('base-runtime', progress * 0.8, message, '', telemetry), packageSource.id === 'domestic')
       else python = (await findBootstrapPython())?.executable
       if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
@@ -1353,9 +1388,8 @@ app.whenReady().then(async () => {
     try { return await analysisInstallTask }
     catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error)
-      const message = isTaskCancelled(error) ? '环境准备已取消' : /downloading|connection|timed?\s*out|network|reset|remote host/i.test(rawMessage) ? '依赖下载中断。已完成的文件会保留，请检查网络后点击“下载并准备环境”重试。' : rawMessage
+      const message = isTaskCancelled(error) ? '环境准备已取消' : rawMessage
       sendTaskProgress('environment', '准备完整分析环境', isTaskCancelled(error) ? 'cancelled' : 'error', message)
-      if (!isTaskCancelled(error) && message !== rawMessage) throw new Error(message)
       throw error
     } finally { analysisInstallTask = null }
   })
