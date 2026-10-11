@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSegment, retimeSegment } from './lyrics'
-import { generatePitchAss, sentenceSrt, subtitleFrameAt, wordTimedSubtitles } from './subtitles'
+import { defaultSubtitleStyle, generatePitchAss, sentenceSrt, subtitleFrameAt, subtitleUnitCenterX, wordTimedSubtitles } from './subtitles'
 
 describe('word timed subtitle export', () => {
   it('keeps the edited timing for every lyric unit', () => {
@@ -21,7 +21,7 @@ describe('word timed subtitle export', () => {
       { time: 1.7, hz: 493.88, confidence: 0.9, rms: 0.2, voiced: true },
     ])
     expect(output).toContain('A4')
-    expect(output).toContain('・')
+    expect(output).toContain('\\p1')
     expect(output).toContain('Dialogue: 0,0:00:01.00')
     expect(output).toMatch(/\\c&H[0-9A-F]{8}&/)
   })
@@ -38,6 +38,54 @@ describe('word timed subtitle export', () => {
     expect(output).not.toContain('Dialogue: 1,0:00:00.50,0:00:01.25,Dot')
   })
 
+  it('starts future glyphs in the base color and holds each sung glyph at its final pitch', () => {
+    const segment = createSegment('你好', 0, 2)
+    segment.chars[0].pitchOverride = { motion: 'glide', notes: [
+      { note: 'C4', start: 0, end: 0.5 },
+      { note: 'C5', start: 0.5, end: 1 },
+    ] }
+    segment.chars[1].pitchOverride = { motion: 'flat', notes: [{ note: 'A4', start: 0, end: 1 }] }
+    const before = subtitleFrameAt([segment], [], 0.2)!
+    const after = subtitleFrameAt([segment], [], 1.2)!
+    expect(before.colors[1]).toBe(defaultSubtitleStyle.baseColor)
+    expect(after.colors[0]).toBe(subtitleFrameAt([segment], [], 0.9)!.colors[0])
+    expect(after.colors[0]).not.toBe(before.colors[0])
+    const ass = generatePitchAss([segment], [])
+    const firstMain = ass.split('\n').find(line => line.startsWith('Dialogue: 0,'))!
+    expect(firstMain).toContain(`{\\c&H00FCFAF8&}好`)
+  })
+
+  it('tracks the measured F0 color within a sung character and holds its final sample afterward', () => {
+    const segment = createSegment('唱你', 0, 2)
+    const points = [
+      { time: 0.1, hz: 220, confidence: 1, rms: 0.2, voiced: true },
+      { time: 0.5, hz: 440, confidence: 1, rms: 0.2, voiced: true },
+      { time: 0.9, hz: 660, confidence: 1, rms: 0.2, voiced: true },
+    ]
+    const beforeVoice = subtitleFrameAt([segment], points, 0.05)!
+    const early = subtitleFrameAt([segment], points, 0.2)!
+    const late = subtitleFrameAt([segment], points, 0.95)!
+    const after = subtitleFrameAt([segment], points, 1.2)!
+    expect(beforeVoice.colors[0]).toBe(defaultSubtitleStyle.baseColor)
+    expect(beforeVoice.currentLabel).toBe('')
+    expect(early.colors[0]).not.toBe(late.colors[0])
+    expect(early.currentLabel).toBe('A3')
+    expect(late.currentLabel).toBe('E5')
+    expect(after.colors[0]).toBe(late.colors[0])
+    expect(after.colors[1]).toBe(defaultSubtitleStyle.baseColor)
+    expect(generatePitchAss([segment], points).match(/,Main,/g)?.length).toBeGreaterThan(3)
+  })
+
+  it('positions labels using actual lyric offsets, including spaces and wider Latin units', () => {
+    const spaced = createSegment('你 A 好', 0, 3)
+    const compact = createSegment('你A好', 0, 3)
+    const spacedX = subtitleUnitCenterX(spaced, 2, defaultSubtitleStyle, null)
+    const compactX = subtitleUnitCenterX(compact, 2, defaultSubtitleStyle, null)
+    expect(spacedX).toBeGreaterThan(compactX)
+    const ass = generatePitchAss([spaced], [], { horizontalPosition: 'left' })
+    expect(ass).not.toContain('・')
+  })
+
   it('colors glyphs by pitch and shows the emphasis dot only under the active character', () => {
     const segment = createSegment('你好', 0, 2)
     segment.chars[0].pitchOverride = { motion: 'glide', notes: [
@@ -52,7 +100,7 @@ describe('word timed subtitle export', () => {
     expect(late.dotColor).toBe('#00ff00')
     const ass = generatePitchAss([segment], [], style)
     expect(ass).toContain('Style: Dot,Microsoft YaHei,44')
-    expect(ass).toContain('\\c&H0000FF00&}・')
+    expect(ass).toContain('\\c&H0000FF00&}m ')
   })
 
   it('exports the same manually edited pitch sequence and durations to JSON and ASS', () => {

@@ -83,23 +83,23 @@ export function LiveSubtitlePreview({ segments, points, style, mediaRef, playhea
   const horizontal = style.horizontalPosition === 'left' ? 'flex-start' : style.horizontalPosition === 'right' ? 'flex-end' : 'center'
   const vertical = style.verticalPosition === 'top' ? 'flex-start' : style.verticalPosition === 'middle' ? 'center' : 'flex-end'
   const textStroke = style.backgroundStyle === 'outline' ? `${Math.max(0, style.outline * scale)}px ${style.outlineColor}` : undefined
-  const dotSize = Math.max(8, style.dotSize * scale)
+  const dotDiameter = Math.max(3, style.dotSize * scale / 4)
 
   return <div ref={containerRef} className="pointer-events-none absolute inset-0 overflow-hidden" aria-label="实时字幕与音高预览">
     {frame && <div className="absolute inset-0 flex" style={{ alignItems: vertical, justifyContent: horizontal, padding: `${Math.max(6, style.marginBottom * scale)}px ${Math.max(8, style.marginHorizontal * scale)}px` }}>
-      <div className="relative max-w-full whitespace-pre-wrap text-center leading-[1.35]" style={{
+      <div className="relative max-w-full whitespace-pre-wrap text-center" style={{
         color: style.baseColor, fontFamily: style.fontName, fontSize: Math.max(13, style.fontSize * scale),
         fontWeight: style.bold ? 700 : 400, fontStyle: style.italic ? 'italic' : 'normal',
-        letterSpacing: style.spacing * scale, WebkitTextStroke: textStroke,
+        letterSpacing: style.spacing * scale, lineHeight: 1, WebkitTextStroke: textStroke,
         backgroundColor: style.backgroundStyle === 'box' ? `${style.backgroundColor}${Math.round(style.backgroundOpacity * 2.55).toString(16).padStart(2, '0')}` : undefined,
         boxShadow: style.shadow ? `0 ${style.shadow * scale}px ${style.shadow * 2 * scale}px #000` : undefined,
       }}>
         {frame.segment.chars.map((char, index) => {
           const gap = frame.segment.text.slice(index ? frame.segment.chars[index - 1].endOffset : 0, char.startOffset)
-          return <span key={char.id}>{gap}<span className="relative inline-block" style={{ color: frame.colors[index] }}>
+          return <span key={char.id}>{gap}<span className="relative inline-block" style={{ color: frame.colors[index], lineHeight: 1 }}>
             {char.text}
-            {style.showDot && frame.activeIndex === index && <span className="absolute left-1/2 -translate-x-1/2 leading-none" style={{ top: `calc(100% + ${style.dotOffset * scale}px)`, color: frame.dotColor, fontSize: dotSize, WebkitTextStroke: '0px' }}>・</span>}
-            {style.showPitch && pitchLabelIndex === index && frame.currentLabel && <span className="absolute bottom-full left-1/2 -translate-x-1/2 whitespace-nowrap leading-none" style={{ color: frame.colors[index], fontSize: Math.max(9, style.fontSize * scale * 0.45), WebkitTextStroke: '0px' }}>{frame.currentLabel}</span>}
+            {style.showDot && frame.activeIndex === index && <span className="absolute left-1/2 -translate-x-1/2 rounded-full" style={{ top: `calc(100% + ${(style.dotOffset - 2) * scale}px)`, backgroundColor: frame.dotColor, width: dotDiameter, height: dotDiameter, WebkitTextStroke: '0px' }} />}
+            {style.showPitch && pitchLabelIndex === index && frame.currentLabel && <span className="absolute left-1/2 -translate-x-1/2 whitespace-nowrap leading-none" style={{ bottom: `calc(100% - ${style.fontSize * scale * 0.18}px)`, color: frame.colors[index], fontSize: Math.max(9, style.fontSize * scale * 0.45), WebkitTextStroke: '0px' }}>{frame.currentLabel}</span>}
           </span></span>
         })}{frame.segment.text.slice(frame.segment.chars.at(-1)?.endOffset ?? 0)}
       </div>

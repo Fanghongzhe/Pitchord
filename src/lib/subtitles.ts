@@ -1,5 +1,5 @@
 import type { LyricSegment } from './lyrics'
-import { noteHz, pitchForChar, pitchNotation, type PitchAnnotation, type PitchPoint } from './pitch'
+import { noteHz, noteName, pitchForChar, pitchNotation, type PitchAnnotation, type PitchPoint } from './pitch'
 
 export type PitchColorBand = 'rainbow' | 'cool' | 'warm' | 'custom'
 export type SubtitleVerticalPosition = 'top' | 'middle' | 'bottom'
@@ -147,6 +147,7 @@ function displayedText(segment: LyricSegment, colors: string[]) {
 }
 
 type TimedNote = { start: number; end: number; hz: number; label: string }
+type TimedPitch = { time: number; hz: number }
 
 function timedNotes(word: LyricSegment['chars'][number], points: PitchPoint[]): TimedNote[] {
   const annotation = pitchForChar(word, points)
@@ -163,6 +164,30 @@ function noteAt(notes: TimedNote[], time: number): TimedNote | null {
   return notes.find(note => time >= note.start && time < note.end) ?? (time < notes[0].start ? notes[0] : notes[notes.length - 1])
 }
 
+function sampledPitch(word: LyricSegment['chars'][number], points: PitchPoint[]): TimedPitch[] {
+  if (word.pitchOverride) return []
+  const voiced = points.filter(point => point.time >= word.start && point.time < word.end && point.voiced && point.hz > 0)
+  const sampled: TimedPitch[] = []
+  for (const point of voiced) {
+    if (!sampled.length || point.time - sampled[sampled.length - 1].time >= 0.08) sampled.push({ time: point.time, hz: point.hz })
+  }
+  const last = voiced.at(-1)
+  if (last && sampled.at(-1)?.time !== last.time) sampled.push({ time: last.time, hz: last.hz })
+  return sampled
+}
+
+function pitchAt(samples: TimedPitch[], time: number): TimedPitch | null {
+  if (!samples.length || time < samples[0].time) return null
+  let low = 0
+  let high = samples.length
+  while (low < high) {
+    const middle = (low + high) >> 1
+    if (samples[middle].time <= time) low = middle + 1
+    else high = middle
+  }
+  return samples[Math.max(0, low - 1)]
+}
+
 export type SubtitleFrame = {
   segment: LyricSegment
   activeIndex: number
@@ -173,15 +198,20 @@ export type SubtitleFrame = {
   dotColor: string
 }
 
-export type PreparedSubtitleSegment = { segment: LyricSegment; notes: TimedNote[][] }
+export type PreparedSubtitleSegment = { segment: LyricSegment; notes: TimedNote[][]; samples: TimedPitch[][] }
 
 export function prepareSubtitleTimeline(segments: LyricSegment[], points: PitchPoint[]): PreparedSubtitleSegment[] {
-  return segments.map(segment => ({ segment, notes: segment.chars.map(char => timedNotes(char, points)) }))
+  return segments.map(segment => ({ segment, notes: segment.chars.map(char => timedNotes(char, points)), samples: segment.chars.map(char => sampledPitch(char, points)) }))
 }
 
-function frameForSegment(segment: LyricSegment, time: number, style: SubtitleStyle, notes: TimedNote[][]): SubtitleFrame {
+function frameForSegment(segment: LyricSegment, time: number, style: SubtitleStyle, notes: TimedNote[][], samples: TimedPitch[][]): SubtitleFrame {
   const activeIndex = segment.chars.findIndex(char => time >= char.start && time < char.end)
-  const colors = notes.map(items => {
+  const colors = notes.map((items, index) => {
+    if (time < segment.chars[index].start) return style.baseColor
+    if (samples[index].length) {
+      const sample = pitchAt(samples[index], time)
+      return sample ? pitchColor(sample.hz, style) : style.baseColor
+    }
     const note = noteAt(items, time)
     return note?.hz ? pitchColor(note.hz, style) : style.baseColor
   })
@@ -189,10 +219,12 @@ function frameForSegment(segment: LyricSegment, time: number, style: SubtitleSty
   const currentNote = activeIndex >= 0 ? noteAt(notes[activeIndex], time) : null
   const previousIndex = segment.chars.findLastIndex(char => char.end <= time)
   const heldNote = currentNote ?? (previousIndex >= 0 ? noteAt(notes[previousIndex], time) : null)
+  const heldSample = activeIndex >= 0 ? pitchAt(samples[activeIndex], time) : previousIndex >= 0 ? pitchAt(samples[previousIndex], time) : null
+  const waitingForVoice = activeIndex >= 0 && samples[activeIndex].length > 0 && !heldSample
   return {
     segment, activeIndex, colors,
-    currentHz: heldNote?.hz || null,
-    currentLabel: heldNote?.label ?? '',
+    currentHz: waitingForVoice ? null : heldSample?.hz ?? heldNote?.hz ?? null,
+    currentLabel: waitingForVoice ? '' : heldSample ? noteName(heldSample.hz) : heldNote?.label ?? '',
     progress: activeChar ? clamp01((time - activeChar.start) / Math.max(0.001, activeChar.end - activeChar.start)) : 0,
     dotColor: style.dotColorMode === 'custom' ? style.dotColor : activeIndex >= 0 ? colors[activeIndex] : style.baseColor,
   }
@@ -202,24 +234,38 @@ export function subtitleFrameFromTimeline(prepared: PreparedSubtitleSegment[], t
   const style = { ...defaultSubtitleStyle, ...partialStyle }
   const item = prepared.find(({ segment }) => time >= segment.start && time < segment.end)
   if (!item || !item.segment.chars.length) return null
-  return frameForSegment(item.segment, time, style, item.notes)
+  return frameForSegment(item.segment, time, style, item.notes, item.samples)
 }
 
 export function subtitleFrameAt(segments: LyricSegment[], points: PitchPoint[], time: number, partialStyle: Partial<SubtitleStyle> = {}): SubtitleFrame | null {
   return subtitleFrameFromTimeline(prepareSubtitleTimeline(segments, points), time, partialStyle)
 }
 
-function activeX(segment: LyricSegment, charIndex: number, style: SubtitleStyle) {
-  const before = segment.chars.slice(0, charIndex).reduce((sum, item) => sum + Array.from(item.text).length, 0)
-  const current = Math.max(1, Array.from(segment.chars[charIndex].text).length)
-  const total = Math.max(1, segment.chars.reduce((sum, item) => sum + Array.from(item.text).length, 0))
-  const estimatedWidth = Math.min(style.width * 0.86, total * style.fontSize)
+function textWidth(text: string, style: SubtitleStyle, context: CanvasRenderingContext2D | null) {
+  const glyphWidth = context
+    ? context.measureText(text).width
+    : Array.from(text).reduce((sum, glyph) => sum + style.fontSize * (/\s/u.test(glyph) ? 0.33 : (glyph.codePointAt(0) ?? 0) < 128 ? 0.6 : 1), 0)
+  return glyphWidth + Math.max(0, Array.from(text).length - 1) * style.spacing
+}
+
+function measurementContext(style: SubtitleStyle): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null
+  const context = document.createElement('canvas').getContext('2d')
+  if (context) context.font = `${style.italic ? 'italic ' : ''}${style.bold ? '700' : '400'} ${style.fontSize}px ${JSON.stringify(style.fontName)}`
+  return context
+}
+
+export function subtitleUnitCenterX(segment: LyricSegment, charIndex: number, style: SubtitleStyle, context: CanvasRenderingContext2D | null = measurementContext(style)) {
+  const char = segment.chars[charIndex]
+  const prefix = segment.text.slice(0, char.startOffset)
+  const through = segment.text.slice(0, char.endOffset)
+  const totalWidth = textWidth(segment.text, style, context)
   const lineLeft = style.horizontalPosition === 'left'
     ? style.marginHorizontal
     : style.horizontalPosition === 'right'
-      ? style.width - style.marginHorizontal - estimatedWidth
-      : style.width / 2 - estimatedWidth / 2
-  return Math.round(lineLeft + estimatedWidth * (before + current / 2) / total)
+      ? style.width - style.marginHorizontal - totalWidth
+      : style.width / 2 - totalWidth / 2
+  return Math.round(lineLeft + (textWidth(prefix, style, context) + textWidth(through, style, context)) / 2)
 }
 
 function alignment(style: SubtitleStyle) {
@@ -228,10 +274,21 @@ function alignment(style: SubtitleStyle) {
   return horizontal + vertical
 }
 
-function lineY(style: SubtitleStyle) {
-  if (style.verticalPosition === 'top') return style.marginBottom + style.fontSize
-  if (style.verticalPosition === 'middle') return Math.round(style.height / 2)
-  return style.height - style.marginBottom
+function lineBounds(style: SubtitleStyle) {
+  const top = style.verticalPosition === 'top'
+    ? style.marginBottom
+    : style.verticalPosition === 'middle'
+      ? (style.height - style.fontSize) / 2
+      : style.height - style.marginBottom - style.fontSize
+  return { top: Math.round(top), bottom: Math.round(top + style.fontSize) }
+}
+
+function dotDrawing(size: number) {
+  const diameter = Math.max(3, Math.round(size / 4))
+  const radius = diameter / 2
+  const tangent = radius * 0.55228475
+  const n = (value: number) => Math.round(value * 10) / 10
+  return `m ${n(radius)} 0 b ${n(radius + tangent)} 0 ${diameter} ${n(radius - tangent)} ${diameter} ${n(radius)} b ${diameter} ${n(radius + tangent)} ${n(radius + tangent)} ${diameter} ${n(radius)} ${diameter} b ${n(radius - tangent)} ${diameter} 0 ${n(radius + tangent)} 0 ${n(radius)} b 0 ${n(radius - tangent)} ${n(radius - tangent)} 0 ${n(radius)} 0`
 }
 
 function backgroundAlpha(opacity: number) {
@@ -271,19 +328,23 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
   const assAlignment = alignment(style)
   const header = `[Script Info]\nTitle: Pitchord word timed subtitles\nScriptType: v4.00+\nPlayResX: ${style.width}\nPlayResY: ${style.height}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontName},${style.fontSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,${style.spacing},0,${borderStyle},${mainOutline},${mainShadow},${assAlignment},${style.marginHorizontal},${style.marginHorizontal},${style.marginBottom},1\nStyle: Pitch,${style.fontName},${Math.round(style.fontSize * 0.45)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,2,10,10,10,1\nStyle: Dot,${style.fontName},${style.dotSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},0,0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,8,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   const events: string[] = []
+  const context = measurementContext(style)
+  const bounds = lineBounds(style)
   for (const segment of segments) {
     if (!segment.chars.length) continue
     const notes = segment.chars.map(char => timedNotes(char, points))
+    const samples = segment.chars.map(char => sampledPitch(char, points))
     const boundaries = [...new Set([
       segment.start, segment.end,
       ...segment.chars.flatMap(char => [char.start, char.end]),
       ...notes.flatMap(items => items.flatMap(item => [item.start, item.end])),
+      ...samples.flatMap(items => items.map(item => item.time)),
     ])].filter(time => time >= segment.start && time <= segment.end).sort((a, b) => a - b)
     for (let index = 0; index < boundaries.length - 1; index++) {
       const from = boundaries[index]
       const to = boundaries[index + 1]
       if (to - from < 0.005) continue
-      const frame = frameForSegment(segment, (from + to) / 2, style, notes)
+      const frame = frameForSegment(segment, (from + to) / 2, style, notes, samples)
       const start = assTime(from)
       const end = assTime(to)
       const fadeMs = Math.min(style.fadeMs, Math.max(0, Math.round((to - from) * 400)))
@@ -292,11 +353,14 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
       events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${edgeFade}${displayedText(segment, frame.colors)}`)
       const labelIndex = frame.activeIndex >= 0 ? frame.activeIndex : segment.chars.findLastIndex(char => char.end <= from)
       if (labelIndex < 0) continue
-      const x = activeX(segment, labelIndex, style)
-      const y = lineY(style)
+      const x = subtitleUnitCenterX(segment, labelIndex, style, context)
       const activeColor = frame.colors[labelIndex]
-      if (style.showPitch && frame.currentLabel) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${y - style.fontSize - 16})\\c${assColor(activeColor)}&}${escapeAss(frame.currentLabel)}`)
-      if (frame.activeIndex >= 0 && style.showDot) events.push(`Dialogue: 1,${start},${end},Dot,,0,0,0,,{\\pos(${x},${y + Math.round(style.fontSize * 0.72) + style.dotOffset})\\c${assColor(frame.dotColor)}&}・`)
+      if (style.showPitch && frame.currentLabel) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${bounds.top + Math.round(style.fontSize * 0.18)})\\c${assColor(activeColor)}&}${escapeAss(frame.currentLabel)}`)
+      if (frame.activeIndex >= 0 && style.showDot) {
+        const diameter = Math.max(3, Math.round(style.dotSize / 4))
+        const dotY = bounds.bottom + style.dotOffset + diameter / 2 - 2
+        events.push(`Dialogue: 1,${start},${end},Dot,,0,0,0,,{\\an5\\pos(${x},${dotY})\\p1\\c${assColor(frame.dotColor)}&}${dotDrawing(style.dotSize)}`)
+      }
     }
   }
   return `${header}\n${events.join('\n')}\n`
