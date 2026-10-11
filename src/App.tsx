@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import {
-  Activity, AlertCircle, AudioLines, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download,
+  Activity, AlertCircle, AudioLines, CheckCircle2, CheckSquare2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Download,
   FileAudio2, FilePlus2, FileText, FolderOpen, Grid2X2, HardDrive, Home, List, LoaderCircle, Maximize2, Merge, Pause, Pencil,
-  Play, Plus, Redo2, RotateCcw, RotateCw, Save, Scissors, Search, Settings2, SlidersHorizontal, Square, Trash2, Undo2, Upload, Video,
+  MoreHorizontal, Play, Plus, Redo2, RefreshCw, RotateCcw, RotateCw, Save, Scissors, Search, Settings2, SlidersHorizontal, Square, Trash2, Undo2, Upload, Video,
   Volume2, VolumeX, WandSparkles, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -38,7 +38,7 @@ type SeparationResult = { id: string; modelId: string; modelLabel: string; creat
 type PitchResult = { id: string; algorithm: PitchAlgorithm; label: string; createdAt: string; path?: string; device?: string; points: PitchPoint[]; separationResultId?: string }
 type AlignmentResult = { id: string; modelId: string; modelLabel: string; createdAt: string; inputResultId?: string; path?: string; coverage: number; lowConfidenceLines?: number[]; segments: LyricSegment[] }
 type Draft = { projectName?: string; segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; activeVocalResultId?: string; activeAccompanimentResultId?: string; pitchInputResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string; alignmentInputResultId?: string; alignmentResults?: AlignmentResult[]; activeAlignmentResultId?: string; harmonyEnabled?: boolean; harmonyModelId?: string; subtitleStyle?: Partial<SubtitleStyle> }
-type RecentProject = { name: string; directory: string; updatedAt: string }
+type RecentProject = { name: string; directory: string; updatedAt: string; available?: boolean }
 type TrackKind = 'original' | 'vocals' | 'harmonies' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
 type ContextState = { x: number; y: number; id?: string; time?: number }
@@ -108,7 +108,7 @@ function readDraft(): Draft | null {
 function readRecentProjects(): RecentProject[] {
   try {
     const value = JSON.parse(localStorage.getItem('pitchord.recent-projects.v1') ?? '[]') as RecentProject[]
-    return Array.isArray(value) ? value.filter(item => item && typeof item.name === 'string' && typeof item.directory === 'string').slice(0, 8) : []
+    return Array.isArray(value) ? value.filter(item => item && typeof item.name === 'string' && typeof item.directory === 'string').slice(0, 50) : []
   } catch { return [] }
 }
 
@@ -118,6 +118,13 @@ const installPresets: Record<'minimum' | 'recommended' | 'all', InstallSelection
   minimum: { pitchMethods: ['pyin'], separationModels: ['mdx_extra_q'], harmonyModels: [], alignmentModels: ['base'] },
   recommended: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs'], harmonyModels: [], alignmentModels: ['small'] },
   all: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs', 'htdemucs_ft', 'mdx_extra_q'], harmonyModels: ['bs-roformer-karaoke-frazer'], alignmentModels: ['small', 'base'] },
+}
+
+function readHiddenProjectDirectories(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem('pitchord.hidden-projects.v1') ?? '[]') as unknown
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  } catch { return [] }
 }
 
 const installOptionLabels = {
@@ -285,6 +292,13 @@ export default function App() {
   const [projectNameDraft, setProjectNameDraft] = useState('')
   const [projectSearch, setProjectSearch] = useState('')
   const [projectGridView, setProjectGridView] = useState(true)
+  const [projectSelectionMode, setProjectSelectionMode] = useState(false)
+  const [selectedRecentDirectories, setSelectedRecentDirectories] = useState<string[]>([])
+  const [duplicateSource, setDuplicateSource] = useState<RecentProject | null>(null)
+  const [duplicateName, setDuplicateName] = useState('')
+  const [pendingProjectTrash, setPendingProjectTrash] = useState<RecentProject[]>([])
+  const [projectActionBusy, setProjectActionBusy] = useState(false)
+  const [projectHomeMessage, setProjectHomeMessage] = useState('')
   const [automaticProcessing, setAutomaticProcessing] = useState(false)
   const [splitTimeDraft, setSplitTimeDraft] = useState('')
   const [splitOffset, setSplitOffset] = useState('')
@@ -1725,9 +1739,91 @@ export default function App() {
   }
 
   const rememberProject = (name: string, directory: string) => {
-    const next = [{ name, directory, updatedAt: new Date().toISOString() }, ...recentProjects.filter(item => item.directory !== directory)].slice(0, 8)
-    setRecentProjects(next)
-    localStorage.setItem('pitchord.recent-projects.v1', JSON.stringify(next))
+    localStorage.setItem('pitchord.hidden-projects.v1', JSON.stringify(readHiddenProjectDirectories().filter(item => item !== directory)))
+    setRecentProjects(previous => {
+      const next = [{ name, directory, updatedAt: new Date().toISOString(), available: true }, ...previous.filter(item => item.directory !== directory)].slice(0, 50)
+      localStorage.setItem('pitchord.recent-projects.v1', JSON.stringify(next))
+      return next
+    })
+  }
+
+  const removeRecentProjects = (directories: string[]) => {
+    const removed = new Set(directories)
+    localStorage.setItem('pitchord.hidden-projects.v1', JSON.stringify([...new Set([...readHiddenProjectDirectories(), ...directories])]))
+    setRecentProjects(previous => {
+      const next = previous.filter(item => !removed.has(item.directory))
+      localStorage.setItem('pitchord.recent-projects.v1', JSON.stringify(next))
+      return next
+    })
+    setSelectedRecentDirectories(previous => previous.filter(directory => !removed.has(directory)))
+    setProjectHomeMessage(`已从最近项目移除 ${removed.size} 个工程；磁盘文件未删除。`)
+  }
+
+  const toggleRecentSelection = (directory: string) => {
+    setSelectedRecentDirectories(previous => previous.includes(directory) ? previous.filter(item => item !== directory) : [...previous, directory])
+  }
+
+  const refreshRecentProjects = async () => {
+    if (!window.pitchordDesktop || projectActionBusy) return
+    setProjectActionBusy(true)
+    try {
+      const refreshed = await window.pitchordDesktop.refreshProjects(recentProjects.map(project => project.directory))
+      const previousByDirectory = new Map(recentProjects.map(project => [project.directory, project]))
+      const hidden = new Set(readHiddenProjectDirectories())
+      const next = refreshed.filter(project => !hidden.has(project.directory)).map(project => project.available ? project : { ...project, name: previousByDirectory.get(project.directory)?.name || project.name, updatedAt: previousByDirectory.get(project.directory)?.updatedAt || project.updatedAt })
+      setRecentProjects(next)
+      localStorage.setItem('pitchord.recent-projects.v1', JSON.stringify(next))
+      setSelectedRecentDirectories(previous => previous.filter(directory => next.some(project => project.directory === directory)))
+      setProjectHomeMessage(`已刷新，找到 ${next.filter(project => project.available).length} 个工程${next.some(project => !project.available) ? '；位置已失效的记录仍可从列表移除' : ''}。`)
+    } catch (error) {
+      setProjectHomeMessage(`刷新失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setProjectActionBusy(false) }
+  }
+
+  const beginProjectDuplicate = (project: RecentProject) => {
+    setDuplicateSource(project)
+    setDuplicateName(`${project.name} - 副本`)
+  }
+
+  const confirmProjectDuplicate = async () => {
+    if (!duplicateSource || !window.pitchordDesktop || projectActionBusy) return
+    setProjectActionBusy(true)
+    try {
+      const copy = await window.pitchordDesktop.duplicateProject(duplicateSource.directory, duplicateName.trim())
+      rememberProject(copy.name, copy.directory)
+      setDuplicateSource(null)
+      setProjectHomeMessage(`已复制工程“${copy.name}”，原工程保持不变。`)
+    } catch (error) {
+      setProjectHomeMessage(`复制失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setProjectActionBusy(false) }
+  }
+
+  const revealRecentProject = async (project: RecentProject) => {
+    try { await window.pitchordDesktop?.revealProject(project.directory) }
+    catch (error) { setProjectHomeMessage(`无法定位工程：${error instanceof Error ? error.message : String(error)}`) }
+  }
+
+  const confirmProjectTrash = async () => {
+    if (!pendingProjectTrash.length || !window.pitchordDesktop || projectActionBusy) return
+    setProjectActionBusy(true)
+    try {
+      const result = await window.pitchordDesktop.trashProjects(pendingProjectTrash.map(project => project.directory))
+      if (result.trashed.length) {
+        const removed = new Set(result.trashed)
+        setRecentProjects(previous => {
+          const next = previous.filter(item => !removed.has(item.directory))
+          localStorage.setItem('pitchord.recent-projects.v1', JSON.stringify(next))
+          return next
+        })
+        setSelectedRecentDirectories(previous => previous.filter(directory => !removed.has(directory)))
+      }
+      setProjectHomeMessage(result.failed.length
+        ? `${result.trashed.length} 个工程已移入回收站；${result.failed.length} 个失败：${result.failed.map(item => item.message).join('；')}`
+        : `${result.trashed.length} 个工程已移入系统回收站。`)
+      setPendingProjectTrash([])
+    } catch (error) {
+      setProjectHomeMessage(`删除失败，工程未移入回收站：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setProjectActionBusy(false) }
   }
 
   const closeProjectToHome = async () => {
@@ -2086,6 +2182,7 @@ export default function App() {
   const activeWorkflowIndex = Math.max(0, workflowSteps.findIndex(step => !step.done))
   const remainingWorkflowSteps = workflowSteps.filter(step => !step.done && step.id !== 'import' && (step.id !== 'video' || mediaIsVideo)).length
   const visibleRecentProjects = recentProjects.filter(project => !projectSearch.trim() || project.name.toLowerCase().includes(projectSearch.trim().toLowerCase()))
+  const selectedVisibleProjects = visibleRecentProjects.filter(project => selectedRecentDirectories.includes(project.directory))
 
   return <TooltipProvider delayDuration={250}>
     <div className="min-h-screen bg-background text-foreground">
@@ -2101,19 +2198,37 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <label className="flex h-10 w-64 items-center gap-2 rounded-lg border border-border bg-card px-3 text-muted-foreground"><Search className="size-4" /><input value={projectSearch} onChange={event => setProjectSearch(event.target.value)} placeholder="搜索项目…" className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none" /></label>
+            <label className="flex h-10 w-64 items-center gap-2 rounded-lg border border-border bg-card px-3 text-muted-foreground"><Search className="size-4" /><input value={projectSearch} onChange={event => { setProjectSearch(event.target.value); setSelectedRecentDirectories([]) }} placeholder="搜索项目…" className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none" /></label>
             <Button className="h-10 bg-foreground px-5 text-background hover:bg-foreground/85" onClick={() => void showNewProject()}><Plus />新建项目</Button>
             <DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" aria-label="设置"><Settings2 /></Button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onSelect={() => window.setTimeout(() => setModelManagerOpen(true), 0)}>模型管理</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(openEnvironmentSetup, 0)}>分析环境</DropdownMenuItem><DropdownMenuItem onSelect={() => window.setTimeout(() => void openStorageManager(), 0)}>存储与环境</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           </div>
         </header>
         <section className="p-7">
-          <div className="mb-6 flex items-center gap-5 text-xs text-muted-foreground"><span>项目</span><span>最近修改 ↓</span></div>
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+            <div><h1 className="text-sm font-semibold">项目</h1><p className="mt-1 text-xs text-muted-foreground">最近打开的工程与默认工程目录 · {recentProjects.filter(project => project.available !== false).length} 个</p></div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => void refreshRecentProjects()} disabled={projectActionBusy || !window.pitchordDesktop}><RefreshCw className={projectActionBusy ? 'animate-spin' : ''} />刷新</Button>
+              <Button size="sm" variant={projectSelectionMode ? 'secondary' : 'outline'} onClick={() => { setProjectSelectionMode(!projectSelectionMode); setSelectedRecentDirectories([]) }} disabled={!visibleRecentProjects.length}><CheckSquare2 />{projectSelectionMode ? '完成选择' : '选择'}</Button>
+            </div>
+          </div>
+          {projectHomeMessage && <p className="mb-4 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm" role="status">{projectHomeMessage}</p>}
+          {projectSelectionMode && <div className="mb-5 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card p-2 text-sm">
+            <Button size="sm" variant="ghost" onClick={() => setSelectedRecentDirectories(selectedVisibleProjects.length === visibleRecentProjects.length ? [] : visibleRecentProjects.map(project => project.directory))}>{selectedVisibleProjects.length === visibleRecentProjects.length ? '取消全选' : '全选当前结果'}</Button>
+            <span className="mr-auto text-xs text-muted-foreground">已选 {selectedVisibleProjects.length} 个</span>
+            <Button size="sm" variant="outline" disabled={selectedVisibleProjects.length !== 1 || selectedVisibleProjects[0]?.available === false} onClick={() => void openProject(selectedVisibleProjects[0].directory)}>打开</Button>
+            <Button size="sm" variant="outline" disabled={selectedVisibleProjects.length !== 1 || selectedVisibleProjects[0]?.available === false || !window.pitchordDesktop} onClick={() => beginProjectDuplicate(selectedVisibleProjects[0])}><Copy />复制</Button>
+            <Button size="sm" variant="outline" disabled={!selectedVisibleProjects.length} onClick={() => removeRecentProjects(selectedVisibleProjects.map(project => project.directory))}>从列表移除</Button>
+            <Button size="sm" variant="destructive" disabled={!selectedVisibleProjects.length || selectedVisibleProjects.some(project => project.available === false) || !window.pitchordDesktop} onClick={() => setPendingProjectTrash(selectedVisibleProjects)}><Trash2 />移入回收站</Button>
+          </div>}
           <div className={projectGridView ? 'grid max-w-6xl grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3' : 'max-w-5xl space-y-3'}>
-            {visibleRecentProjects.map(project => <button key={project.directory} type="button" onClick={() => void openProject(project.directory)} className={projectGridView ? 'project-card group overflow-hidden rounded-xl border border-border bg-card text-left transition hover:border-primary/50' : 'flex w-full items-center gap-4 rounded-xl border border-border bg-card p-3 text-left hover:border-primary/50'}>
-              <div className={projectGridView ? 'relative aspect-video bg-neutral-950' : 'flex h-16 w-28 shrink-0 items-center justify-center rounded-lg bg-neutral-950'}><AudioLines className="size-10 text-white/45" /><span className="absolute bottom-2 right-2 text-[11px] text-white/75">{projectGridView ? 'PITCHORD' : ''}</span></div>
-              <div className={projectGridView ? 'p-4' : 'min-w-0 flex-1'}><p className="truncate font-medium">{project.name}</p><p className="mt-2 truncate text-xs text-muted-foreground">{new Date(project.updatedAt).toLocaleString()}</p></div>
-              {!projectGridView && <ChevronRight className="size-4 text-muted-foreground" />}
-            </button>)}
+            {visibleRecentProjects.map(project => <div key={project.directory} className={projectGridView ? `project-card group relative overflow-hidden rounded-xl border bg-card transition hover:border-primary/50 ${selectedRecentDirectories.includes(project.directory) ? 'border-primary ring-1 ring-primary' : 'border-border'}` : `group flex w-full items-center gap-2 rounded-xl border bg-card p-2 transition hover:border-primary/50 ${selectedRecentDirectories.includes(project.directory) ? 'border-primary ring-1 ring-primary' : 'border-border'}`}>
+              {projectSelectionMode && <button type="button" aria-label={`${selectedRecentDirectories.includes(project.directory) ? '取消选择' : '选择'}${project.name}`} aria-pressed={selectedRecentDirectories.includes(project.directory)} onClick={() => toggleRecentSelection(project.directory)} className={projectGridView ? 'absolute left-3 top-3 z-10 flex size-8 items-center justify-center rounded-md bg-background/90 shadow-sm' : 'flex size-9 shrink-0 items-center justify-center rounded-md hover:bg-muted'}>{selectedRecentDirectories.includes(project.directory) ? <CheckSquare2 className="size-5 text-primary" /> : <Square className="size-5 text-muted-foreground" />}</button>}
+              <button type="button" onClick={() => projectSelectionMode ? toggleRecentSelection(project.directory) : project.available === false ? setProjectHomeMessage('工程位置已失效。请从最近列表移除，或从文件夹重新打开。') : void openProject(project.directory)} className={projectGridView ? 'block w-full text-left' : 'flex min-w-0 flex-1 items-center gap-4 text-left'}>
+                <div className={projectGridView ? 'relative flex aspect-video items-center justify-center bg-neutral-950' : 'flex h-16 w-28 shrink-0 items-center justify-center rounded-lg bg-neutral-950'}><AudioLines className="size-10 text-white/45" />{projectGridView && <span className="absolute bottom-2 right-2 text-[11px] text-white/75">PITCHORD</span>}</div>
+                <div className={projectGridView ? 'p-4 pr-12' : 'min-w-0 flex-1'}><p className="truncate font-medium">{project.name}</p><p className="mt-2 truncate text-xs text-muted-foreground">{project.available === false ? '位置已失效' : project.updatedAt ? new Date(project.updatedAt).toLocaleString() : '尚未记录修改时间'}</p></div>
+              </button>
+              <DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" className={projectGridView ? 'absolute bottom-3 right-3 size-8' : 'size-8 shrink-0'} aria-label={`${project.name}的更多操作`}><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onSelect={() => void openProject(project.directory)} disabled={project.available === false}><FolderOpen />打开工程</DropdownMenuItem><DropdownMenuItem onSelect={() => beginProjectDuplicate(project)} disabled={project.available === false || !window.pitchordDesktop}><Copy />复制工程</DropdownMenuItem><DropdownMenuItem onSelect={() => void revealRecentProject(project)} disabled={project.available === false || !window.pitchordDesktop}><FolderOpen />在文件夹中显示</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => removeRecentProjects([project.directory])}>从最近列表移除</DropdownMenuItem><DropdownMenuItem onSelect={() => setPendingProjectTrash([project])} disabled={project.available === false || !window.pitchordDesktop} className="text-destructive focus:text-destructive"><Trash2 />移入回收站…</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+            </div>)}
             <button type="button" onClick={() => void showNewProject()} className={projectGridView ? 'flex aspect-[16/10] min-h-52 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border bg-card/40 text-muted-foreground transition hover:border-primary/60 hover:text-primary' : 'flex w-full items-center gap-3 rounded-xl border border-dashed border-border bg-card/40 p-5 text-muted-foreground hover:border-primary/60 hover:text-primary'}><span className="flex size-11 items-center justify-center rounded-full border border-current"><Plus className="size-5" /></span><span className="font-medium">新建项目</span></button>
           </div>
           {!visibleRecentProjects.length && projectSearch && <p className="mt-8 text-sm text-muted-foreground">没有匹配的最近项目。</p>}
@@ -2349,6 +2464,10 @@ export default function App() {
 
       <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}><DialogContent><DialogHeader><DialogTitle>新建工程</DialogTitle><DialogDescription>选择名称和存放位置。原媒体、分离结果及歌词标注会保存在同一个工程文件夹中。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">工程名称<Input value={newProjectName} onChange={event => setNewProjectName(event.target.value)} placeholder="例如：歌曲名称" /></label><div className="space-y-2 text-sm"><p>存放位置</p><div className="flex items-center gap-2"><Input value={projectParent} onChange={event => setProjectParent(event.target.value)} className="min-w-0 flex-1" /><Button variant="outline" onClick={async () => { const parent = await window.pitchordDesktop?.pickProjectParent(); if (parent) setProjectParent(parent) }}>选择…</Button></div></div></div><DialogFooter><Button variant="outline" onClick={() => { pendingMediaRef.current = null; setNewProjectOpen(false) }}>取消</Button><Button onClick={() => void createProject()} disabled={!newProjectName.trim() || (window.pitchordDesktop && !projectParent.trim())}>创建工程</Button></DialogFooter></DialogContent></Dialog>
 
+      <Dialog open={!!duplicateSource} onOpenChange={open => { if (!open && !projectActionBusy) setDuplicateSource(null) }}><DialogContent><DialogHeader><DialogTitle>复制工程</DialogTitle><DialogDescription>复制完整工程文件夹，包括媒体、歌词和分析结果。副本与原工程相互独立，保存在原工程旁边。</DialogDescription></DialogHeader><label className="block space-y-2 text-sm">副本名称<Input autoFocus value={duplicateName} onChange={event => setDuplicateName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void confirmProjectDuplicate() }} /></label><p className="break-all text-xs text-muted-foreground">原工程：{duplicateSource?.directory}</p><DialogFooter><Button variant="outline" onClick={() => setDuplicateSource(null)} disabled={projectActionBusy}>取消</Button><Button onClick={() => void confirmProjectDuplicate()} disabled={!duplicateName.trim() || projectActionBusy}>{projectActionBusy ? '正在复制…' : '创建副本'}</Button></DialogFooter></DialogContent></Dialog>
+
+      <Dialog open={pendingProjectTrash.length > 0} onOpenChange={open => { if (!open && !projectActionBusy) setPendingProjectTrash([]) }}><DialogContent><DialogHeader><DialogTitle>将工程移入回收站？</DialogTitle><DialogDescription>这会移动选中的整个工程文件夹，包括原媒体、分析结果和歌词备份。与“从最近列表移除”不同；在清空系统回收站前通常可以恢复。</DialogDescription></DialogHeader><div className="max-h-36 space-y-1 overflow-y-auto rounded-lg border border-border bg-muted/30 p-3 text-sm">{pendingProjectTrash.map(project => <p key={project.directory} className="truncate" title={project.directory}>{project.name}</p>)}</div><DialogFooter><Button variant="outline" onClick={() => setPendingProjectTrash([])} disabled={projectActionBusy}>取消</Button><Button variant="destructive" onClick={() => void confirmProjectTrash()} disabled={projectActionBusy}>{projectActionBusy ? '正在移动…' : `将 ${pendingProjectTrash.length} 个工程移入回收站`}</Button></DialogFooter></DialogContent></Dialog>
+
       <Dialog open={splitOpen} onOpenChange={setSplitOpen}><DialogContent><DialogHeader><DialogTitle>分割当前歌词</DialogTitle><DialogDescription>先用辅助线确定音频分割位置，再选择文字从哪里断开。左右两句会保留各自的媒体时间范围。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">音频分割时间<Input value={splitTimeDraft} onChange={event => setSplitTimeDraft(event.target.value)} className="font-mono" /></label><div className="space-y-2 text-sm"><label>文字分割位置</label><Select value={splitOffset} onValueChange={setSplitOffset}><SelectTrigger><SelectValue placeholder="选择字界" /></SelectTrigger><SelectContent>{splitBoundaries.map(offset => <SelectItem key={offset} value={String(offset)}>{activeLine?.text.slice(0, offset)} ｜ {activeLine?.text.slice(offset)}</SelectItem>)}</SelectContent></Select></div><div className="rounded-md bg-muted p-3 text-xs text-muted-foreground">点击时间轴或按空格暂停可设置辅助线；没有句内辅助线时取句中附近的音量低谷。文字边界优先参考中英文标点和空格，请试听确认。</div></div><DialogFooter><Button variant="outline" onClick={() => setSplitOpen(false)}>取消</Button><Button onClick={confirmSplit}>确认分割</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={conflictOpen} onOpenChange={() => undefined}><DialogContent><DialogHeader><DialogTitle>{charRangeAdjusting ? '单字范围发生冲突' : '句子范围发生冲突'}</DialogTitle><DialogDescription>新的时间范围与相邻{charRangeAdjusting ? '字' : '歌词'}重叠，请选择处理方式后继续。</DialogDescription></DialogHeader><div className="space-y-2 text-sm"><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" onClick={() => resolveConflict('compress')}>1. 压缩两侧时间块并推动后续块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="outline" onClick={() => resolveConflict('push')}>2. 保持其他时间块形状，只推动相邻块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="ghost" onClick={() => resolveConflict('discard')}>3. 放弃本次修改</Button></div></DialogContent></Dialog>
@@ -2376,7 +2495,7 @@ export default function App() {
             <div className="mt-4 border-t border-border pt-3"><p className="mb-2 text-xs font-medium">可选 · 提取主唱、剥离和声（第二阶段）</p><label className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.harmonyModels.includes('bs-roformer-karaoke-frazer')} onChange={() => toggleInstallOption('harmonyModels', 'bs-roformer-karaoke-frazer')} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">BS-RoFormer Karaoke</span><span className="mt-0.5 block text-[11px] text-muted-foreground">先用上方模型分离人声，再提取主唱并保留和声／残留轨。额外下载约 204 MB；“轻量”“推荐”默认不选，“全部”会选中。</span></span></label></div>
             {!installSelectionComplete && <p className="mt-3 text-xs font-medium text-destructive">音高识别、人声分离和歌词对齐必须各保留至少一项。</p>}
           </div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；Whisper 会在 Hugging Face 官方与国内模型线路间实测下载速度，失败时保留进度并切换备用线路。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">自动加速、可复用缓存</p><p className="mt-1 break-all text-xs text-muted-foreground">Python、依赖、模型和缓存只写入：{environmentRootDraft || '请选择目录'}。高速安装工具已随 Windows 版提供，无需单独下载。Python 依赖与 PyTorch 会在官方线路和清华 TUNA / 上海交大 SJTUG 国内线路间自动测速；Whisper 会在 Hugging Face 官方与国内模型线路间实测下载速度，失败时保留进度并切换备用线路。</p></div>
           {environmentProgress && <div className="rounded-xl border border-primary/30 bg-primary/5 p-4" aria-label="完整环境安装进度">
             <div className="flex items-center justify-between gap-3"><div><p className="font-medium">完整环境安装</p><p className="mt-1 text-xs text-muted-foreground">共 {environmentProgress.components.length} 项，关闭窗口后仍会在任务进度中继续。</p></div><span className="font-mono text-lg font-semibold text-primary">{Math.round(environmentProgress.overallProgress * 100)}%</span></div>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${Math.round(environmentProgress.overallProgress * 100)}%` }} /></div>

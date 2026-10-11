@@ -1,7 +1,7 @@
 {
   "name": "pitchord",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.1.0",
   "productName": "Pitchord",
   "description": "本地歌词时间编辑器",
   "author": "Pitchord",
@@ -57,6 +57,13 @@
       {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "vendor/uv",
+        "to": "vendor/uv",
+        "filter": [
+          "uv-0.12.23-py3-none-win_amd64.whl"
+        ]
       }
     ],
     "asar": true,

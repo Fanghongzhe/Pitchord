@@ -69,6 +69,10 @@ declare global {
       pickProjectParent: () => Promise<string | null>
       createProject: (name: string, parent: string) => Promise<{ directory: string; name: string }>
       openProject: (directory?: string) => Promise<{ directory: string; name: string; content: string } | null>
+      refreshProjects: (directories: string[]) => Promise<Array<{ directory: string; name: string; updatedAt: string; available: boolean }>>
+      duplicateProject: (directory: string, name: string) => Promise<{ directory: string; name: string }>
+      revealProject: (directory: string) => Promise<void>
+      trashProjects: (directories: string[]) => Promise<{ trashed: string[]; failed: Array<{ directory: string; message: string }> }>
       saveProject: (content: string) => Promise<string>
       storeLyricsSource: (name: string, content: string) => Promise<string>
       openLyricsFolder: () => Promise<string>

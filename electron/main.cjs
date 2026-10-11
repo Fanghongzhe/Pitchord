@@ -8,6 +8,7 @@ const { createHash } = require('node:crypto')
 const { resolvePitchInput } = require('./pitch-input.cjs')
 const { findGeneratedStem } = require('./harmony-stems.cjs')
 const { orderedDownloadSources, downloadFromSources } = require('./download-sources.cjs')
+const { validatedProjectDirectory, duplicateProject } = require('./project-operations.cjs')
 
 let ffmpegPath = null
 try { ffmpegPath = require('ffmpeg-static') } catch { ffmpegPath = null }
@@ -71,6 +72,7 @@ const pythonExecutable = process.platform === 'win32' ? 'python.exe' : 'python'
 const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings.json')
 const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtime-manifest.json'), 'utf8'))
 const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
+const bootstrapInstaller = runtimeManifest.bootstrapInstaller
 const analysisModel = 'htdemucs'
 const separationModelCatalog = [
   { id: 'htdemucs', label: 'HTDemucs', description: '默认平衡方案，首次使用时按需下载模型。', bundled: false },
@@ -818,12 +820,12 @@ async function downloadVerifiedFileAttempt(url, destination, expectedHash, expec
   await fs.promises.rename(partial, destination)
 }
 
-async function verifyLocalFile(file, expectedHash, expectedSize) {
+async function verifyLocalFile(file, expectedHash, expectedSize, label = '离线基础运行时') {
   const stat = await fs.promises.stat(file)
-  if (stat.size !== expectedSize) throw new Error(`离线基础运行时大小异常：应为 ${expectedSize} 字节，实际为 ${stat.size} 字节。`)
+  if (stat.size !== expectedSize) throw new Error(`${label}大小异常：应为 ${expectedSize} 字节，实际为 ${stat.size} 字节。`)
   const hash = createHash('sha256')
   for await (const chunk of fs.createReadStream(file)) hash.update(chunk)
-  if (hash.digest('hex') !== expectedHash) throw new Error('离线基础运行时校验失败，请重新下载安装包。')
+  if (hash.digest('hex') !== expectedHash) throw new Error(`${label}校验失败，请重新下载安装包。`)
 }
 
 async function ensureBaseRuntime(force = false, onProgress, preferDomestic = true) {
@@ -1266,7 +1268,7 @@ app.whenReady().then(async () => {
         transferPaths: [path.join(analysisRoot(), 'cache', 'uv'), path.join(analysisRoot(), 'cache', 'pip')],
         onTransfer: telemetry => report(currentComponent, reportedComponentProgress.get(currentComponent) || componentStart, componentMessage, '', telemetry),
       })
-      const sourceArguments = source => ['--index-url', source.pypi, ...(source.id === 'domestic' ? ['--extra-index-url', officialPackageSource.pypi] : [])]
+      const sourceArguments = source => ['--index-url', source.pypi]
       const activatePackageSource = source => {
         packageSource = source
         plan = environmentPlan(resolvedProfile, packageSource, installSelection)
@@ -1277,12 +1279,25 @@ app.whenReady().then(async () => {
         try {
           const uvProbe = await runProcess(python, ['-c', "import importlib.util; print('ready' if importlib.util.find_spec('uv') else 'missing')"], { env: analysisEnvironment(python) })
           uvAvailable = uvProbe.stdout.trim().endsWith('ready')
+          const bundledUvWheel = path.join(app.isPackaged ? process.resourcesPath : appRoot, 'vendor', 'uv', bootstrapInstaller.wheel)
+          if (!uvAvailable && process.platform === 'win32' && process.arch === 'x64' && fs.existsSync(bundledUvWheel)) {
+            try {
+              report('base-runtime', 0.86, '正在从安装包准备高速安装工具，无需联网下载…', '', { transferState: 'installing' })
+              await verifyLocalFile(bundledUvWheel, bootstrapInstaller.sha256, bootstrapInstaller.size, '内置高速安装工具')
+              await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--no-deps', bundledUvWheel], processOptions())
+              uvAvailable = true
+            } catch (error) {
+              if (isTaskCancelled(error)) throw error
+              report('base-runtime', 0.9, '安装包内的高速工具不可用，正在尝试在线备用线路…', error instanceof Error ? error.message.slice(-240) : String(error).slice(-240))
+            }
+          }
           if (!uvAvailable) {
             const bootstrapSources = packageSource.id === 'domestic' ? [packageSource, officialPackageSource] : [packageSource]
             let lastBootstrapError
             for (const source of bootstrapSources) {
               try {
-                await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '4', '--timeout', '120', '--only-binary', ':all:', ...sourceArguments(source), 'uv==0.12.23'], processOptions())
+                report('base-runtime', 0.9, `正在从${source.label}准备高速安装工具…`)
+                await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '1', '--timeout', '20', '--only-binary', ':all:', '--no-deps', '--index-url', source.pypi, `uv==${bootstrapInstaller.version}`], processOptions())
                 activatePackageSource(source)
                 uvAvailable = true
                 break
@@ -1649,6 +1664,61 @@ app.whenReady().then(async () => {
     activeProject = { directory, name: value.name || path.basename(directory), assets: value.assets || {} }
     await queueProjectSave(activeProject, () => saveProjectManifest(activeProject, content))
     return { directory, name: activeProject.name, content }
+  })
+
+  const protectedProjectDirectories = () => [applicationDirectory(), projectRoot(), analysisRoot(), app.getPath('home'), app.getPath('documents')]
+
+  ipcMain.handle('pitchord:refresh-projects', async (event, recentDirectories) => {
+    if (event.sender !== mainWindow?.webContents || !Array.isArray(recentDirectories) || recentDirectories.length > 100) throw new Error('最近项目列表无效。')
+    let defaultProjects = []
+    try {
+      const entries = await fs.promises.readdir(projectRoot(), { withFileTypes: true })
+      defaultProjects = entries.filter(entry => entry.isDirectory()).map(entry => path.join(projectRoot(), entry.name))
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    const candidates = [...new Set([...recentDirectories.filter(directory => typeof directory === 'string' && path.isAbsolute(directory)), ...defaultProjects])].slice(0, 100)
+    const projects = await Promise.all(candidates.map(async directory => {
+      try {
+        const project = await validatedProjectDirectory(directory, protectedProjectDirectories())
+        const info = await fs.promises.stat(project.manifest)
+        const name = [project.content.projectName, project.content.name].find(value => typeof value === 'string' && value.trim()) || path.basename(project.directory)
+        return { directory: project.directory, name, updatedAt: info.mtime.toISOString(), available: true }
+      } catch {
+        return recentDirectories.includes(directory) ? { directory, name: path.basename(directory), updatedAt: '', available: false } : null
+      }
+    }))
+    return projects.filter(Boolean).sort((a, b) => Number(b.available) - Number(a.available) || Date.parse(b.updatedAt || '1970-01-01') - Date.parse(a.updatedAt || '1970-01-01')).slice(0, 50)
+  })
+
+  ipcMain.handle('pitchord:duplicate-project', async (event, directory, name) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    return duplicateProject(directory, name, protectedProjectDirectories())
+  })
+
+  ipcMain.handle('pitchord:reveal-project', async (event, directory) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    const project = await validatedProjectDirectory(directory, protectedProjectDirectories())
+    shell.showItemInFolder(project.directory)
+  })
+
+  ipcMain.handle('pitchord:trash-projects', async (event, directories) => {
+    if (event.sender !== mainWindow?.webContents || !Array.isArray(directories) || !directories.length || directories.length > 50 || directories.some(directory => typeof directory !== 'string')) throw new Error('请选择有效的工程。')
+    if (activeAnalysisTasks.size) throw new Error('分析任务仍在运行，请结束任务后再删除工程。')
+    const unique = [...new Set(directories)]
+    const projects = await Promise.all(unique.map(directory => validatedProjectDirectory(directory, protectedProjectDirectories())))
+    const trashed = []
+    const failed = []
+    for (const project of projects) {
+      try {
+        await shell.trashItem(project.directory)
+        if (activeProject?.directory === project.directory) activeProject = null
+        trashed.push(project.directory)
+      } catch (error) {
+        failed.push({ directory: project.directory, message: error instanceof Error ? error.message : String(error) })
+      }
+    }
+    return { trashed, failed }
   })
 
   ipcMain.handle('pitchord:save-project', async (event, content) => {

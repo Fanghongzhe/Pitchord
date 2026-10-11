@@ -13,6 +13,15 @@ The distribution contains CPython and third-party components under their own lic
 
 The complete portable bundle contains the pinned Python packages listed in `scripts/analysis-lock-win-x64.txt` and the htdemucs model cache. Their license metadata and license files remain in the bundled wheels or installed packages.
 
+## uv bootstrap installer
+
+- Project: https://github.com/astral-sh/uv
+- Version: 0.12.23, Windows x86-64 Python wheel
+- License: MIT OR Apache-2.0
+- Wheel SHA-256: `fb8a4117a5224d73abe2204a1e744ae34b544f1b9a0b761576851deaa7215c12`
+
+The uv wheel is included in the portable application so the first installation step does not need to download it. Its license texts and software bill of materials remain inside the wheel at `vendor/uv/uv-0.12.23-py3-none-win_amd64.whl`.
+
 ## Main analysis components
 
 - Demucs 4.1.0: MIT License, https://github.com/adefossez/demucs
