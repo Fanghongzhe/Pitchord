@@ -1,5 +1,6 @@
 # Pitchord
 
+在练习歌曲的过程中，我们通常对每一句歌词的音高很感兴趣，目前在bilibili生产这样音高标注视频的创作者们效率通常不高，这个工具是为了提高他们的效率，借助一定的工具的算法生成一个大概的音高标注版本，并提供较为直观的界面和便捷的操作来让使用者人工检验并修正结果。
 Pitchord 是一款 Windows 本地桌面工具，用来把歌曲音频或视频与参考歌词对齐，校对每个字的时间，并制作随音高变化的动态字幕。自动分析给出初稿；波形、频谱、音高曲线和实时预览帮助你快速找到并修正不准的字界。
 
 **[下载最新正式版](https://github.com/Fanghongzhe/Pitchord/releases/latest)** · [查看所有版本](https://github.com/Fanghongzhe/Pitchord/releases)
