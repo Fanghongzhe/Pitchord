@@ -1,7 +1,19 @@
 import type { LyricSegment } from './lyrics'
 import { noteHz, noteName, pitchForChar, pitchNotation, type PitchAnnotation, type PitchPoint } from './pitch'
 
-export type PitchColorBand = 'rainbow' | 'cool' | 'warm' | 'custom'
+export type PitchColorBand = 'rainbow' | 'cool' | 'warm' | 'custom' | 'ranges'
+export const pitchColorBandNames: Record<PitchColorBand, string> = {
+  rainbow: '音高彩虹', cool: '冷色渐变', warm: '暖色渐变', custom: '双端自定义', ranges: '分段音域',
+}
+export type PitchColorRule = {
+  id: string
+  fromMidi: number
+  toMidi: number
+  includeEnd: boolean
+  mode: 'solid' | 'linear'
+  lowColor: string
+  highColor: string
+}
 export type SubtitleVerticalPosition = 'top' | 'middle' | 'bottom'
 export type SubtitleHorizontalPosition = 'left' | 'center' | 'right'
 export type SubtitleBackgroundStyle = 'outline' | 'box' | 'none'
@@ -29,6 +41,8 @@ export type SubtitleStyle = {
   backgroundOpacity: number
   fadeMs: number
   colorBand: PitchColorBand
+  colorRules?: PitchColorRule[]
+  rangeFallback?: 'base' | 'rainbow' | 'cool' | 'warm'
   showDot: boolean
   showPitch: boolean
   dotSize: number
@@ -60,6 +74,8 @@ export const defaultSubtitleStyle: SubtitleStyle = {
   backgroundOpacity: 65,
   fadeMs: 80,
   colorBand: 'rainbow',
+  colorRules: [],
+  rangeFallback: 'base',
   showDot: true,
   showPitch: true,
   dotSize: 32,
@@ -94,7 +110,15 @@ function interpolateColor(from: string, to: string, amount: number) {
 }
 
 export function pitchColor(hz: number, style: SubtitleStyle) {
-  const normalized = clamp01((69 + 12 * Math.log2(Math.max(65, hz) / 440) - 36) / 48)
+  const midi = 69 + 12 * Math.log2(Math.max(1, hz) / 440)
+  if (style.colorBand === 'ranges') {
+    const note = Math.round(midi)
+    const rule = style.colorRules?.find(item => item.fromMidi < item.toMidi && note >= item.fromMidi && (note < item.toMidi || item.includeEnd && note === item.toMidi))
+    if (rule) return rule.mode === 'solid' ? rule.lowColor : interpolateColor(rule.lowColor, rule.highColor, (midi - rule.fromMidi) / Math.max(1, rule.toMidi - rule.fromMidi))
+    if (!style.rangeFallback || style.rangeFallback === 'base') return style.baseColor
+    return pitchColor(hz, { ...style, colorBand: style.rangeFallback })
+  }
+  const normalized = clamp01((midi - 36) / 48)
   if (style.colorBand === 'custom') return interpolateColor(style.lowColor, style.highColor, normalized)
   if (style.colorBand === 'cool') return interpolateColor('#22D3EE', '#A78BFA', normalized)
   if (style.colorBand === 'warm') return interpolateColor('#FDE047', '#F43F5E', normalized)
@@ -107,6 +131,32 @@ export function pitchColor(hz: number, style: SubtitleStyle) {
   const [r1, g1, b1] = section < 1 ? [chroma, x, 0] : section < 2 ? [x, chroma, 0] : section < 3 ? [0, chroma, x] : [0, x, chroma]
   const match = lightness / 100 - chroma / 2
   return rgbHex((r1 + match) * 255, (g1 + match) * 255, (b1 + match) * 255)
+}
+
+export function detectedPitchRange(points: PitchPoint[]) {
+  const voiced = points.filter(point => point.voiced && point.hz >= 65 && point.hz <= 1100)
+  const trusted = voiced.filter(point => point.confidence >= 0.5)
+  const usable = trusted.length ? trusted : voiced
+  if (!usable.length) return null
+  let minHz = Number.POSITIVE_INFINITY
+  let maxHz = 0
+  for (const point of usable) {
+    minHz = Math.min(minHz, point.hz)
+    maxHz = Math.max(maxHz, point.hz)
+  }
+  return {
+    minHz, maxHz, count: usable.length,
+    minMidi: Math.round(69 + 12 * Math.log2(minHz / 440)),
+    maxMidi: Math.round(69 + 12 * Math.log2(maxHz / 440)),
+  }
+}
+
+export function recommendedPitchColorRules(range: ReturnType<typeof detectedPitchRange> = null): PitchColorRule[] {
+  return [
+    { id: 'cool', fromMidi: Math.min(48, range?.minMidi ?? 48), toMidi: 60, includeEnd: false, mode: 'linear', lowColor: '#22D3EE', highColor: '#A78BFA' },
+    { id: 'gray', fromMidi: 60, toMidi: 64, includeEnd: false, mode: 'solid', lowColor: '#9CA3AF', highColor: '#9CA3AF' },
+    { id: 'warm', fromMidi: 64, toMidi: Math.max(74, range?.maxMidi ?? 74), includeEnd: true, mode: 'linear', lowColor: '#FDE047', highColor: '#F43F5E' },
+  ]
 }
 
 function assColor(hex: string, alpha = '00') {
@@ -132,18 +182,6 @@ function srtTime(seconds: number) {
 
 function escapeAss(text: string) {
   return text.replace(/\\/g, '＼').replace(/{/g, '｛').replace(/}/g, '｝').replace(/\r?\n/g, '\\N')
-}
-
-function displayedText(segment: LyricSegment, colors: string[]) {
-  let cursor = 0
-  let output = ''
-  for (const [index, word] of segment.chars.entries()) {
-    output += escapeAss(segment.text.slice(cursor, word.startOffset))
-    const content = escapeAss(segment.text.slice(word.startOffset, word.endOffset) || word.text)
-    output += `{\\c${assColor(colors[index])}&}${content}{\\r}`
-    cursor = word.endOffset
-  }
-  return output + escapeAss(segment.text.slice(cursor))
 }
 
 type TimedNote = { start: number; end: number; hz: number; label: string }
@@ -268,6 +306,13 @@ export function subtitleUnitCenterX(segment: LyricSegment, charIndex: number, st
   return Math.round(lineLeft + (textWidth(prefix, style, context) + textWidth(through, style, context)) / 2)
 }
 
+function lineCenterX(segment: LyricSegment, style: SubtitleStyle, context: CanvasRenderingContext2D | null) {
+  const width = textWidth(segment.text, style, context)
+  if (style.horizontalPosition === 'left') return style.marginHorizontal + width / 2
+  if (style.horizontalPosition === 'right') return style.width - style.marginHorizontal - width / 2
+  return style.width / 2
+}
+
 function alignment(style: SubtitleStyle) {
   const horizontal = style.horizontalPosition === 'left' ? 1 : style.horizontalPosition === 'right' ? 3 : 2
   const vertical = style.verticalPosition === 'top' ? 6 : style.verticalPosition === 'middle' ? 3 : 0
@@ -281,6 +326,20 @@ function lineBounds(style: SubtitleStyle) {
       ? (style.height - style.fontSize) / 2
       : style.height - style.marginBottom - style.fontSize
   return { top: Math.round(top), bottom: Math.round(top + style.fontSize) }
+}
+
+function lineAnchorY(style: SubtitleStyle) {
+  if (style.verticalPosition === 'top') return style.marginBottom
+  if (style.verticalPosition === 'middle') return style.height / 2
+  return style.height - style.marginBottom
+}
+
+function unitAlignment(style: SubtitleStyle) {
+  return style.verticalPosition === 'top' ? 8 : style.verticalPosition === 'middle' ? 5 : 2
+}
+
+function boxDrawing(width: number, height: number) {
+  return `m 0 0 l ${width} 0 ${width} ${height} 0 ${height}`
 }
 
 function dotDrawing(size: number) {
@@ -319,14 +378,14 @@ export function sentenceSrt(segments: LyricSegment[]) {
 
 export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[], partialStyle: Partial<SubtitleStyle> = {}) {
   const style = { ...defaultSubtitleStyle, ...partialStyle }
-  const borderStyle = style.backgroundStyle === 'box' ? 3 : 1
-  const mainOutline = style.backgroundStyle === 'none' ? 0 : style.backgroundStyle === 'box' ? Math.max(6, style.outline * 2) : style.outline
+  const borderStyle = 1
+  const mainOutline = style.backgroundStyle === 'none' ? 0 : style.outline
   const mainShadow = style.backgroundStyle === 'none' ? 0 : style.shadow
   const backColor = assColor(style.backgroundColor, backgroundAlpha(style.backgroundOpacity))
   const bold = style.bold ? -1 : 0
   const italic = style.italic ? -1 : 0
   const assAlignment = alignment(style)
-  const header = `[Script Info]\nTitle: Pitchord word timed subtitles\nScriptType: v4.00+\nPlayResX: ${style.width}\nPlayResY: ${style.height}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontName},${style.fontSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,${style.spacing},0,${borderStyle},${mainOutline},${mainShadow},${assAlignment},${style.marginHorizontal},${style.marginHorizontal},${style.marginBottom},1\nStyle: Pitch,${style.fontName},${Math.round(style.fontSize * 0.45)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,2,10,10,10,1\nStyle: Dot,${style.fontName},${style.dotSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},0,0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,8,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
+  const header = `[Script Info]\nTitle: Pitchord word timed subtitles\nScriptType: v4.00+\nPlayResX: ${style.width}\nPlayResY: ${style.height}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontName},${style.fontSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,${style.spacing},0,${borderStyle},${mainOutline},${mainShadow},${assAlignment},${style.marginHorizontal},${style.marginHorizontal},${style.marginBottom},1\nStyle: Pitch,${style.fontName},${Math.round(style.fontSize * 0.45)},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},${italic},0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,2,10,10,10,1\nStyle: Dot,${style.fontName},${style.dotSize},${assColor(style.baseColor)},${assColor(style.baseColor)},${assColor(style.outlineColor)},${backColor},${bold},0,0,0,100,100,0,0,1,${Math.max(1, style.outline - 1)},0,8,10,10,10,1\nStyle: Back,${style.fontName},${style.fontSize},${backColor},${backColor},${backColor},${backColor},0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   const events: string[] = []
   const context = measurementContext(style)
   const bounds = lineBounds(style)
@@ -334,6 +393,13 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
     if (!segment.chars.length) continue
     const notes = segment.chars.map(char => timedNotes(char, points))
     const samples = segment.chars.map(char => sampledPitch(char, points))
+    const unitCenters = segment.chars.map((_, index) => subtitleUnitCenterX(segment, index, style, context))
+    const anchorY = lineAnchorY(style)
+    const boxPadding = Math.max(6, style.outline * 2)
+    const boxWidth = Math.round(textWidth(segment.text, style, context) + boxPadding * 2)
+    const boxHeight = Math.round(style.fontSize + boxPadding * 2)
+    const boxX = Math.round(lineCenterX(segment, style, context))
+    const boxY = Math.round((bounds.top + bounds.bottom) / 2)
     const boundaries = [...new Set([
       segment.start, segment.end,
       ...segment.chars.flatMap(char => [char.start, char.end]),
@@ -350,10 +416,17 @@ export function generatePitchAss(segments: LyricSegment[], points: PitchPoint[],
       const fadeMs = Math.min(style.fadeMs, Math.max(0, Math.round((to - from) * 400)))
       const edgeFade = fadeMs > 0 && (index === 0 || index === boundaries.length - 2)
         ? `{\\fad(${index === 0 ? fadeMs : 0},${index === boundaries.length - 2 ? fadeMs : 0})}` : ''
-      events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${edgeFade}${displayedText(segment, frame.colors)}`)
+      if (style.backgroundStyle === 'box') {
+        events.push(`Dialogue: 0,${start},${end},Back,,0,0,0,,${edgeFade}{\\an5\\pos(${boxX},${boxY})\\p1}${boxDrawing(boxWidth, boxHeight)}`)
+      }
+      for (const [charIndex, char] of segment.chars.entries()) {
+        const unitX = unitCenters[charIndex]
+        const content = escapeAss(segment.text.slice(char.startOffset, char.endOffset) || char.text)
+        events.push(`Dialogue: 0,${start},${end},Main,,0,0,0,,${edgeFade}{\\an${unitAlignment(style)}\\pos(${unitX},${anchorY})\\c${assColor(frame.colors[charIndex])}&}${content}`)
+      }
       const labelIndex = frame.activeIndex >= 0 ? frame.activeIndex : segment.chars.findLastIndex(char => char.end <= from)
       if (labelIndex < 0) continue
-      const x = subtitleUnitCenterX(segment, labelIndex, style, context)
+      const x = unitCenters[labelIndex]
       const activeColor = frame.colors[labelIndex]
       if (style.showPitch && frame.currentLabel) events.push(`Dialogue: 1,${start},${end},Pitch,,0,0,0,,{\\pos(${x},${bounds.top + Math.round(style.fontSize * 0.18)})\\c${assColor(activeColor)}&}${escapeAss(frame.currentLabel)}`)
       if (frame.activeIndex >= 0 && style.showDot) {

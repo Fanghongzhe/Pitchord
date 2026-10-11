@@ -18,6 +18,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Timeline } from '@/components/Timeline'
 import { LiveSubtitlePreview } from '@/components/LiveSubtitlePreview'
+import { PitchColorBandEditor } from '@/components/PitchColorBandEditor'
 import {
   carryPitchOverrides, clamp, createSegment, formatTime, getAdjacentSelection, lyricUnits, mergeSegments,
   MIN_SPAN, parseLyrics, parseTime, replaceText, retimeSegment, roundTime, splitSegment, suggestSplitOffset,
@@ -25,7 +26,7 @@ import {
 import type { LyricSegment } from '@/lib/lyrics'
 import { analyzeAudioBuffer, matchPitchToChars, noteHz, parsePitchNotation, pitchForChar, pitchNotation, validPitchAnnotation } from '@/lib/pitch'
 import type { PitchPoint } from '@/lib/pitch'
-import { defaultSubtitleStyle, generatePitchAss, sentenceSrt, wordTimedSubtitles } from '@/lib/subtitles'
+import { defaultSubtitleStyle, generatePitchAss, pitchColorBandNames, sentenceSrt, wordTimedSubtitles } from '@/lib/subtitles'
 import type { SubtitleStyle } from '@/lib/subtitles'
 import { StemMixer } from '@/lib/stem-mixer'
 import { resolveRangeConflict } from '@/lib/range-conflict'
@@ -270,6 +271,7 @@ export default function App() {
   const [activeAlignmentResultId, setActiveAlignmentResultId] = useState(savedDraft?.activeAlignmentResultId ?? '')
   const [alignmentStatus, setAlignmentStatus] = useState('尚未匹配')
   const [subtitleStudioOpen, setSubtitleStudioOpen] = useState(false)
+  const [pitchColorOpen, setPitchColorOpen] = useState(false)
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>({ ...defaultSubtitleStyle, ...savedDraft?.subtitleStyle })
   const [lastRenderedSignature, setLastRenderedSignature] = useState('')
   const [rerunPrompt, setRerunPrompt] = useState<'separation' | 'pitch' | 'alignment' | null>(null)
@@ -542,12 +544,23 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [projectDirectory, currentProjectData])
 
+  const copyAssetIntoProject = async (kind: 'media' | 'vocals' | 'accompaniment', file: File) => {
+    if (!window.pitchordDesktop) throw new Error('当前版本无法保存工程素材。')
+    await window.pitchordDesktop.storeAsset(kind, file.name, await file.arrayBuffer())
+    const stored = await window.pitchordDesktop.readProjectAsset(kind)
+    if (!stored) throw new Error('工程素材复制后无法读取。')
+    const bytes = new Uint8Array(stored.data.byteLength)
+    bytes.set(stored.data)
+    return new File([bytes.buffer], file.name, { type: file.type })
+  }
+
   const loadMedia = async (file: File, persist = true) => {
     if (!file.type.startsWith('audio/') && !file.type.startsWith('video/')) { setNotice('请选择音频或视频文件。'); updateWork('media-import', '导入媒体', 'error', '文件不是可识别的音频或视频'); return }
     updateWork('media-import', '导入媒体', 'running', `正在读取 ${file.name}…`, 0.05)
+    let projectFile = file
     if (persist && window.pitchordDesktop && projectDirectory) {
       try {
-        await window.pitchordDesktop.storeAsset('media', file.name, await file.arrayBuffer())
+        projectFile = await copyAssetIntoProject('media', file)
         updateWork('media-import', '导入媒体', 'running', '原媒体已复制到工程，正在解析音轨…', 0.35)
       }
       catch (error) { setNotice(`原媒体保存失败：${error instanceof Error ? error.message : String(error)}`); updateWork('media-import', '导入媒体', 'error', error instanceof Error ? error.message : String(error)); return }
@@ -556,11 +569,11 @@ export default function App() {
     const token = ++mediaToken.current
     mediaRef.current?.pause()
     mixerRef.current?.clear()
-    mediaFileRef.current = file
+    mediaFileRef.current = projectFile
     setStemReady({ vocals: false, harmonies: false, accompaniment: false })
     setTrackEnabled({ original: true, vocals: false, harmonies: false, accompaniment: false })
     auditionRef.current = null
-    setMediaUrl(URL.createObjectURL(file))
+    setMediaUrl(URL.createObjectURL(projectFile))
     setMediaName(file.name)
     setMediaIsVideo(file.type.startsWith('video/'))
     setVideoAspect(16 / 9)
@@ -600,7 +613,7 @@ export default function App() {
       try {
         const audioContext = new AudioContext()
         try {
-          const audio = await audioContext.decodeAudioData(await file.arrayBuffer())
+          const audio = await audioContext.decodeAudioData(await projectFile.arrayBuffer())
           if (token === mediaToken.current) { audioBufferRef.current = audio; setAudioReady(true); setPeaks(samplePeaks(audio)); setWaveformStatus(''); updateWork('media-import', '导入媒体', 'success', `已载入 ${file.name} 并生成波形`, 1) }
           return
         } finally { void audioContext.close() }
@@ -609,10 +622,10 @@ export default function App() {
     try {
       const { extractAudioBuffer, extractWaveform } = await import('@/lib/waveform')
       try {
-        const audio = await extractAudioBuffer(file, () => token === mediaToken.current)
+        const audio = await extractAudioBuffer(projectFile, () => token === mediaToken.current)
         if (token === mediaToken.current) { audioBufferRef.current = audio; setAudioReady(true); setPeaks(samplePeaks(audio)); setWaveformStatus(''); updateWork('media-import', '导入媒体', 'success', `已载入 ${file.name} 并提取音轨`, 1) }
       } catch {
-        const waveform = await extractWaveform(file, () => token === mediaToken.current)
+        const waveform = await extractWaveform(projectFile, () => token === mediaToken.current)
         if (token === mediaToken.current) setPeaks(waveform)
         if (token === mediaToken.current) {
           setWaveformStatus(waveform.length ? '音高分析需要可解码的音轨。' : '此媒体没有可解码的音轨。')
@@ -694,9 +707,13 @@ export default function App() {
   const loadVocalTrack = async (file: File, persist = true, clearPitch = true) => {
     if (!file.type.startsWith('audio/')) { setNotice('人声分析轨需要音频文件。'); return }
     const token = ++vocalToken.current
+    let projectFile = file
+    if (persist && window.pitchordDesktop && projectDirectory) {
+      try { projectFile = await copyAssetIntoProject('vocals', file) }
+      catch (error) { setNotice(`人声分析轨复制到工程失败：${error instanceof Error ? error.message : String(error)}`); return }
+    }
     try {
-      if (persist && window.pitchordDesktop && projectDirectory) await window.pitchordDesktop.storeAsset('vocals', file.name, await file.arrayBuffer())
-      const audio = await getMixer().load('vocals', file)
+      const audio = await getMixer().load('vocals', projectFile)
       if (token !== vocalToken.current) return
       audioBufferRef.current = audio
       setVocalPeaks(samplePeaks(audio))
@@ -719,9 +736,13 @@ export default function App() {
     } catch { setNotice('无法解码这个人声分析轨，请换用 WAV、MP3 或浏览器支持的音频格式。') }
   }
   const loadAccompanimentTrack = async (file: File, persist = true) => {
+    let projectFile = file
+    if (persist && window.pitchordDesktop && projectDirectory) {
+      try { projectFile = await copyAssetIntoProject('accompaniment', file) }
+      catch (error) { setNotice(`伴奏轨复制到工程失败：${error instanceof Error ? error.message : String(error)}`); return }
+    }
     try {
-      if (persist && window.pitchordDesktop && projectDirectory) await window.pitchordDesktop.storeAsset('accompaniment', file.name, await file.arrayBuffer())
-      await getMixer().load('accompaniment', file)
+      await getMixer().load('accompaniment', projectFile)
       setStemReady(current => ({ ...current, accompaniment: true }))
       setNotice('纯伴奏音轨已载入，可与其他音轨单独或组合试听。')
     } catch { setNotice('无法解码伴奏轨，请换用 WAV 或 MP3。') }
@@ -1881,8 +1902,7 @@ export default function App() {
       setNewProjectOpen(false)
       setNotice(`工程已创建：${project.directory}`)
       if (pending) {
-        await window.pitchordDesktop.storeAsset('media', pending.name, await pending.arrayBuffer())
-        await loadMedia(pending, false)
+        await loadMedia(await copyAssetIntoProject('media', pending), false)
       }
     } catch (error) { setNotice(`新建工程失败：${error instanceof Error ? error.message : String(error)}`) }
   }
@@ -2524,7 +2544,7 @@ export default function App() {
       <Dialog open={!!pendingModelDownload} onOpenChange={open => { if (!open) setPendingModelDownload(null) }}><DialogContent><DialogHeader><DialogTitle>准备模型</DialogTitle><DialogDescription>将从模型提供方联网下载所需权重，并保存到 Pitchord 自己的 environment/models 中。不会写入系统模型目录，也不要求填写 HF Token。</DialogDescription></DialogHeader><p className="text-sm">模型：{pendingModelDownload?.startsWith('alignment:') ? analysisEnvironment?.alignment.models.find(model => model.id === pendingModelDownload.slice('alignment:'.length))?.label : pendingModelDownload?.startsWith('harmony:') ? analysisEnvironment?.harmonyModels?.find(model => model.id === pendingModelDownload.slice('harmony:'.length))?.label : analysisEnvironment?.separationModels.find(model => model.id === pendingModelDownload)?.label}</p><DialogFooter><Button variant="outline" onClick={() => setPendingModelDownload(null)}>取消</Button><Button onClick={() => { const id = pendingModelDownload; setPendingModelDownload(null); if (!id) return; if (id.startsWith('alignment:')) void prepareAlignmentModel(id.slice('alignment:'.length)); else if (id.startsWith('harmony:')) void prepareHarmonyModel(id.slice('harmony:'.length)); else void prepareAnalysisModel(id) }}>开始下载</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={!!pendingModelRemoval} onOpenChange={open => { if (!open) setPendingModelRemoval(null) }}><DialogContent><DialogHeader><DialogTitle>删除 Pitchord 中的模型？</DialogTitle><DialogDescription>只删除 Pitchord 环境内管理的副本。用户最初选择的模型文件不会被删除，工程中的历史分析结果也会保留。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setPendingModelRemoval(null)}>取消</Button><Button variant="destructive" onClick={() => { if (!pendingModelRemoval) return; if (pendingModelRemoval.startsWith('alignment:')) void removeAlignmentModel(pendingModelRemoval.slice('alignment:'.length)); else if (pendingModelRemoval.startsWith('harmony:')) void removeHarmonyModel(pendingModelRemoval.slice('harmony:'.length)); else void removeAnalysisModel(pendingModelRemoval) }}>确认删除</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={subtitleStudioOpen} onOpenChange={setSubtitleStudioOpen}>
+      <Dialog open={subtitleStudioOpen} onOpenChange={open => { setSubtitleStudioOpen(open); if (!open) setPitchColorOpen(false) }}>
         <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-5xl">
           <DialogHeader>
             <DialogTitle>字幕导出与视频生成</DialogTitle>
@@ -2579,11 +2599,7 @@ export default function App() {
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="block space-y-1.5 text-xs text-muted-foreground">背景方式<Select value={subtitleStyle.backgroundStyle} onValueChange={value => setSubtitleStyle(style => ({ ...style, backgroundStyle: value as SubtitleStyle['backgroundStyle'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="outline">描边</SelectItem><SelectItem value="box">半透明底框</SelectItem><SelectItem value="none">无背景</SelectItem></SelectContent></Select></label>
-                  <label className="block space-y-1.5 text-xs text-muted-foreground">音高色带<Select value={subtitleStyle.colorBand} onValueChange={value => setSubtitleStyle(style => ({ ...style, colorBand: value as SubtitleStyle['colorBand'] }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="rainbow">音高彩虹</SelectItem><SelectItem value="cool">冷色带</SelectItem><SelectItem value="warm">暖色带</SelectItem><SelectItem value="custom">自定义</SelectItem></SelectContent></Select></label>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="space-y-1.5 text-xs text-muted-foreground">低音色<Input type="color" value={subtitleStyle.lowColor} onChange={event => setSubtitleStyle(style => ({ ...style, lowColor: event.target.value, colorBand: 'custom' }))} /></label>
-                  <label className="space-y-1.5 text-xs text-muted-foreground">高音色<Input type="color" value={subtitleStyle.highColor} onChange={event => setSubtitleStyle(style => ({ ...style, highColor: event.target.value, colorBand: 'custom' }))} /></label>
+                  <div className="space-y-1.5 text-xs text-muted-foreground"><p>歌词音高色带</p><Button type="button" className="w-full justify-between" variant="outline" onClick={() => setPitchColorOpen(true)}><span>{pitchColorBandNames[subtitleStyle.colorBand] ?? pitchColorBandNames.rainbow}</span><SlidersHorizontal className="size-4" /></Button></div>
                 </div>
                 <div className="rounded-lg border border-border p-3">
                   <p className="mb-3 text-xs font-medium">当前字强调点</p>
@@ -2621,6 +2637,7 @@ export default function App() {
             <Button variant="outline" onClick={() => void exportWordSubtitles('ass')} disabled={!subtitleReady}>导出 ASS</Button>
             <Button onClick={() => void burnSubtitleVideo()} disabled={!subtitleReady || !mediaIsVideo || !projectDirectory || pipelineTaskRunning}><Video />生成带字幕视频</Button>
           </DialogFooter>
+          <PitchColorBandEditor open={pitchColorOpen} onOpenChange={setPitchColorOpen} style={subtitleStyle} onChange={setSubtitleStyle} points={pitchPoints} />
         </DialogContent>
       </Dialog>
 

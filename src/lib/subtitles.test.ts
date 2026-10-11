@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSegment, retimeSegment } from './lyrics'
-import { defaultSubtitleStyle, generatePitchAss, sentenceSrt, subtitleFrameAt, subtitleUnitCenterX, wordTimedSubtitles } from './subtitles'
+import { defaultSubtitleStyle, detectedPitchRange, generatePitchAss, pitchColor, recommendedPitchColorRules, sentenceSrt, subtitleFrameAt, subtitleUnitCenterX, wordTimedSubtitles } from './subtitles'
 
 describe('word timed subtitle export', () => {
   it('keeps the edited timing for every lyric unit', () => {
@@ -51,8 +51,8 @@ describe('word timed subtitle export', () => {
     expect(after.colors[0]).toBe(subtitleFrameAt([segment], [], 0.9)!.colors[0])
     expect(after.colors[0]).not.toBe(before.colors[0])
     const ass = generatePitchAss([segment], [])
-    const firstMain = ass.split('\n').find(line => line.startsWith('Dialogue: 0,'))!
-    expect(firstMain).toContain(`{\\c&H00FCFAF8&}好`)
+    const firstMain = ass.split('\n').filter(line => line.startsWith('Dialogue: 0,0:00:00.00') && line.includes(',Main,'))
+    expect(firstMain.some(line => line.includes(`\\c&H00FCFAF8&}好`))).toBe(true)
   })
 
   it('tracks the measured F0 color within a sung character and holds its final sample afterward', () => {
@@ -84,6 +84,43 @@ describe('word timed subtitle export', () => {
     expect(spacedX).toBeGreaterThan(compactX)
     const ass = generatePitchAss([spaced], [], { horizontalPosition: 'left' })
     expect(ass).not.toContain('・')
+  })
+
+  it('uses the exact same ASS anchor for each glyph, its pitch label and its dot', () => {
+    const segment = createSegment('你 A 好', 0, 3)
+    for (const char of segment.chars) char.pitchOverride = { motion: 'flat', notes: [{ note: 'A4', start: 0, end: 1 }] }
+    const lines = generatePitchAss([segment], [], { spacing: 2 }).split('\n')
+    for (const [index, char] of segment.chars.entries()) {
+      const time = `0:00:0${index}.00`
+      const unit = lines.find(line => line.startsWith(`Dialogue: 0,${time},`) && line.includes(',Main,') && line.endsWith(`}${char.text}`))!
+      const pitch = lines.find(line => line.startsWith(`Dialogue: 1,${time},`) && line.includes(',Pitch,'))!
+      const dot = lines.find(line => line.startsWith(`Dialogue: 1,${time},`) && line.includes(',Dot,'))!
+      const x = (line: string) => Number(/\\pos\((\d+),/.exec(line)?.[1])
+      expect(x(unit)).toBeGreaterThan(0)
+      expect(x(pitch)).toBe(x(unit))
+      expect(x(dot)).toBe(x(unit))
+    }
+  })
+
+  it('supports inclusive/exclusive per-note ranges, solid colors and linear gradients', () => {
+    const style = { ...defaultSubtitleStyle, colorBand: 'ranges' as const, colorRules: recommendedPitchColorRules(), rangeFallback: 'base' as const }
+    const hz = (midi: number) => 440 * 2 ** ((midi - 69) / 12)
+    expect(pitchColor(hz(60), style)).toBe('#9CA3AF')
+    expect(pitchColor(hz(63), style)).toBe('#9CA3AF')
+    expect(pitchColor(hz(64), style)).toBe('#fde047')
+    expect(pitchColor(hz(74), style)).toBe('#f43f5e')
+    expect(pitchColor(hz(75), style)).toBe(style.baseColor)
+    expect(pitchColor(hz(55), style)).not.toBe(pitchColor(hz(59), style))
+  })
+
+  it('detects the trusted F0 extremes for a project-specific recommendation', () => {
+    const range = detectedPitchRange([
+      { time: 0, hz: 130.81, confidence: 0.9, rms: 0.1, voiced: true },
+      { time: 1, hz: 587.33, confidence: 0.9, rms: 0.1, voiced: true },
+      { time: 2, hz: 1000, confidence: 0.1, rms: 0.1, voiced: true },
+    ])!
+    expect([range.minMidi, range.maxMidi, range.count]).toEqual([48, 74, 2])
+    expect(recommendedPitchColorRules(range)[2].toMidi).toBe(74)
   })
 
   it('colors glyphs by pitch and shows the emphasis dot only under the active character', () => {
@@ -142,8 +179,9 @@ describe('word timed subtitle export', () => {
       verticalPosition: 'top', horizontalPosition: 'left', backgroundStyle: 'box',
       backgroundColor: '#000000', backgroundOpacity: 75, bold: false, italic: true,
     })
-    expect(ass).toMatch(/Style: Main,[^\n]+,0,-1,0,0,100,100,0,0,3,/)
+    expect(ass).toMatch(/Style: Main,[^\n]+,0,-1,0,0,100,100,0,0,1,/)
     expect(ass).toMatch(/,7,80,80,96,1/)
     expect(ass).toContain('&H40000000')
+    expect(ass).toContain(',Back,')
   })
 })
