@@ -4,7 +4,7 @@ import {
   Activity, AlertCircle, AudioLines, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download,
   FileAudio2, FilePlus2, FileText, FolderOpen, Grid2X2, HardDrive, Home, List, LoaderCircle, Maximize2, Merge, Pause, Pencil,
   Play, Plus, Redo2, RotateCcw, RotateCw, Save, Scissors, Search, Settings2, SlidersHorizontal, Square, Trash2, Undo2, Upload, Video,
-  Volume2, VolumeX, WandSparkles,
+  Volume2, VolumeX, WandSparkles, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -268,6 +268,8 @@ export default function App() {
   const [rerunPrompt, setRerunPrompt] = useState<'separation' | 'pitch' | 'alignment' | null>(null)
   const [workItems, setWorkItems] = useState<WorkItem[]>([])
   const [workCenterOpen, setWorkCenterOpen] = useState(false)
+  const [taskAlert, setTaskAlert] = useState<WorkItem | null>(null)
+  const [environmentInstallState, setEnvironmentInstallState] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
   const [zoom, setZoom] = useState(85)
   const [importOpen, setImportOpen] = useState(false)
   const [importDraft, setImportDraft] = useState('')
@@ -313,6 +315,7 @@ export default function App() {
   const finishCharRangeAdjustRef = useRef<() => void>(() => undefined)
   const togglePlaybackRef = useRef<(createGuideOnPause?: boolean) => Promise<void>>(async () => undefined)
   const workflowExecutionRef = useRef<'automatic' | 'separation' | 'harmony' | 'pitch' | 'alignment' | 'render' | null>(null)
+  const workStatusRef = useRef(new Map<string, WorkItem['status']>())
   const getMixer = () => mixerRef.current ?? (mixerRef.current = new StemMixer())
   const activeLine = segments.find(segment => selectedLineIds.includes(segment.id)) ?? null
   const effectiveSegments = useMemo(() => {
@@ -340,6 +343,11 @@ export default function App() {
     ?? separationResults.find(result => !result.harmonies)
 
   const updateWork = useCallback((id: string, title: string, status: WorkItem['status'], message: string, progress?: number) => {
+    const previousStatus = workStatusRef.current.get(id)
+    workStatusRef.current.set(id, status)
+    if (id !== 'environment-check' && previousStatus === 'running' && (status === 'success' || status === 'error')) {
+      setTaskAlert({ id, title, status, message, progress, updatedAt: Date.now() })
+    }
     setWorkItems(current => {
       const previous = current.find(item => item.id === id)
       const next = { id, title, status, message, progress: progress ?? previous?.progress, updatedAt: Date.now() }
@@ -347,6 +355,12 @@ export default function App() {
     })
     if (status === 'running' && id !== 'environment-check') setWorkCenterOpen(true)
   }, [])
+
+  useEffect(() => {
+    if (!taskAlert) return
+    const timer = window.setTimeout(() => setTaskAlert(current => current?.updatedAt === taskAlert.updatedAt ? null : current), taskAlert.status === 'error' ? 10000 : 6000)
+    return () => window.clearTimeout(timer)
+  }, [taskAlert])
 
   const cancelAnalysisTask = useCallback(async (taskId: 'environment' | 'separation' | 'harmony' | 'pitch' | 'alignment') => {
     const item = workItems.find(candidate => candidate.id === taskId)
@@ -910,6 +924,7 @@ export default function App() {
   }
 
   const openEnvironmentSetup = () => {
+    setEnvironmentInstallState(analysisEnvironmentBusy ? 'running' : 'idle')
     setEnvironmentMode(analysisEnvironment?.runtimePreference || 'managed')
     setEnvironmentRootDraft(analysisEnvironment?.root || analysisEnvironment?.defaultRoot || '')
     setExternalPythonDraft(analysisEnvironment?.runtimePreference === 'custom' ? analysisEnvironment.path : '')
@@ -939,6 +954,7 @@ export default function App() {
 
   const installAnalysisRuntime = async () => {
     if (!window.pitchordDesktop?.installAnalysisRuntime) return
+    setEnvironmentInstallState('running')
     setAnalysisEnvironmentBusy(true)
     setEnvironmentProgress(null)
     setAnalysisProgress('正在规划完整环境安装…')
@@ -946,6 +962,7 @@ export default function App() {
     try {
       const status = await window.pitchordDesktop.installAnalysisRuntime({ root: environmentRootDraft, computeProfile: computeProfileDraft, installSelection: installSelectionDraft })
       setAnalysisEnvironment(status)
+      setEnvironmentInstallState('success')
       setEnvironmentRootDraft(status.root)
       setSeparationModel(current => status.separationModels.some(model => model.id === current && model.ready && model.runnable !== false) ? current : status.separationModels.find(model => model.ready && model.runnable !== false)?.id || current)
       setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready && method.runnable !== false) ? current : (status.pitchMethods.find(method => method.ready && method.runnable !== false && (method.id === 'pyin' || method.id === 'torchcrepe'))?.id as PitchAlgorithm | undefined) || current)
@@ -954,7 +971,8 @@ export default function App() {
       updateWork('environment', '准备完整分析环境', 'success', 'Python、分析依赖、人声模型和歌词模型已全部准备完成', 1)
       setNotice('Pitchord 完整分析环境已准备完成，可直接运行默认流程。')
     } catch (error) {
-      setAnalysisProgress('环境安装未完成')
+      setEnvironmentInstallState(taskWasCancelled(error) ? 'idle' : 'error')
+      setAnalysisProgress(error instanceof Error ? error.message : String(error))
       updateWork('environment', '准备分析环境', taskWasCancelled(error) ? 'cancelled' : 'error', taskWasCancelled(error) ? '环境准备已取消' : error instanceof Error ? error.message : String(error))
       setNotice(`分析环境安装失败：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
@@ -1771,10 +1789,10 @@ export default function App() {
       }
     } catch (error) { setNotice(`新建工程失败：${error instanceof Error ? error.message : String(error)}`) }
   }
-  const openProject = async () => {
+  const openProject = async (recentDirectory?: string) => {
     if (!window.pitchordDesktop) { projectInputRef.current?.click(); return }
     try {
-      const result = await window.pitchordDesktop.openProject()
+      const result = await window.pitchordDesktop.openProject(recentDirectory)
       if (!result) return
       resetProjectState()
       const media = await window.pitchordDesktop.readProjectAsset('media')
@@ -1794,7 +1812,11 @@ export default function App() {
         rememberProject(savedName || result.name, result.directory)
         if (vocals && accompaniment) setSeparationStatus(harmonies ? '已载入主唱、和声和伴奏' : '已载入纯人声和纯伴奏')
       }
-    } catch (error) { setNotice(`打开工程失败：${error instanceof Error ? error.message : String(error)}`) }
+    } catch (error) {
+      const message = `打开工程失败：${error instanceof Error ? error.message : String(error)}`
+      setNotice(message)
+      setTaskAlert({ id: 'project-open', title: '打开项目', status: 'error', message, updatedAt: Date.now() })
+    }
   }
 
   const activateLine = (id: string, beginAdjust = true) => {
@@ -2086,7 +2108,7 @@ export default function App() {
         <section className="p-7">
           <div className="mb-6 flex items-center gap-5 text-xs text-muted-foreground"><span>项目</span><span>最近修改 ↓</span></div>
           <div className={projectGridView ? 'grid max-w-6xl grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3' : 'max-w-5xl space-y-3'}>
-            {visibleRecentProjects.map(project => <button key={project.directory} type="button" onClick={() => void openProject()} className={projectGridView ? 'project-card group overflow-hidden rounded-xl border border-border bg-card text-left transition hover:border-primary/50' : 'flex w-full items-center gap-4 rounded-xl border border-border bg-card p-3 text-left hover:border-primary/50'}>
+            {visibleRecentProjects.map(project => <button key={project.directory} type="button" onClick={() => void openProject(project.directory)} className={projectGridView ? 'project-card group overflow-hidden rounded-xl border border-border bg-card text-left transition hover:border-primary/50' : 'flex w-full items-center gap-4 rounded-xl border border-border bg-card p-3 text-left hover:border-primary/50'}>
               <div className={projectGridView ? 'relative aspect-video bg-neutral-950' : 'flex h-16 w-28 shrink-0 items-center justify-center rounded-lg bg-neutral-950'}><AudioLines className="size-10 text-white/45" /><span className="absolute bottom-2 right-2 text-[11px] text-white/75">{projectGridView ? 'PITCHORD' : ''}</span></div>
               <div className={projectGridView ? 'p-4' : 'min-w-0 flex-1'}><p className="truncate font-medium">{project.name}</p><p className="mt-2 truncate text-xs text-muted-foreground">{new Date(project.updatedAt).toLocaleString()}</p></div>
               {!projectGridView && <ChevronRight className="size-4 text-muted-foreground" />}
@@ -2334,7 +2356,10 @@ export default function App() {
 
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>需要先完成人声分离</DialogTitle><DialogDescription>音高识别和歌词时间戳匹配只读取纯人声结果。Pitchord 会直接处理当前工程中已经导入的媒体，不需要再次选择文件。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setSeparationPromptOpen(false)}>取消</Button><Button onClick={() => { setSeparationPromptOpen(false); requestSeparation() }}>进行人声分离</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{analysisEnvironment?.completeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>选择一套方案即可同时准备 Python、计算组件和所需模型；也可以按需要自定义。安装可在后台继续，关闭此窗口不会取消任务。</DialogDescription></DialogHeader><div className="space-y-4 text-sm">
+      <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{environmentInstallState === 'success' ? '分析环境安装完成' : environmentInstallState === 'running' ? '正在准备分析环境' : analysisEnvironment?.completeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>{environmentInstallState === 'success' ? '所选运行组件和模型已通过检查，可以开始使用。' : '选择一套方案即可同时准备 Python、计算组件和所需模型；也可以按需要自定义。安装可在后台继续，关闭此窗口不会取消任务。'}</DialogDescription></DialogHeader>
+      {environmentInstallState === 'success' && <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-5 text-sm" role="status"><div className="flex items-center gap-2 font-semibold text-emerald-700"><CheckCircle2 className="size-5" />所选分析环境已准备完成</div><p className="mt-2 text-muted-foreground">现在可以创建或打开项目，开始人声分离、音高识别和歌词对齐。需要调整模型时，可随时从“分析环境”或“模型管理”重新进入。</p></div>}
+      {environmentInstallState === 'error' && <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive" role="alert">安装未完成：{analysisProgress}。请查看任务提示或重试。</div>}
+      <div className={environmentInstallState === 'success' ? 'hidden' : 'space-y-4 text-sm'}>
         <div className="grid grid-cols-2 gap-2"><Button variant={environmentMode === 'managed' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('managed')} disabled={analysisEnvironmentBusy}>创建独立环境</Button><Button variant={environmentMode === 'custom' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('custom')} disabled={analysisEnvironmentBusy}>使用现有 Python</Button></div>
         {environmentMode === 'managed' ? <>
           <div className="space-y-2"><p className="font-medium">环境存放位置</p><div className="flex gap-2"><Input value={environmentRootDraft} readOnly className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseAnalysisDirectory(environmentRootDraft); if (selected) setEnvironmentRootDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><div className="flex items-center justify-between gap-2"><p className="text-xs text-muted-foreground">默认放在软件同目录的 environment 文件夹，也可以选择 D 盘等其他位置。</p>{analysisEnvironment?.defaultRoot && environmentRootDraft !== analysisEnvironment.defaultRoot && <Button size="sm" variant="ghost" onClick={() => setEnvironmentRootDraft(analysisEnvironment.defaultRoot)}>恢复默认</Button>}</div></div>
@@ -2363,7 +2388,7 @@ export default function App() {
           <div className="space-y-2"><p className="font-medium">Python 可执行文件</p><div className="flex gap-2"><Input value={externalPythonDraft} readOnly placeholder="选择 python.exe" className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.choosePython(externalPythonDraft); if (selected) setExternalPythonDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><p className="text-xs text-muted-foreground">支持 Python 3.10–3.12。Pitchord 只检测并使用该环境，不会自动安装或删除其中的内容。</p></div>
           <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">适合已有环境的用户</p><p className="mt-1 text-xs text-muted-foreground">检测会确认 Demucs、TorchCrepe、librosa 和 faster-whisper。缺失的组件会明确列出，不会静默修改环境。</p></div>
         </>}
-      </div><DialogFooter><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>{analysisEnvironmentBusy ? '后台继续' : '稍后设置'}</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy || !environmentRootDraft || !installSelectionComplete}>{analysisEnvironmentBusy ? '正在准备所选环境…' : '下载并准备所选环境'}</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</DialogFooter></DialogContent></Dialog>
+      </div><DialogFooter>{environmentInstallState === 'success' ? <Button onClick={() => setRepairEnvironmentOpen(false)}>完成，开始使用</Button> : <><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>{analysisEnvironmentBusy ? '后台继续' : analysisEnvironment?.completeReady ? '关闭' : '稍后设置'}</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy || !environmentRootDraft || !installSelectionComplete}>{analysisEnvironmentBusy ? '正在准备所选环境…' : analysisEnvironment?.completeReady ? '重新准备所选环境' : '下载并准备所选环境'}</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</>}</DialogFooter></DialogContent></Dialog>
 
       <Dialog open={modelManagerOpen} onOpenChange={setModelManagerOpen}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>模型管理</DialogTitle><DialogDescription>功能页只显示已经安装且可以运行的模型。这里可以准备推荐模型，或把自己的模型复制到 Pitchord 环境中统一管理。</DialogDescription></DialogHeader><div className="space-y-3">
         <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">模型计算设备</p><Badge variant={analysisEnvironment?.compute.cudaAvailable ? 'secondary' : 'outline'}>{analysisEnvironment?.compute.label || '正在检测…'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">支持 CUDA 的 Pitchord 运行环境会自动让 Demucs、MSST 和 TorchCrepe 使用 GPU；pYIN 使用 CPU。歌词识别会单独检测 CTranslate2 的 CUDA 支持，GPU 初始化失败时自动回退 CPU。</p>{analysisEnvironment?.compute.torchVersion && <p className="mt-1 text-xs text-muted-foreground">PyTorch {analysisEnvironment.compute.torchVersion}{analysisEnvironment.compute.torchBuildCuda ? ` · CUDA ${analysisEnvironment.compute.torchBuildCuda}` : ' · CPU 构建'}</p>}</div>
@@ -2494,6 +2519,12 @@ export default function App() {
           <div className="max-h-80 space-y-1 overflow-y-auto p-2">{workItems.map(item => <div key={item.id} className="rounded-lg border border-border bg-background p-2.5"><div className="flex items-start gap-2">{item.status === 'running' ? <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin text-primary" /> : item.status === 'success' ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary" /> : item.status === 'cancelled' ? <Square className="mt-0.5 size-4 shrink-0 text-muted-foreground" /> : <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />}<div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><p className="truncate text-xs font-medium">{item.title}</p><div className="flex items-center gap-1"><span className="text-[10px] text-muted-foreground">{item.status === 'running' ? '进行中' : item.status === 'success' ? '完成' : item.status === 'cancelled' ? '已取消' : '失败'}</span>{item.status === 'running' && cancellableTaskIds.has(item.id) && <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => void cancelAnalysisTask(item.id as 'environment' | 'separation' | 'pitch' | 'alignment')}><Square className="size-3" />取消</Button>}</div></div><p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{item.message}</p>{item.status === 'running' && <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full bg-primary transition-[width] duration-200 ${item.progress === undefined ? 'w-1/3 animate-pulse' : ''}`} style={item.progress === undefined ? undefined : { width: `${Math.round(clamp(item.progress, 0, 1) * 100)}%` }} /></div>}</div></div></div>)}{!workItems.length && <p className="py-6 text-center text-xs text-muted-foreground">导入、环境与模型、人声分离、音高识别和视频渲染的进度会显示在这里。</p>}</div>
         </section>}
         {!workCenterOpen && <Button className="shadow-lg" variant="secondary" onClick={() => setWorkCenterOpen(true)}><Activity />任务进度{workItems.some(item => item.status === 'running') && <Badge variant="secondary">{workItems.filter(item => item.status === 'running').length}</Badge>}<ChevronUp /></Button>}
+      </div>}
+
+      {taskAlert && <div className={`fixed right-4 top-4 z-[90] flex w-[360px] max-w-[calc(100vw-2rem)] items-start gap-3 rounded-xl border bg-card p-3 shadow-2xl ${taskAlert.status === 'error' ? 'border-destructive/60' : 'border-emerald-500/50'}`} role={taskAlert.status === 'error' ? 'alert' : 'status'} aria-live={taskAlert.status === 'error' ? 'assertive' : 'polite'}>
+        {taskAlert.status === 'error' ? <AlertCircle className="mt-0.5 size-5 shrink-0 text-destructive" /> : <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-600" />}
+        <div className="min-w-0 flex-1"><p className="text-sm font-semibold">{taskAlert.title}{taskAlert.status === 'error' ? '失败' : '完成'}</p><p className="mt-1 break-words text-xs text-muted-foreground">{taskAlert.message}</p></div>
+        <Button size="icon" variant="ghost" className="size-7 shrink-0" onClick={() => setTaskAlert(null)} aria-label="关闭任务提示"><X className="size-4" /></Button>
       </div>}
 
       {contextMenu && <div className="fixed z-50 min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onPointerDown={event => event.stopPropagation()}><Button variant="ghost" size="sm" className="w-full justify-start" onClick={() => contextAction('add')}><Plus />添加句</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!mergeIndexes} onClick={() => contextAction('merge')}><Merge />合并</Button><Button variant="ghost" size="sm" className="w-full justify-start" disabled={!activeLine || !splitBoundaries.length} onClick={() => contextAction('split')}><Scissors />分割</Button><Button variant="ghost" size="sm" className="w-full justify-start text-destructive hover:text-destructive" disabled={!contextMenu.id && !selectedLineIds.length} onClick={() => contextAction('delete')}><Trash2 />删除</Button></div>}

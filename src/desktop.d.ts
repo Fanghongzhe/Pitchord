@@ -68,7 +68,7 @@ declare global {
       projectDefaults: () => Promise<{ parent: string; suggestedName: string }>
       pickProjectParent: () => Promise<string | null>
       createProject: (name: string, parent: string) => Promise<{ directory: string; name: string }>
-      openProject: () => Promise<{ directory: string; name: string; content: string } | null>
+      openProject: (directory?: string) => Promise<{ directory: string; name: string; content: string } | null>
       saveProject: (content: string) => Promise<string>
       storeLyricsSource: (name: string, content: string) => Promise<string>
       openLyricsFolder: () => Promise<string>

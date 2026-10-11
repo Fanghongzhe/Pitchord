@@ -1595,11 +1595,18 @@ app.whenReady().then(async () => {
     return { directory, name: project.name }
   })
 
-  ipcMain.handle('pitchord:open-project', async event => {
+  ipcMain.handle('pitchord:open-project', async (event, recentDirectory) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
-    const picked = await dialog.showOpenDialog(mainWindow, { title: '打开 Pitchord 工程', defaultPath: projectRoot(), properties: ['openFile'], filters: [{ name: 'Pitchord 工程', extensions: ['json'] }] })
-    if (picked.canceled || !picked.filePaths[0]) return null
-    const file = picked.filePaths[0]
+    let file
+    if (recentDirectory === undefined) {
+      const picked = await dialog.showOpenDialog(mainWindow, { title: '打开 Pitchord 工程', defaultPath: projectRoot(), properties: ['openFile'], filters: [{ name: 'Pitchord 工程', extensions: ['json'] }] })
+      if (picked.canceled || !picked.filePaths[0]) return null
+      file = picked.filePaths[0]
+    } else {
+      if (typeof recentDirectory !== 'string' || !path.isAbsolute(recentDirectory)) throw new Error('最近项目的目录无效。')
+      file = path.join(path.resolve(recentDirectory), 'project.pitchord.json')
+      if (!fs.existsSync(file)) throw new Error('最近项目文件已移动或删除。请使用“从文件夹打开项目”重新选择。')
+    }
     const content = await readFile(file, 'utf8')
     const value = JSON.parse(content)
     if (value.version !== 1 || !Array.isArray(value.segments)) throw new Error('工程文件格式无效。')

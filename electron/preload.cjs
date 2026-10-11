@@ -34,7 +34,7 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   projectDefaults: () => ipcRenderer.invoke('pitchord:project-defaults'),
   pickProjectParent: () => ipcRenderer.invoke('pitchord:pick-project-parent'),
   createProject: (name, parent) => ipcRenderer.invoke('pitchord:create-project', { name, parent }),
-  openProject: () => ipcRenderer.invoke('pitchord:open-project'),
+  openProject: directory => ipcRenderer.invoke('pitchord:open-project', directory),
   saveProject: content => ipcRenderer.invoke('pitchord:save-project', content),
   storeLyricsSource: (name, content) => ipcRenderer.invoke('pitchord:store-lyrics-source', { name, content }),
   openLyricsFolder: () => ipcRenderer.invoke('pitchord:open-lyrics-folder'),
