@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import type { AcousticAnalysis } from '@/lib/acoustics'
 import { snapAcousticBoundary, type BoundaryReview } from '@/lib/alignment-quality'
+import { pitchGuideMidis, pitchMidi, pitchMidiName, pitchViewY, type PitchViewSettings } from '@/lib/timeline-pitch-view'
 
 type Clip = LyricSegment | CharSpan
 type Drag = { id: string; mode: 'move' | 'start' | 'end'; x: number; start: number; end: number; index: number; moved: boolean; lastX: number; lastStep: number; detached: boolean; frozen?: ClipPreview[]; preview?: ClipPreview[] }
@@ -24,6 +25,7 @@ type Props = {
   showSpectrogram?: boolean
   reviews?: BoundaryReview[]
   pitchPoints: PitchPoint[]
+  pitchView: PitchViewSettings
   zoom: number
   playhead: number
   centerRequest: number
@@ -49,9 +51,10 @@ type Props = {
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, time: number, id?: string) => void
 }
 
-export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, vocalPeaks = [], acoustics = null, showSpectrogram = false, reviews = [], pitchPoints, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, guideLine, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, onClipPreview, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
+export function Timeline({ mode, segments, activeSegment, selectedIds, duration, peaks, vocalPeaks = [], acoustics = null, showSpectrogram = false, reviews = [], pitchPoints, pitchView, zoom, playhead, centerRequest, centerTargetId, seekCenterRequest, guideLine, waveformStatus, onSeekAndPlay, onSelect, onActivateLine, onActivateChar, onRetimeLines, onRetimeChar, onRetimeChars, onClipPreview, rangeAdjusting = false, rangeDraft = null, onRangePreview, onRangeEdgeChange, onBeginRangeAdjust, onSaveRangeAdjust, onCancelRangeAdjust, onContextMenu }: Props) {
   const start = mode === 'chars' && activeSegment ? activeSegment.start : 0
   const end = mode === 'chars' && activeSegment ? activeSegment.end : Math.max(duration, 1)
+  const pitchTrackHeight = mode === 'chars' ? pitchView.trackHeight : 112
   const span = Math.max(end - start, 0.2)
   const width = mode === 'chars' ? Math.max(960, span * zoom * 1.6) : Math.max(1200, span * zoom)
   const scale = width / span
@@ -109,12 +112,12 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
     viewport.scrollLeft = clamp((playhead - start) * scale - viewport.clientWidth / 2, 0, viewport.scrollWidth - viewport.clientWidth)
   }, [seekCenterRequest, playhead, mode, start, end, scale])
 
-  const shownPeaks = mode === 'chars' && vocalPeaks.length ? vocalPeaks : peaks
+  const shownPeaks = vocalPeaks.length ? vocalPeaks : peaks
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !shownPeaks.length) return
     const actualWidth = Math.min(Math.round(width), 30000)
-    const actualHeight = 112
+    const actualHeight = pitchTrackHeight
     canvas.width = actualWidth
     canvas.height = actualHeight
     const ctx = canvas.getContext('2d')
@@ -130,14 +133,14 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       const to = Math.min(shownPeaks.length, viewStartIndex + Math.ceil((x + 1) / columns * count))
       let peak = 0
       for (let i = from; i < to; i++) peak = Math.max(peak, shownPeaks[i] ?? 0)
-      const height = Math.max(2, Math.round(peak * 94))
+      const height = Math.min(actualHeight, Math.max(2, Math.round(peak * (actualHeight - 18) * (mode === 'chars' && vocalPeaks.length ? pitchView.waveformGain : 1))))
       ctx.fillRect(x * 2, (actualHeight - height) / 2, 1, height)
     }
-  }, [shownPeaks, width, start, end, duration])
+  }, [shownPeaks, width, start, end, duration, mode, vocalPeaks.length, pitchView.waveformGain, pitchTrackHeight])
 
   useEffect(() => {
     const canvas = spectrogramRef.current
-    if (!canvas || !acoustics || !showSpectrogram || mode !== 'chars') return
+    if (!canvas || !acoustics || !showSpectrogram) return
     const actualWidth = Math.min(Math.round(width), 30000)
     const height = 96
     canvas.width = actualWidth
@@ -147,7 +150,8 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
     const image = ctx.createImageData(actualWidth, height)
     const count = acoustics.rms.length
     for (let x = 0; x < actualWidth; x++) {
-      const frame = Math.min(count - 1, Math.max(0, Math.floor((start + x / scale) / acoustics.step)))
+      const time = start + x / actualWidth * (end - start)
+      const frame = Math.min(count - 1, Math.max(0, Math.floor(time / acoustics.step)))
       for (let y = 0; y < height; y++) {
         const band = Math.min(acoustics.bands - 1, Math.floor((1 - y / height) * acoustics.bands))
         const intensity = acoustics.spectrum[frame * acoustics.bands + band] ?? 0
@@ -159,7 +163,7 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
       }
     }
     ctx.putImageData(image, 0, 0)
-  }, [acoustics, showSpectrogram, mode, width, start, scale])
+  }, [acoustics, showSpectrogram, mode, width, start, end])
 
   const pointerDown = (event: PointerEvent<HTMLDivElement>, clip: Clip, modeOfDrag: Drag['mode']) => {
     if (event.button !== 0) return
@@ -393,14 +397,37 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
   }
 
   const visiblePlayhead = playhead >= start && playhead <= end
-  const visiblePitch = pitchPoints.filter(point => point.voiced && point.time >= start && point.time <= end)
+  const pitchLowMidi = mode === 'chars' ? pitchView.lowMidi : 36
+  const pitchHighMidi = mode === 'chars' ? pitchView.highMidi : 85
+  const pitchGuides = mode === 'chars' && pitchView.guides ? pitchGuideMidis(pitchLowMidi, pitchHighMidi, pitchView.density) : []
+  const pitchGuideLabels = new Set<number>()
+  let lastGuideLabelY = -Infinity
+  for (const midi of [...pitchGuides].reverse()) {
+    const y = pitchViewY(midi, pitchLowMidi, pitchHighMidi, pitchTrackHeight)
+    if (y - lastGuideLabelY >= 13) { pitchGuideLabels.add(midi); lastGuideLabelY = y }
+  }
+  const visiblePitchPaths = useMemo(() => {
+    const paths: string[][] = []
+    let current: string[] = []
+    let previousTime = -Infinity
+    for (const point of pitchPoints) {
+      if (point.time < start || point.time > end) continue
+      const midi = point.voiced && point.hz > 0 ? pitchMidi(point.hz) : NaN
+      if (!Number.isFinite(midi) || midi < pitchLowMidi || midi > pitchHighMidi) { current = []; previousTime = -Infinity; continue }
+      if (point.time - previousTime > 0.08) { current = []; paths.push(current) }
+      if (!current.length && paths.at(-1) !== current) paths.push(current)
+      current.push(`${(point.time - start) * scale},${pitchViewY(midi, pitchLowMidi, pitchHighMidi, pitchTrackHeight)}`)
+      previousTime = point.time
+    }
+    return paths.filter(path => path.length > 1)
+  }, [pitchPoints, start, end, scale, pitchLowMidi, pitchHighMidi, pitchTrackHeight])
   const visibleCandidates = mode === 'chars' ? acoustics?.candidates.filter(candidate => candidate.time >= start && candidate.time <= end && candidate.strength >= 0.35) ?? [] : []
   const reviewById = new Map(reviews.map(review => [review.charId, review]))
   const floatingClip = selectedIds.length === 1 ? clips.find(clip => clip.id === activeClipId) : null
   const floatingRange = floatingClip ? (rangeAdjusting && rangeDraft?.id === floatingClip.id ? rangeDraft : floatingClip) : null
   const floatingLeft = floatingRange ? clamp(((floatingRange.start + floatingRange.end) / 2 - start) * scale, 76, width - 76) : 0
   const contextAt = (event: ReactMouseEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect()
+    const rect = (event.currentTarget.firstElementChild ?? event.currentTarget).getBoundingClientRect()
     const time = roundTime(clamp(start + (event.clientX - rect.left) / scale, start, end))
     onContextMenu?.(event, time)
   }
@@ -416,13 +443,16 @@ export function Timeline({ mode, segments, activeSegment, selectedIds, duration,
             <span className="absolute top-2 left-2 whitespace-nowrap text-xs text-muted-foreground">{formatTime(time).slice(0, 5)}</span>
           </div>)}
         </div>
-        <div className="relative h-32 cursor-crosshair border-b border-border bg-muted/40" onPointerDown={seekAt}>
+        <div className="relative cursor-crosshair border-b border-border bg-muted/40" style={{ height: pitchTrackHeight + 16 }} onPointerDown={seekAt}>
           {ticks.map(time => <div key={time} className="absolute top-0 bottom-0 border-l border-border/40" style={{ left: (time - start) * scale }} />)}
-          {shownPeaks.length > 0 ? <canvas ref={canvasRef} className="absolute inset-0 h-28 w-full" style={{ width }} /> : <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">{waveformStatus}</div>}
-          {visiblePitch.length > 1 && <svg className="pointer-events-none absolute inset-0 h-28" style={{ width }} viewBox={`0 0 ${Math.max(1, width)} 112`} preserveAspectRatio="none" aria-label="连续音高轨"><polyline fill="none" stroke="hsl(var(--primary))" strokeOpacity=".9" strokeWidth="2" points={visiblePitch.map(point => `${(point.time - start) * scale},${102 - Math.min(88, Math.max(0, Math.log2(Math.max(65, point.hz) / 65) / Math.log2(1100 / 65) * 88))}`).join(' ')} /></svg>}
-          <div className="absolute left-4 bottom-2 rounded bg-background/80 px-2 py-1 text-xs text-muted-foreground">{mode === 'chars' && vocalPeaks.length ? '纯人声波形 · F0' : '原媒体波形 · F0'}</div>
+          {shownPeaks.length > 0 ? <canvas ref={canvasRef} className="absolute inset-0" style={{ width, height: pitchTrackHeight }} /> : <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">{waveformStatus}</div>}
+          {(visiblePitchPaths.length > 0 || pitchGuides.length > 0) && <svg className="pointer-events-none absolute inset-0" style={{ width, height: pitchTrackHeight }} viewBox={`0 0 ${Math.max(1, width)} ${pitchTrackHeight}`} preserveAspectRatio="none" aria-label="连续音高轨与音高辅助线">
+            {pitchGuides.map(midi => { const y = pitchViewY(midi, pitchLowMidi, pitchHighMidi, pitchTrackHeight); return <g key={midi}><line x1="0" x2={width} y1={y} y2={y} stroke="#64748b" strokeOpacity={midi % 12 === 0 ? 0.45 : 0.22} strokeWidth="1" />{pitchGuideLabels.has(midi) && <text x="5" y={y - 2} fill="#64748b" fontSize="10" stroke="hsl(var(--background))" strokeWidth="2" paintOrder="stroke">{pitchMidiName(midi)}</text>}</g> })}
+            {visiblePitchPaths.map((points, index) => <polyline key={index} fill="none" stroke="hsl(var(--primary))" strokeOpacity=".95" strokeWidth="2" points={points.join(' ')} />)}
+          </svg>}
+          <div className="absolute left-4 bottom-2 rounded bg-background/80 px-2 py-1 text-xs text-muted-foreground">{vocalPeaks.length ? '纯人声波形 · F0' : peaks.length ? '原媒体波形（待提取人声）· F0' : '等待波形 · F0'}</div>
         </div>
-        {mode === 'chars' && showSpectrogram && acoustics && <div className="relative h-24 border-b border-border bg-black" onPointerDown={seekAt}><canvas ref={spectrogramRef} className="absolute inset-0 h-24" style={{ width }} /><div className="pointer-events-none absolute bottom-1 left-4 rounded bg-black/70 px-2 py-0.5 text-[10px] text-white/80">纯人声频谱 · 低频在下</div></div>}
+        {showSpectrogram && acoustics && <div className="relative h-24 border-b border-border bg-black" onPointerDown={seekAt}><canvas ref={spectrogramRef} className="absolute inset-0 h-24" style={{ width }} /><div className="pointer-events-none absolute bottom-1 left-4 rounded bg-black/70 px-2 py-0.5 text-[10px] text-white/80">纯人声频谱 · 低频在下</div></div>}
         <div className="relative h-30 border-b border-border bg-card/60" onPointerDown={seekAt}>
           {ticks.map(time => <div key={time} className="absolute top-0 bottom-0 border-l border-border/40" style={{ left: (time - start) * scale }} />)}
           <div className="absolute top-2 left-4 text-xs text-muted-foreground">{mode === 'lines' ? '句级歌词轨' : '单字时间轨'}</div>

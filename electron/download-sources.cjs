@@ -10,7 +10,7 @@ async function downloadFromSources(sources, download, onFailure) {
       await download(source)
       return source
     } catch (error) {
-      if (['ENOSPC', 'EACCES', 'EPERM'].includes(error?.code)) throw error
+      if (['ENOSPC', 'EACCES', 'EPERM'].includes(error?.code) || error?.name === 'TaskCancelledError') throw error
       const reason = error instanceof Error ? error.message : String(error)
       failures.push(`${source.label}：${reason}`)
       if (index < sources.length - 1) onFailure?.(source, reason, sources[index + 1])

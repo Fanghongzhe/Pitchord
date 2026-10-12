@@ -41,3 +41,14 @@ test('does not switch lines for local disk errors', async () => {
   }), /磁盘空间不足/)
   assert.deepEqual(attempted, ['镜像 A'])
 })
+
+test('does not switch to another line after the user cancels', async () => {
+  const attempted = []
+  await assert.rejects(downloadFromSources([mirrors[0], official], async source => {
+    attempted.push(source.label)
+    const error = new Error('任务已取消。')
+    error.name = 'TaskCancelledError'
+    throw error
+  }), { name: 'TaskCancelledError' })
+  assert.deepEqual(attempted, ['镜像 A'])
+})

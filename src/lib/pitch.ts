@@ -32,6 +32,14 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
+function percentile(values: number[], fraction: number) {
+  const sorted = [...values].sort((a, b) => a - b)
+  const position = (sorted.length - 1) * fraction
+  const lower = Math.floor(position)
+  const upper = Math.ceil(position)
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower)
+}
+
 /** A local baseline tracker for immediate review. Model adapters can replace this without changing the editor data shape. */
 export function analyzeAudioBuffer(buffer: AudioBuffer): PitchPoint[] {
   const sampleRate = buffer.sampleRate
@@ -162,12 +170,16 @@ function annotationFromPoints(start: number, end: number, points: PitchPoint[]):
   const base = midiNote(Math.round(voiced.length < 5 ? raw[0] : median(smoothed)))
   if (isVibrato(voiced.map(item => item.time), smoothed)) return { motion: 'vibrato', notes: [{ note: base, start: 0, end: 1 }] }
   if (voiced.length < 5 || end - start < 0.22) return { motion: 'flat', notes: [{ note: base, start: 0, end: 1 }] }
+  // A steady tone close to a semitone boundary may alternate between two note
+  // names even though its measured F0 barely moves.
+  if (percentile(smoothed, 0.9) - percentile(smoothed, 0.1) < 0.65) return { motion: 'flat', notes: [{ note: base, start: 0, end: 1 }] }
 
   const states = smoothed.map(value => Math.round(value))
   const step = median(voiced.slice(1).map((item, index) => item.time - voiced[index].time).filter(value => value > 0)) || 0.02
   const minimumRun = Math.max(0.12, step * 4)
-  // A pitch estimate that lasts only a few frames is not a new sung note.
-  for (let pass = 0; pass < 3; pass++) {
+  // Recompute runs after every merge. Editing all runs from one stale snapshot
+  // can make alternating short notes survive indefinitely.
+  for (let pass = 0; pass < states.length; pass++) {
     const runs: Array<{ from: number; to: number; note: number }> = []
     for (let index = 0; index < states.length;) {
       let next = index + 1
@@ -175,19 +187,19 @@ function annotationFromPoints(start: number, end: number, points: PitchPoint[]):
       runs.push({ from: index, to: next, note: states[index] })
       index = next
     }
-    let changed = false
-    for (let index = 0; index < runs.length; index++) {
-      const run = runs[index]
-      const duration = voiced[run.to - 1].time - voiced[run.from].time + step
-      if (duration >= minimumRun) continue
-      const left = runs[index - 1]
-      const right = runs[index + 1]
-      const neighbor = left && right ? (Math.abs(left.note - run.note) <= Math.abs(right.note - run.note) ? left : right) : left ?? right
-      if (!neighbor) continue
-      for (let position = run.from; position < run.to; position++) states[position] = neighbor.note
-      changed = true
-    }
-    if (!changed) break
+    if (runs.length < 2) break
+    const shortest = runs.map((run, index) => ({ index, duration: voiced[run.to - 1].time - voiced[run.from].time + step }))
+      .filter(item => item.duration < minimumRun).sort((a, b) => a.duration - b.duration)[0]
+    if (!shortest) break
+    const run = runs[shortest.index]
+    const left = runs[shortest.index - 1]
+    const right = runs[shortest.index + 1]
+    const neighbor = left && right
+      ? Math.abs(left.note - run.note) < Math.abs(right.note - run.note) ? left
+        : Math.abs(right.note - run.note) < Math.abs(left.note - run.note) ? right
+          : left.to - left.from >= right.to - right.from ? left : right
+      : left ?? right
+    for (let position = run.from; position < run.to; position++) states[position] = neighbor!.note
   }
   const runs: Array<{ from: number; to: number; note: number }> = []
   for (let index = 0; index < states.length;) {
@@ -202,7 +214,7 @@ function annotationFromPoints(start: number, end: number, points: PitchPoint[]):
 }
 
 export function pitchForChar(char: CharSpan, points: PitchPoint[]): PitchAnnotation {
-  return validPitchAnnotation(char.pitchOverride) ? char.pitchOverride : annotationFromPoints(char.start, char.end, points)
+  return char.pitchPreference !== 'model' && validPitchAnnotation(char.pitchOverride) ? char.pitchOverride : annotationFromPoints(char.start, char.end, points)
 }
 
 export function matchPitchToChars(segments: LyricSegment[], points: PitchPoint[]): Record<string, PitchMatch> {

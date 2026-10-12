@@ -44,6 +44,28 @@ describe('pitch analysis matching', () => {
     expect(pitchNotation(matchPitchToChars([segment], points)[segment.chars[0].id].annotation)).toBe('A4')
   })
 
+  it('does not split a half-second steady tone that straddles a semitone boundary', () => {
+    const segment = createSegment('唱', 0, 0.55)
+    const points = Array.from({ length: 55 }, (_, index) => ({
+      time: (index + 0.5) / 100,
+      hz: 440 * 2 ** ((46.5 + Math.sin(index * 0.8) * 0.16 - 69) / 12),
+      confidence: 0.9, rms: 0.2, voiced: true,
+    }))
+    expect(matchPitchToChars([segment], points)[segment.chars[0].id].annotation.notes).toHaveLength(1)
+  })
+
+  it('merges all sub-120ms alternating note runs, not just the first three passes', () => {
+    const segment = createSegment('唱', 0, 0.55)
+    const points = Array.from({ length: 55 }, (_, index) => ({
+      time: (index + 0.5) / 100,
+      hz: 440 * 2 ** (((Math.floor(index / 5) % 2 ? 46 : 47) - 69) / 12),
+      confidence: 0.9, rms: 0.2, voiced: true,
+    }))
+    const annotation = matchPitchToChars([segment], points)[segment.chars[0].id].annotation
+    expect(annotation.notes.length).toBeLessThanOrEqual(4)
+    expect(annotation.notes.every(note => (note.end - note.start) * 0.55 >= 0.119)).toBe(true)
+  })
+
   it('separates sustained note changes from periodic vibrato', () => {
     const segment = createSegment('唱', 0, 1)
     const glide = Array.from({ length: 100 }, (_, index) => ({

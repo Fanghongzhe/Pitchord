@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { LyricSegment } from '@/lib/lyrics'
-import { noteName, type PitchPoint } from '@/lib/pitch'
-import { prepareSubtitleTimeline, subtitleFrameFromTimeline, type SubtitleStyle } from '@/lib/subtitles'
+import { type PitchPoint } from '@/lib/pitch'
+import { pitchColor, prepareSubtitleTimeline, rawPitchAt, rawPitchLabel, rawPitchPlacement, subtitleFrameFromTimeline, type SubtitleStyle } from '@/lib/subtitles'
 
 type Props = {
   segments: LyricSegment[]
@@ -11,20 +11,6 @@ type Props = {
   mediaRef: RefObject<HTMLMediaElement | null>
   playhead: number
   enabled?: boolean
-}
-
-function nearestPitch(points: PitchPoint[], time: number) {
-  let low = 0
-  let high = points.length
-  while (low < high) {
-    const middle = (low + high) >> 1
-    if (points[middle].time < time) low = middle + 1
-    else high = middle
-  }
-  const previous = points[low - 1]
-  const next = points[low]
-  const point = !previous ? next : !next ? previous : Math.abs(previous.time - time) <= Math.abs(next.time - time) ? previous : next
-  return point && Math.abs(point.time - time) < 0.08 && point.voiced && point.hz > 0 ? point : null
 }
 
 function pitchTrail(points: PitchPoint[], time: number) {
@@ -42,7 +28,7 @@ function pitchTrail(points: PitchPoint[], time: number) {
 
 export function LiveSubtitlePreview({ segments, points, style, mediaRef, playhead, enabled = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const [width, setWidth] = useState(640)
+  const [size, setSize] = useState({ width: 640, height: 360 })
   const [time, setTime] = useState(playhead)
   const currentSegment = segments.find(segment => time >= segment.start && time < segment.end)
   const prepared = useMemo(() => currentSegment ? prepareSubtitleTimeline([currentSegment], points) : [], [currentSegment, points])
@@ -50,7 +36,7 @@ export function LiveSubtitlePreview({ segments, points, style, mediaRef, playhea
   useEffect(() => {
     const node = containerRef.current
     if (!node) return
-    const resize = new ResizeObserver(() => setWidth(node.clientWidth))
+    const resize = new ResizeObserver(() => setSize({ width: node.clientWidth, height: node.clientHeight }))
     resize.observe(node)
     return () => resize.disconnect()
   }, [])
@@ -75,11 +61,12 @@ export function LiveSubtitlePreview({ segments, points, style, mediaRef, playhea
     return () => cancelAnimationFrame(frame)
   }, [mediaRef])
 
-  const scale = width / Math.max(1, style.width)
+  const scale = size.width / Math.max(1, style.width)
+  const scaleY = size.height / Math.max(1, style.height)
   const frame = enabled ? subtitleFrameFromTimeline(prepared, time, style) : null
-  const pitch = nearestPitch(points, time)
-  const trail = pitchTrail(points, time)
-  const pitchLabelIndex = frame ? frame.activeIndex >= 0 ? frame.activeIndex : frame.segment.chars.findLastIndex(char => char.end <= time) : -1
+  const pitch = rawPitchAt(points, time)
+  const trail = style.embedRawPitch ? [] : pitchTrail(points, time)
+  const rawPlacement = rawPitchPlacement(style)
   const horizontal = style.horizontalPosition === 'left' ? 'flex-start' : style.horizontalPosition === 'right' ? 'flex-end' : 'center'
   const vertical = style.verticalPosition === 'top' ? 'flex-start' : style.verticalPosition === 'middle' ? 'center' : 'flex-end'
   const textStroke = style.backgroundStyle === 'outline' ? `${Math.max(0, style.outline * scale)}px ${style.outlineColor}` : undefined
@@ -97,15 +84,21 @@ export function LiveSubtitlePreview({ segments, points, style, mediaRef, playhea
         {frame.segment.chars.map((char, index) => {
           const gap = frame.segment.text.slice(index ? frame.segment.chars[index - 1].endOffset : 0, char.startOffset)
           return <span key={char.id}>{gap}<span className="relative inline-block" style={{ color: frame.colors[index], lineHeight: 1 }}>
-            {char.text}
+            {frame.segment.text.slice(char.startOffset, char.endOffset) || char.text}
             {style.showDot && frame.activeIndex === index && <span className="absolute left-1/2 -translate-x-1/2 rounded-full" style={{ top: `calc(100% + ${(style.dotOffset - 2) * scale}px)`, backgroundColor: frame.dotColor, width: dotDiameter, height: dotDiameter, WebkitTextStroke: '0px' }} />}
-            {style.showPitch && pitchLabelIndex === index && frame.currentLabel && <span className="absolute left-1/2 -translate-x-1/2 whitespace-nowrap leading-none" style={{ bottom: `calc(100% - ${style.fontSize * scale * 0.18}px)`, color: frame.colors[index], fontSize: Math.max(9, style.fontSize * scale * 0.45), WebkitTextStroke: '0px' }}>{frame.currentLabel}</span>}
+            {style.showPitch && frame.labels[index] && <span className="absolute left-1/2 -translate-x-1/2 whitespace-nowrap leading-none" style={{ bottom: `calc(100% - ${style.fontSize * scale * 0.18}px)`, color: frame.labelColors[index], fontSize: Math.max(9, style.fontSize * scale * 0.45), WebkitTextStroke: '0px' }}>{frame.labels[index]}</span>}
           </span></span>
         })}{frame.segment.text.slice(frame.segment.chars.at(-1)?.endOffset ?? 0)}
       </div>
     </div>}
-    {enabled && <div className="absolute right-2 top-2 rounded bg-black/65 px-2 py-1 font-mono text-[11px] text-white" aria-label="当前实时音高">
-      <div>{pitch ? `${noteName(pitch.hz)} · ${pitch.hz.toFixed(1)} Hz` : 'F0 —'}</div>
+    {enabled && style.embedRawPitch && pitch && <div className="absolute whitespace-nowrap rounded bg-black/65 font-bold leading-none" aria-label="当前实时音高" style={{
+      left: rawPlacement.x * scale, top: rawPlacement.y * scaleY,
+      transform: `translate(${style.rawPitchHorizontalPosition === 'left' ? '0' : style.rawPitchHorizontalPosition === 'right' ? '-100%' : '-50%'}, ${style.rawPitchVerticalPosition === 'top' ? '0' : style.rawPitchVerticalPosition === 'bottom' ? '-100%' : '-50%'})`,
+      color: pitchColor(pitch.hz, style), fontFamily: style.fontName, fontSize: Math.max(8, style.rawPitchFontSize * scaleY), padding: `${Math.max(2, 5 * scaleY)}px ${Math.max(3, 8 * scale)}px`,
+    }}>{rawPitchLabel(pitch)}</div>}
+    {enabled && !style.embedRawPitch && <div className="absolute right-2 top-2 rounded bg-black/65 px-2 py-1 font-mono text-[11px] text-white" aria-label="当前实时音高">
+      <div className="text-[9px] text-white/70">原始 F0 · 仅供校对</div>
+      <div>{pitch ? rawPitchLabel(pitch) : 'F0 —'}</div>
       {trail.length > 1 && <svg width="140" height="26" viewBox="0 0 140 26" aria-label="最近两秒音高变化"><polyline fill="none" stroke="#67e8f9" strokeWidth="1.5" points={trail.map(point => `${140 - (time - point.time) * 70},${24 - Math.max(0, Math.min(23, (Math.log2(point.hz / 65) / Math.log2(1100 / 65)) * 23))}`).join(' ')} /></svg>}
     </div>}
   </div>

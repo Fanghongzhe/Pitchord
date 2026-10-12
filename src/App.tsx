@@ -18,6 +18,10 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Timeline } from '@/components/Timeline'
 import { LiveSubtitlePreview } from '@/components/LiveSubtitlePreview'
+import { VideoFrameMirror } from '@/components/VideoFrameMirror'
+import { FloatingVideoPreview } from '@/components/FloatingVideoPreview'
+import { RepeatedSectionsDialog } from '@/components/RepeatedSectionsDialog'
+import { SectionMarkingDialog } from '@/components/SectionMarkingDialog'
 import { PitchColorBandEditor } from '@/components/PitchColorBandEditor'
 import {
   carryPitchOverrides, clamp, createSegment, formatTime, getAdjacentSelection, lyricUnits, mergeSegments,
@@ -32,26 +36,28 @@ import { StemMixer } from '@/lib/stem-mixer'
 import { resolveRangeConflict } from '@/lib/range-conflict'
 import { analyzeVocalAcoustics, type AcousticAnalysis } from '@/lib/acoustics'
 import { mergeAlignmentKeepingLocks, reapplyUnlockedLine, scoreCharTiming, type BoundaryReview } from '@/lib/alignment-quality'
+import { autoPitchViewRange, defaultPitchViewSettings, normalizePitchViewSettings, pitchMidiName, type PitchGuideDensity } from '@/lib/timeline-pitch-view'
+import { orderedSections, type RepeatedSection } from '@/lib/repeated-sections'
 
 type History = { present: LyricSegment[]; past: LyricSegment[][]; future: LyricSegment[][] }
 type View = 'lines' | 'chars'
 type SeparationResult = { id: string; modelId: string; modelLabel: string; createdAt: string; vocals: string; accompaniment: string; harmonies?: string; sourceVocals?: string; sourceResultId?: string; harmonyModelId?: string }
 type PitchResult = { id: string; algorithm: PitchAlgorithm; label: string; createdAt: string; path?: string; device?: string; points: PitchPoint[]; separationResultId?: string }
 type AlignmentResult = { id: string; modelId: string; modelLabel: string; createdAt: string; inputResultId?: string; path?: string; coverage: number; lowConfidenceLines?: number[]; segments: LyricSegment[] }
-type Draft = { projectName?: string; segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; activeVocalResultId?: string; activeAccompanimentResultId?: string; pitchInputResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string; alignmentInputResultId?: string; alignmentResults?: AlignmentResult[]; activeAlignmentResultId?: string; harmonyEnabled?: boolean; harmonyModelId?: string; subtitleStyle?: Partial<SubtitleStyle> }
+type Draft = { projectName?: string; segments: LyricSegment[]; mediaName: string; duration: number; pitchPoints?: PitchPoint[]; separationResults?: SeparationResult[]; activeSeparationResultId?: string; activeVocalResultId?: string; activeAccompanimentResultId?: string; pitchInputResultId?: string; pitchResults?: PitchResult[]; activePitchResultId?: string; alignmentInputResultId?: string; alignmentResults?: AlignmentResult[]; activeAlignmentResultId?: string; harmonyEnabled?: boolean; harmonyModelId?: string; subtitleStyle?: Partial<SubtitleStyle>; repeatedSections?: RepeatedSection[] }
 type RecentProject = { name: string; directory: string; updatedAt: string; available?: boolean }
 type TrackKind = 'original' | 'vocals' | 'harmonies' | 'accompaniment'
 type TimelinePreview = { id: string; start: number; end: number }
-type ContextState = { x: number; y: number; id?: string; time?: number }
+type ContextState = { x: number; y: number; id?: string; time?: number; selectedLineIds: string[] }
 type InstallSelection = { pitchMethods: PitchAlgorithm[]; separationModels: string[]; harmonyModels: string[]; alignmentModels: string[] }
 type AnalysisEnvironment = {
   runtimeVersion: string
-  source: 'managed' | 'portable' | 'custom' | 'missing'
+  source: 'managed' | 'portable' | 'custom' | 'existing' | 'missing'
   path: string
   pythonVersion: string
   root: string
   defaultRoot: string
-  runtimePreference: 'managed' | 'custom'
+  runtimePreference: 'managed' | 'custom' | 'existing'
   computeProfile: 'auto' | 'cpu' | 'cuda121'
   detectedGpu: { name: string; driver: string } | null
   packages: { demucs: boolean; torchcrepe: boolean; librosa: boolean; fasterWhisper: boolean; pip: boolean }
@@ -75,7 +81,7 @@ type AnalysisEnvironment = {
   busy: boolean
 }
 type WorkItem = { id: string; title: string; status: 'running' | 'success' | 'error' | 'cancelled'; message: string; progress?: number; updatedAt: number }
-type PitchAlgorithm = 'pyin' | 'torchcrepe'
+type PitchAlgorithm = 'pyin' | 'torchcrepe' | 'rmvpe' | 'fcpe'
 type AnalysisStorage = {
   root: string
   locations: Record<'baseRuntime' | 'analysisRuntime' | 'models' | 'cache' | 'downloads', string>
@@ -118,7 +124,12 @@ const cancellableTaskIds = new Set(['environment', 'separation', 'pitch', 'align
 const installPresets: Record<'minimum' | 'recommended' | 'all', InstallSelection> = {
   minimum: { pitchMethods: ['pyin'], separationModels: ['mdx_extra_q'], harmonyModels: [], alignmentModels: ['base'] },
   recommended: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs'], harmonyModels: [], alignmentModels: ['small'] },
-  all: { pitchMethods: ['pyin', 'torchcrepe'], separationModels: ['htdemucs', 'htdemucs_ft', 'mdx_extra_q'], harmonyModels: ['bs-roformer-karaoke-frazer'], alignmentModels: ['small', 'base'] },
+  all: { pitchMethods: ['pyin', 'torchcrepe', 'rmvpe', 'fcpe'], separationModels: ['htdemucs', 'htdemucs_ft', 'mdx_extra_q'], harmonyModels: ['bs-roformer-karaoke-frazer'], alignmentModels: ['small', 'base'] },
+}
+
+function readPitchViewSettings() {
+  try { return normalizePitchViewSettings(JSON.parse(localStorage.getItem('pitchord.pitch-view.v1') ?? 'null')) }
+  catch { return { ...defaultPitchViewSettings } }
 }
 
 function readHiddenProjectDirectories(): string[] {
@@ -129,14 +140,14 @@ function readHiddenProjectDirectories(): string[] {
 }
 
 const installOptionLabels = {
-  pitchMethods: { pyin: 'pYIN', torchcrepe: 'TorchCrepe' },
+  pitchMethods: { pyin: 'pYIN', torchcrepe: 'TorchCrepe', rmvpe: 'RMVPE', fcpe: 'FCPE' },
   separationModels: { htdemucs: 'HTDemucs', htdemucs_ft: 'HTDemucs FT', mdx_extra_q: 'MDX Extra Q' },
   harmonyModels: { 'bs-roformer-karaoke-frazer': 'BS-RoFormer Karaoke' },
   alignmentModels: { small: 'Whisper Small', base: 'Whisper Base' },
 } as const
 
 const installOptionSizes = {
-  pitchMethods: { pyin: 120, torchcrepe: 25 },
+  pitchMethods: { pyin: 120, torchcrepe: 25, rmvpe: 370, fcpe: 45 },
   separationModels: { htdemucs: 85, htdemucs_ft: 330, mdx_extra_q: 170 },
   harmonyModels: { 'bs-roformer-karaoke-frazer': 204 },
   alignmentModels: { small: 470, base: 150 },
@@ -194,6 +205,9 @@ export default function App() {
   const [view, setView] = useState<View>('lines')
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([])
   const [selectedCharIds, setSelectedCharIds] = useState<string[]>([])
+  const [repeatedSections, setRepeatedSections] = useState<RepeatedSection[]>(savedDraft?.repeatedSections ?? [])
+  const [repeatedSectionsOpen, setRepeatedSectionsOpen] = useState(false)
+  const [sectionMarkingOpen, setSectionMarkingOpen] = useState(false)
   const [centerRequest, setCenterRequest] = useState(0)
   const [centerTargetId, setCenterTargetId] = useState<string | null>(null)
   const [seekCenterRequest, setSeekCenterRequest] = useState(0)
@@ -209,6 +223,10 @@ export default function App() {
   const [shiftConfirmOpen, setShiftConfirmOpen] = useState(false)
   const [pendingShift, setPendingShift] = useState(0)
   const [lastShiftBefore, setLastShiftBefore] = useState<LyricSegment[] | null>(null)
+  const [shiftDialogOpen, setShiftDialogOpen] = useState(false)
+  const [shiftMode, setShiftMode] = useState<'seconds' | 'first-line'>('seconds')
+  const [shiftSecondsDraft, setShiftSecondsDraft] = useState('0')
+  const [firstLineStartDraft, setFirstLineStartDraft] = useState('')
   const [mediaUrl, setMediaUrl] = useState('')
   const [stemReady, setStemReady] = useState<{ vocals: boolean; harmonies: boolean; accompaniment: boolean }>({ vocals: false, harmonies: false, accompaniment: false })
   const [trackEnabled, setTrackEnabled] = useState<Record<TrackKind, boolean>>({ original: true, vocals: false, harmonies: false, accompaniment: false })
@@ -228,6 +246,9 @@ export default function App() {
   const [vocalPeaks, setVocalPeaks] = useState<number[]>([])
   const [acoustics, setAcoustics] = useState<AcousticAnalysis | null>(null)
   const [showSpectrogram, setShowSpectrogram] = useState(true)
+  const [pitchViewSettings, setPitchViewSettings] = useState(readPitchViewSettings)
+  const [pitchViewOpen, setPitchViewOpen] = useState(false)
+  const [floatingVideoUrl, setFloatingVideoUrl] = useState('')
   const [waveformStatus, setWaveformStatus] = useState('导入音频或视频后显示波形')
   const [pitchPoints, setPitchPoints] = useState<PitchPoint[]>([])
   const [pitchStatus, setPitchStatus] = useState('尚未分析音高')
@@ -244,8 +265,10 @@ export default function App() {
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [separationPromptOpen, setSeparationPromptOpen] = useState(false)
   const [repairEnvironmentOpen, setRepairEnvironmentOpen] = useState(false)
-  const [environmentMode, setEnvironmentMode] = useState<'managed' | 'custom'>('managed')
+  const [environmentMode, setEnvironmentMode] = useState<'managed' | 'custom' | 'existing'>('managed')
   const [environmentRootDraft, setEnvironmentRootDraft] = useState('')
+  const [existingEnvironmentDraft, setExistingEnvironmentDraft] = useState('')
+  const [existingEnvironmentError, setExistingEnvironmentError] = useState('')
   const [externalPythonDraft, setExternalPythonDraft] = useState('')
   const [computeProfileDraft, setComputeProfileDraft] = useState<'auto' | 'cpu' | 'cuda121'>('auto')
   const [installPreset, setInstallPreset] = useState<'minimum' | 'recommended' | 'all' | 'custom'>('recommended')
@@ -311,6 +334,8 @@ export default function App() {
   const [notice, setNotice] = useState(savedDraft?.segments.length ? '已恢复歌词草稿。重新导入同名媒体后即可试听。' : '导入媒体，然后导入 LRC 或粘贴歌词开始编辑。')
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const pitchEditorRef = useRef<HTMLDivElement>(null)
+  const lyricListRef = useRef<HTMLDivElement>(null)
+  const lyricListTargetRef = useRef<string | null>(null)
   const vocalInputRef = useRef<HTMLInputElement>(null)
   const lyricInputRef = useRef<HTMLInputElement>(null)
   const environmentSetupPromptedRef = useRef(false)
@@ -329,18 +354,29 @@ export default function App() {
   const rightEdgeAuditionRef = useRef(false)
   const finishRangeAdjustRef = useRef<() => void>(() => undefined)
   const finishCharRangeAdjustRef = useRef<() => void>(() => undefined)
-  const togglePlaybackRef = useRef<(createGuideOnPause?: boolean) => Promise<void>>(async () => undefined)
+  const togglePlaybackRef = useRef<() => Promise<void>>(async () => undefined)
   const workflowExecutionRef = useRef<'automatic' | 'separation' | 'harmony' | 'pitch' | 'alignment' | 'render' | null>(null)
   const workStatusRef = useRef(new Map<string, WorkItem['status']>())
   const getMixer = () => mixerRef.current ?? (mixerRef.current = new StemMixer())
   const activeLine = segments.find(segment => selectedLineIds.includes(segment.id)) ?? null
+  const orderedRepeatedSections = useMemo(() => orderedSections(repeatedSections, segments), [repeatedSections, segments])
+  const repeatedLineLabels = useMemo(() => new Map(orderedRepeatedSections.flatMap(section => section.lineIds.map(id => [id, section.label] as const))), [orderedRepeatedSections])
   const effectiveSegments = useMemo(() => {
-    if (!timelinePreview?.length) return segments
-    const updates = new Map(timelinePreview.map(item => [item.id, item]))
+    const draft = view === 'lines' && rangeAdjusting ? rangeDraft : view === 'chars' && charRangeAdjusting ? charRangeDraft : null
+    const previews = timelinePreview?.length ? timelinePreview : draft ? [draft] : []
+    if (!previews.length) return segments
+    const updates = new Map(previews.map(item => [item.id, item]))
     return view === 'lines'
       ? segments.map(segment => { const update = updates.get(segment.id); return update ? retimeSegment(segment, update.start, update.end) : segment })
       : segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => { const update = updates.get(char.id); return update ? { ...char, start: update.start, end: update.end } : char }) } : segment)
-  }, [segments, timelinePreview, view, activeLine?.id])
+  }, [segments, timelinePreview, view, activeLine?.id, rangeAdjusting, rangeDraft, charRangeAdjusting, charRangeDraft])
+  const visibleActiveLine = effectiveSegments.find(segment => selectedLineIds.includes(segment.id)) ?? null
+  const fittedPitchRange = useMemo(() => pitchViewSettings.autoFitLine && visibleActiveLine
+    ? autoPitchViewRange(pitchPoints, visibleActiveLine.start, visibleActiveLine.end) : null,
+  [pitchViewSettings.autoFitLine, visibleActiveLine, pitchPoints])
+  const displayedPitchView = useMemo(() => fittedPitchRange
+    ? { ...pitchViewSettings, lowMidi: fittedPitchRange[0], highMidi: fittedPitchRange[1] }
+    : pitchViewSettings, [pitchViewSettings, fittedPitchRange])
   const editingLocked = rangeAdjusting || charRangeAdjusting || conflictOpen
   const mergeIndexes = getAdjacentSelection(segments, selectedLineIds)
   const splitBoundaries = useMemo(() => activeLine ? lyricUnits(activeLine.text).slice(0, -1).map(unit => unit.endOffset) : [], [activeLine])
@@ -390,27 +426,28 @@ export default function App() {
     }
   }, [workItems, updateWork])
 
-  const commit = useCallback((next: LyricSegment[]) => {
+  const commit = useCallback((next: LyricSegment[], preserveShiftBaseline = false) => {
+    if (!preserveShiftBaseline) setLastShiftBefore(null)
     setHistory(current => {
       if (JSON.stringify(current.present) === JSON.stringify(next)) return current
       return { present: next, past: [...current.past, current.present].slice(-100), future: [] }
     })
   }, [])
 
-  const undo = useCallback(() => setHistory(current => {
+  const undo = useCallback(() => { setLastShiftBefore(null); setHistory(current => {
     if (!current.past.length) return current
     const previous = current.past[current.past.length - 1]
     return { present: previous, past: current.past.slice(0, -1), future: [current.present, ...current.future] }
-  }), [])
-  const redo = useCallback(() => setHistory(current => {
+  }) }, [])
+  const redo = useCallback(() => { setLastShiftBefore(null); setHistory(current => {
     if (!current.future.length) return current
     return { present: current.future[0], past: [...current.past, current.present], future: current.future.slice(1) }
-  }), [])
+  }) }, [])
 
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       const editable = event.target instanceof HTMLElement && !!event.target.closest('input, textarea, [contenteditable="true"]')
-      if (event.key === ' ' && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); void togglePlaybackRef.current(true); return }
+      if (event.key === ' ' && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); if (!event.repeat) void togglePlaybackRef.current(); return }
       if (editingLocked) return
       if (editable || !(event.ctrlKey || event.metaKey)) return
       if (event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo() }
@@ -465,9 +502,30 @@ export default function App() {
   }, [view, rangeAdjusting, rangeDraft, rangeEdge, charRangeAdjusting, charRangeDraft, charRangeEdge])
 
   useEffect(() => {
-    setSelectedLineIds(ids => ids.filter(id => segments.some(segment => segment.id === id)))
+    setSelectedLineIds(ids => {
+      const valid = ids.filter(id => segments.some(segment => segment.id === id))
+      return valid.length === ids.length ? ids : valid
+    })
     setSelectedCharIds(ids => ids.filter(id => activeLine?.chars.some(char => char.id === id)))
   }, [segments, activeLine])
+
+  useEffect(() => {
+    if (!workspaceOpen || view !== 'lines' || !selectedLineIds.length) return
+    const list = lyricListRef.current
+    if (!list) return
+    const targetId = lyricListTargetRef.current && selectedLineIds.includes(lyricListTargetRef.current)
+      ? lyricListTargetRef.current : selectedLineIds.at(-1)
+    const row = Array.from(list.querySelectorAll<HTMLElement>('[data-line-id]')).find(item => item.dataset.lineId === targetId)
+    if (!row) return
+    const listBounds = list.getBoundingClientRect()
+    const rowBounds = row.getBoundingClientRect()
+    const top = list.scrollTop + rowBounds.top - listBounds.top
+    const padding = 8
+    if (top < list.scrollTop + padding) list.scrollTo({ top: Math.max(0, top - padding), behavior: 'smooth' })
+    else if (top + rowBounds.height > list.scrollTop + list.clientHeight - padding) {
+      list.scrollTo({ top: top + rowBounds.height - list.clientHeight + padding, behavior: 'smooth' })
+    }
+  }, [selectedLineIds, view, workspaceOpen])
 
   useEffect(() => {
     setTextDraft(activeLine?.text ?? '')
@@ -482,13 +540,14 @@ export default function App() {
       setAnalysisEnvironment(status)
       setEnvironmentMode(status.runtimePreference)
       setEnvironmentRootDraft(status.root)
+      setExistingEnvironmentDraft(status.runtimePreference === 'existing' ? status.root : '')
       setExternalPythonDraft(status.runtimePreference === 'custom' ? status.path : '')
       setComputeProfileDraft(status.computeProfile)
       setInstallSelectionDraft(copyInstallSelection(status.installSelection))
       const matchingPreset = (Object.entries(installPresets) as Array<[keyof typeof installPresets, InstallSelection]>).find(([, selection]) => JSON.stringify(selection) === JSON.stringify(status.installSelection))?.[0]
       setInstallPreset(matchingPreset || 'custom')
       setSeparationModel(current => status.separationModels.some(model => model.id === current && model.ready && model.runnable !== false) ? current : status.separationModels.find(model => model.ready && model.runnable !== false)?.id || current)
-      setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready && method.runnable !== false) ? current : (status.pitchMethods.find(method => method.ready && method.runnable !== false && (method.id === 'pyin' || method.id === 'torchcrepe'))?.id as PitchAlgorithm | undefined) || current)
+      setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready && method.runnable !== false) ? current : (status.pitchMethods.find(method => method.ready && method.runnable !== false && ['pyin', 'torchcrepe', 'rmvpe', 'fcpe'].includes(method.id))?.id as PitchAlgorithm | undefined) || current)
       setAlignmentModel(current => status.alignment.models.some(model => model.id === current && model.ready) ? current : status.alignment.models.find(model => model.ready)?.id || current)
       setAnalysisProgress(status.completeReady ? '分析环境与所选模型可用' : '分析环境尚未准备完整')
       const readyCount = [status.mediaTools.ffmpeg && status.mediaTools.ffprobe, status.separationModels.some(model => model.ready), status.pitchMethods.some(method => method.ready), status.alignment.forcedAlignment].filter(Boolean).length
@@ -531,10 +590,11 @@ export default function App() {
 
   useEffect(() => () => { if (mediaUrl) URL.revokeObjectURL(mediaUrl) }, [mediaUrl])
   useEffect(() => () => { void mixerRef.current?.close() }, [])
-  const currentProjectData = useCallback(() => ({ version: 1, projectName, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle }), [projectName, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle])
+  useEffect(() => { localStorage.setItem('pitchord.pitch-view.v1', JSON.stringify(pitchViewSettings)) }, [pitchViewSettings])
+  const currentProjectData = useCallback(() => ({ version: 1, projectName, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle, repeatedSections }), [projectName, mediaName, duration, segments, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle, repeatedSections])
   useEffect(() => {
-    if (mediaName && duration) localStorage.setItem('pitchord.draft.v1', JSON.stringify({ projectName, segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle }))
-  }, [projectName, segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle])
+    if (mediaName && duration) localStorage.setItem('pitchord.draft.v1', JSON.stringify({ projectName, segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle, repeatedSections }))
+  }, [projectName, segments, mediaName, duration, pitchPoints, separationResults, activeSeparationResultId, activeVocalResultId, activeAccompanimentResultId, pitchInputResultId, pitchResults, activePitchResultId, alignmentInputResultId, alignmentResults, activeAlignmentResultId, harmonyEnabled, harmonyModelId, subtitleStyle, repeatedSections])
 
   useEffect(() => {
     if (!projectDirectory || !window.pitchordDesktop) return
@@ -605,6 +665,8 @@ export default function App() {
       setActiveAlignmentResultId('')
       setAlignmentStatus('尚未匹配')
       setHistory({ present: [], past: [], future: [] })
+      setRepeatedSections([])
+      setLastShiftBefore(null)
       setSelectedLineIds([])
       setSelectedCharIds([])
     }
@@ -663,7 +725,7 @@ export default function App() {
     if (workflowExecutionRef.current && !fromPipeline) { setNotice('已有流程正在运行，请等待当前阶段完成。'); return null }
     const ownsLock = !workflowExecutionRef.current
     if (ownsLock) workflowExecutionRef.current = 'pitch'
-    const algorithmLabel = pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'
+    const algorithmLabel = installOptionLabels.pitchMethods[pitchAlgorithm]
     setPitchStatus(`正在使用 ${algorithmLabel} 分析连续音高…`)
     updateWork('pitch', '连续音高识别', 'running', `正在启动 ${algorithmLabel}…`, 0.02)
     await new Promise<void>(resolve => window.setTimeout(resolve, 0))
@@ -963,6 +1025,8 @@ export default function App() {
     setEnvironmentInstallState(analysisEnvironmentBusy ? 'running' : 'idle')
     setEnvironmentMode(analysisEnvironment?.runtimePreference || 'managed')
     setEnvironmentRootDraft(analysisEnvironment?.root || analysisEnvironment?.defaultRoot || '')
+    setExistingEnvironmentDraft(analysisEnvironment?.runtimePreference === 'existing' ? analysisEnvironment.root : '')
+    setExistingEnvironmentError('')
     setExternalPythonDraft(analysisEnvironment?.runtimePreference === 'custom' ? analysisEnvironment.path : '')
     setComputeProfileDraft(analysisEnvironment?.computeProfile || 'auto')
     setRepairEnvironmentOpen(true)
@@ -1001,7 +1065,7 @@ export default function App() {
       setEnvironmentInstallState('success')
       setEnvironmentRootDraft(status.root)
       setSeparationModel(current => status.separationModels.some(model => model.id === current && model.ready && model.runnable !== false) ? current : status.separationModels.find(model => model.ready && model.runnable !== false)?.id || current)
-      setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready && method.runnable !== false) ? current : (status.pitchMethods.find(method => method.ready && method.runnable !== false && (method.id === 'pyin' || method.id === 'torchcrepe'))?.id as PitchAlgorithm | undefined) || current)
+      setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready && method.runnable !== false) ? current : (status.pitchMethods.find(method => method.ready && method.runnable !== false && ['pyin', 'torchcrepe', 'rmvpe', 'fcpe'].includes(method.id))?.id as PitchAlgorithm | undefined) || current)
       setAlignmentModel(current => status.alignment.models.some(model => model.id === current && model.ready) ? current : status.alignment.models.find(model => model.ready)?.id || current)
       setAnalysisProgress('完整分析环境与所选模型已准备完成')
       updateWork('environment', '准备完整分析环境', 'success', 'Python、分析依赖、人声模型和歌词模型已全部准备完成', 1)
@@ -1021,10 +1085,13 @@ export default function App() {
     try {
       const status = await window.pitchordDesktop.configureAnalysisEnvironment({ mode: 'custom', pythonPath: externalPythonDraft })
       setAnalysisEnvironment(status)
+      setEnvironmentMode(status.runtimePreference)
+      setEnvironmentRootDraft(status.root)
+      setExistingEnvironmentDraft(status.runtimePreference === 'existing' ? status.root : '')
       setRepairEnvironmentOpen(false)
-      const complete = status.runtimeReady && status.packages.fasterWhisper
-      updateWork('environment-check', '检测现有 Python', complete ? 'success' : 'error', complete ? '现有 Python 环境可以直接使用' : 'Python 已选定，但仍缺少部分分析组件', 1)
-      setNotice(complete ? '已切换到现有 Python 环境。' : '已记录 Python 环境；缺失组件会在分析环境面板中显示。')
+      const complete = status.completeReady
+      updateWork('environment-check', '检测现有 Python', complete ? 'success' : 'error', complete ? '现有分析环境可以直接使用' : 'Python 已选定，但仍缺少部分分析组件或模型', 1)
+      setNotice(status.runtimePreference === 'existing' ? `已自动识别并复用整套旧环境：${status.root}。${complete ? '' : '部分组件或模型仍需检查。'}` : complete ? '已切换到现有 Python 环境。' : '已记录 Python 环境；模型仍从当前 environment 目录读取，请检查模型状态。')
     } catch (error) {
       updateWork('environment-check', '检测现有 Python', 'error', error instanceof Error ? error.message : String(error))
       setNotice(`无法使用所选 Python：${error instanceof Error ? error.message : String(error)}`)
@@ -1044,6 +1111,31 @@ export default function App() {
     } catch (error) {
       setAnalysisProgress('模型准备未完成')
       setNotice(`模型准备失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally { setAnalysisEnvironmentBusy(false) }
+  }
+
+  const applyExistingEnvironment = async () => {
+    if (!window.pitchordDesktop?.configureAnalysisEnvironment || !existingEnvironmentDraft) return
+    setExistingEnvironmentError('')
+    setAnalysisEnvironmentBusy(true)
+    updateWork('environment-check', '复用已有环境', 'running', '正在检查旧环境中的 Python、计算组件和模型…')
+    try {
+      const status = await window.pitchordDesktop.configureAnalysisEnvironment({ mode: 'existing', root: existingEnvironmentDraft })
+      setAnalysisEnvironment(status)
+      setEnvironmentMode('existing')
+      setEnvironmentRootDraft(status.root)
+      setExternalPythonDraft(status.path)
+      setInstallSelectionDraft(copyInstallSelection(status.installSelection))
+      setSeparationModel(current => status.separationModels.some(model => model.id === current && model.ready) ? current : status.separationModels.find(model => model.ready)?.id || current)
+      setPitchAlgorithm(current => status.pitchMethods.some(method => method.id === current && method.ready) ? current : (status.pitchMethods.find(method => method.ready && ['pyin', 'torchcrepe', 'rmvpe', 'fcpe'].includes(method.id))?.id as PitchAlgorithm | undefined) || current)
+      setAlignmentModel(current => status.alignment.models.some(model => model.id === current && model.ready) ? current : status.alignment.models.find(model => model.ready)?.id || current)
+      updateWork('environment-check', '复用已有环境', status.completeReady ? 'success' : 'error', status.completeReady ? '旧环境中的 Python 和所选模型均可使用' : '已切换目录，但仍有组件或模型未准备好', 1)
+      setNotice(status.completeReady ? '已复用整套旧环境，无需重新下载。' : '已切换到旧环境；请查看下方模型检查结果，缺失项可在模型管理中补充。')
+      if (status.completeReady) setRepairEnvironmentOpen(false)
+    } catch (error) {
+      updateWork('environment-check', '复用已有环境', 'error', error instanceof Error ? error.message : String(error))
+      setExistingEnvironmentError(error instanceof Error ? error.message : String(error))
+      setNotice(`无法复用所选环境：${error instanceof Error ? error.message : String(error)}`)
     } finally { setAnalysisEnvironmentBusy(false) }
   }
 
@@ -1170,6 +1262,12 @@ export default function App() {
     }
     setPlayhead(next)
   }
+  const playMediaSafely = (media: HTMLMediaElement) => {
+    void media.play().catch(error => {
+      if (error instanceof Error && error.name === 'AbortError') return
+      setNotice('媒体无法播放，请确认文件格式受支持。')
+    })
+  }
   const playNormally = (time: number, message: string) => {
     const media = mediaRef.current
     if (!media) { setNotice('请先重新导入原媒体，才能试听。'); return }
@@ -1177,7 +1275,7 @@ export default function App() {
     rightEdgeAuditionRef.current = false
     media.currentTime = time
     setPlayhead(time)
-    void media.play()
+    playMediaSafely(media)
     setNotice(message)
   }
   const loopRange = (start: number, end: number, message: string) => {
@@ -1188,10 +1286,10 @@ export default function App() {
     auditionRef.current = { start, end }
     media.currentTime = start
     setPlayhead(start)
-    void media.play()
+    playMediaSafely(media)
     setNotice(message)
   }
-  async function togglePlayback(createGuideOnPause = false) {
+  async function togglePlayback() {
     const media = mediaRef.current
     if (!media) return
     if (!editingLocked) {
@@ -1199,14 +1297,7 @@ export default function App() {
       rightEdgeAuditionRef.current = false
     }
     if (media.paused) { try { await media.play() } catch { setNotice('媒体无法播放，请确认文件格式受支持。') } }
-    else {
-      const pausedAt = roundTime(media.currentTime)
-      media.pause()
-      if (createGuideOnPause) {
-        setGuideLine(pausedAt)
-        setNotice(`已在 ${formatTime(pausedAt)} 设置辅助线。`)
-      }
-    }
+    else media.pause()
   }
   useEffect(() => { togglePlaybackRef.current = togglePlayback })
 
@@ -1219,6 +1310,7 @@ export default function App() {
       catch (error) { setNotice(`歌词原稿备份失败，导入已取消：${error instanceof Error ? error.message : String(error)}`); return }
     }
     commit(next)
+    setRepeatedSections([])
     setSelectedLineIds([next[0].id])
     setSelectedCharIds([])
     setImportOpen(false)
@@ -1235,6 +1327,7 @@ export default function App() {
       if (!Array.isArray(backup.segments) || !Number.isFinite(backup.duration) || Math.abs(backup.duration - duration) > 0.3 ||
           !backup.segments.every(segment => typeof segment.id === 'string' && typeof segment.text === 'string' && Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.start >= 0 && segment.end <= duration + 0.3 && segment.end > segment.start && Array.isArray(segment.chars))) throw new Error('备份内容与当前媒体不匹配。')
       commit(backup.segments)
+      setRepeatedSections(Array.isArray(backup.repeatedSections) ? backup.repeatedSections : [])
       setSelectedLineIds(backup.segments[0] ? [backup.segments[0].id] : [])
       setSelectedCharIds([])
       setView('lines')
@@ -1244,6 +1337,7 @@ export default function App() {
 
   const selectLine = (id: string, additive: boolean, range: boolean) => {
     if (editingLocked) return
+    lyricListTargetRef.current = id
     setSelectedLineIds(current => {
       if (range && current.length) {
         const anchor = segments.findIndex(segment => segment.id === current[current.length - 1])
@@ -1281,7 +1375,11 @@ export default function App() {
     setSelectedLineIds([added.id])
     setNotice('已添加一句。可修改文本或拖动左右边界。')
   }
-  const addLine = () => addLineAt(playhead)
+  const selectedLineRightEdge = (ids: string[]) => {
+    const selected = segments.filter(segment => ids.includes(segment.id))
+    return selected.length ? Math.max(...selected.map(segment => segment.end)) : null
+  }
+  const addLine = () => addLineAt(selectedLineRightEdge(selectedLineIds) ?? playhead)
 
   const mergeSelected = () => {
     if (editingLocked) return
@@ -1411,12 +1509,13 @@ export default function App() {
   }
 
   const shiftAll = (delta: number, force = false) => {
-    if (editingLocked) return
-    if (!segments.length || !duration) return
-    if (segments.some(segment => segment.chars.some(char => char.startLocked || char.endLocked))) { setNotice('已有锁定的逐字边界，整体移动可能破坏锚点；请先解锁。'); return }
+    if (editingLocked || !segments.length || !duration) return false
+    delta = roundTime(delta)
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.001) { setNotice('请输入非零的整体偏移时间。'); return false }
+    if (segments.some(segment => segment.chars.some(char => char.startLocked || char.endLocked))) { setNotice('已有锁定的逐字边界，整体移动可能破坏锚点；请先解锁。'); return false }
     const next = segments.map(segment => ({ ...segment, start: segment.start + delta, end: segment.end + delta }))
     const overflow = delta > 0 ? Math.max(0, next.at(-1)!.end - duration) : Math.max(0, -next[0].start)
-    if (overflow > 0 && !force) { setPendingShift(delta); setShiftConfirmOpen(true); return }
+    if (overflow > 0 && !force) { setPendingShift(delta); setShiftConfirmOpen(true); return 'pending' }
     const result = next.map(segment => ({ id: segment.id, start: segment.start, end: segment.end }))
     let remaining = overflow
     if (delta > 0) {
@@ -1434,25 +1533,49 @@ export default function App() {
         remaining -= shrink
       }
     }
-    if (remaining > 0) { setNotice('所有歌词已经压缩到最小范围，无法继续整体移动。'); return }
-    setLastShiftBefore(segments)
-    commit(segments.map(segment => { const moved = result.find(item => item.id === segment.id)!; return retimeSegment(segment, roundTime(moved.start), roundTime(moved.end)) }))
+    if (remaining > 0) { setNotice('所有歌词已经压缩到最小范围，无法继续整体移动。'); return false }
+    setLastShiftBefore(current => current ?? segments)
+    commit(segments.map(segment => { const moved = result.find(item => item.id === segment.id)!; return retimeSegment(segment, roundTime(moved.start), roundTime(moved.end)) }), true)
     setNotice(`歌词已整体${delta > 0 ? '后移' : '前移'} ${Math.abs(delta)} 秒。`)
+    return true
   }
-  const restoreShift = () => { if (!lastShiftBefore || editingLocked) return; commit(lastShiftBefore); setLastShiftBefore(null); setNotice('已还原上一次整体移动。') }
+  const restoreShift = () => { if (!lastShiftBefore || editingLocked) return; commit(lastShiftBefore); setShiftDialogOpen(false); setNotice('已恢复到本轮整体偏移前的位置。') }
+  const openShiftDialog = () => {
+    if (!segments.length || !duration || editingLocked) return
+    setShiftMode('seconds')
+    setShiftSecondsDraft('0')
+    setFirstLineStartDraft(formatTime(segments[0].start))
+    setShiftDialogOpen(true)
+  }
+  const firstLineTarget = parseTime(firstLineStartDraft)
+  const shiftDraft = shiftMode === 'first-line'
+    ? firstLineTarget === null || !segments.length ? null : roundTime(firstLineTarget - segments[0].start)
+    : shiftSecondsDraft.trim() === '' || !Number.isFinite(Number(shiftSecondsDraft)) ? null : roundTime(Number(shiftSecondsDraft))
+  const applyShiftDraft = () => {
+    if (shiftDraft === null) return
+    const applied = shiftAll(shiftDraft)
+    if (applied === true || applied === 'pending') setShiftDialogOpen(false)
+  }
 
   const openContextMenu = (event: ReactMouseEvent | ReactPointerEvent, id?: string, time?: number) => {
     event.preventDefault()
     event.stopPropagation()
     if (editingLocked) return
-    if (id && !selectedLineIds.includes(id)) setSelectedLineIds([id])
-    setContextMenu({ x: event.clientX, y: event.clientY, id, time })
+    const selection = id && !selectedLineIds.includes(id) ? [id] : selectedLineIds
+    if (selection !== selectedLineIds) setSelectedLineIds(selection)
+    setContextMenu({ x: event.clientX, y: event.clientY, id, time, selectedLineIds: selection })
   }
   const contextAction = (action: 'add' | 'delete' | 'merge' | 'split') => {
     if (editingLocked) { setContextMenu(null); return }
     const item = contextMenu
     setContextMenu(null)
-    if (item?.time !== undefined && action === 'add') { seek(item.time); addLineAt(item.time); return }
+    if (action === 'add') {
+      const selectedEnd = selectedLineRightEdge(item?.selectedLineIds ?? selectedLineIds)
+      const at = selectedEnd ?? item?.time ?? playhead
+      if (selectedEnd === null && item?.time !== undefined) seek(at)
+      addLineAt(at)
+      return
+    }
     if (item?.id && action === 'delete') { commit(segments.filter(segment => segment.id !== item.id)); setSelectedLineIds([]); setSelectedCharIds([]); if (view === 'chars') setView('lines'); setNotice('已删除选中的歌词标注。'); return }
     if (action === 'merge') mergeSelected()
     if (action === 'split') openSplit()
@@ -1644,7 +1767,8 @@ export default function App() {
     try {
       const project = JSON.parse(content) as Draft & { version?: number }
       if (project.version !== 1 || typeof project.mediaName !== 'string' || !Number.isFinite(project.duration) || project.duration < 0 || !Array.isArray(project.segments)) throw new Error('invalid project')
-      if (!project.segments.every(segment => typeof segment.id === 'string' && typeof segment.text === 'string' && Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.start >= 0 && segment.end <= project.duration && segment.end > segment.start && Array.isArray(segment.chars) && segment.chars.every(char => typeof char.id === 'string' && typeof char.text === 'string' && Number.isFinite(char.start) && Number.isFinite(char.end) && char.start >= segment.start && char.end <= segment.end && char.end >= char.start && Number.isInteger(char.startOffset) && Number.isInteger(char.endOffset) && (char.pitchOverride === undefined || validPitchAnnotation(char.pitchOverride))))) throw new Error('invalid segments')
+      if (!project.segments.every(segment => typeof segment.id === 'string' && typeof segment.text === 'string' && Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.start >= 0 && segment.end <= project.duration && segment.end > segment.start && Array.isArray(segment.chars) && segment.chars.every(char => typeof char.id === 'string' && typeof char.text === 'string' && Number.isFinite(char.start) && Number.isFinite(char.end) && char.start >= segment.start && char.end <= segment.end && char.end >= char.start && Number.isInteger(char.startOffset) && Number.isInteger(char.endOffset) && (char.pitchOverride === undefined || validPitchAnnotation(char.pitchOverride)) && (char.pitchPreference === undefined || char.pitchPreference === 'manual' || char.pitchPreference === 'model')))) throw new Error('invalid segments')
+      const importedRepeatedSections = Array.isArray(project.repeatedSections) && project.repeatedSections.every(section => typeof section.id === 'string' && /^[A-Z]$/.test(section.family) && Array.isArray(section.lineIds) && section.lineIds.every(id => typeof id === 'string') && Array.isArray(section.lineLinks) && section.lineLinks.every(link => typeof link.targetLineId === 'string' && Array.isArray(link.sourceLineIds) && link.sourceLineIds.every(id => typeof id === 'string') && Array.isArray(link.charLinks) && link.charLinks.every(charLink => typeof charLink.targetCharId === 'string' && Array.isArray(charLink.sourceCharIds) && charLink.sourceCharIds.every(id => typeof id === 'string')))) ? project.repeatedSections : []
       const importedPitch = Array.isArray(project.pitchPoints) && project.pitchPoints.every(point => typeof point.time === 'number' && typeof point.hz === 'number' && typeof point.confidence === 'number' && typeof point.rms === 'number' && typeof point.voiced === 'boolean') ? project.pitchPoints : []
       const importedSeparationResults = Array.isArray(project.separationResults) ? project.separationResults : []
       const importedPitchResults = Array.isArray(project.pitchResults) ? project.pitchResults : []
@@ -1676,6 +1800,7 @@ export default function App() {
       setAlignmentResults(importedAlignmentResults)
       setActiveAlignmentResultId(project.activeAlignmentResultId || importedAlignmentResults[0]?.id || '')
       setSubtitleStyle({ ...defaultSubtitleStyle, ...project.subtitleStyle })
+      setRepeatedSections(importedRepeatedSections)
       setHarmonyEnabled(!!project.harmonyEnabled)
       setHarmonyModelId(project.harmonyModelId || 'bs-roformer-karaoke-frazer')
       setLastRenderedSignature('')
@@ -1689,6 +1814,7 @@ export default function App() {
         setWaveformStatus('重新导入原媒体后显示波形')
       }
       setHistory({ present: project.segments, past: [], future: [] })
+      setLastShiftBefore(null)
       setSelectedLineIds(project.segments[0] ? [project.segments[0].id] : [])
       setSelectedCharIds([])
       setPlayhead(0)
@@ -1746,6 +1872,8 @@ export default function App() {
     setVocalTrackReady(false)
     setWaveformStatus('导入音频或视频后显示波形')
     setHistory({ present: [], past: [], future: [] })
+    setRepeatedSections([])
+    setLastShiftBefore(null)
     setSelectedLineIds([])
     setSelectedCharIds([])
     setPlayhead(0)
@@ -1939,6 +2067,7 @@ export default function App() {
   const activateLine = (id: string, beginAdjust = true) => {
     const segment = segments.find(item => item.id === id)
     if (!segment || (editingLocked && rangeDraft?.id !== id)) return
+    lyricListTargetRef.current = id
     setSelectedLineIds([id])
     setSelectedCharIds([])
     setCenterTargetId(id)
@@ -2002,7 +2131,7 @@ export default function App() {
       if (rightEdgeAuditionRef.current && draft) auditionRef.current = { start: loopStart, end: draft.end }
       media.currentTime = loopStart
       setPlayhead(loopStart)
-      void media.play()
+      playMediaSafely(media)
       return
     }
     mixerRef.current?.pause()
@@ -2040,6 +2169,8 @@ export default function App() {
   const activeChar = activeLine?.chars.find(char => selectedCharIds.includes(char.id)) ?? null
   const activePitchAnnotation = activeChar ? pitchForChar(activeChar, pitchPoints) : null
   const activePitchSuggestion = activeChar ? pitchMatches[activeChar.id]?.annotation : null
+  const activeManualPitch = activeChar?.pitchOverride ?? null
+  const activePitchPreference = activeManualPitch && activeChar?.pitchPreference !== 'model' ? 'manual' : 'model'
   const activePitchNotation = activePitchAnnotation ? pitchNotation(activePitchAnnotation) : ''
   const pitchNotationDraft = pitchNotationEdit && pitchNotationEdit.id === activeChar?.id && pitchNotationEdit.base === activePitchNotation ? pitchNotationEdit.value : activePitchNotation
   const savePitchNotation = () => {
@@ -2047,15 +2178,21 @@ export default function App() {
     if (pitchNotationDraft.trim().replaceAll('♯', '#').toUpperCase() === activePitchNotation.toUpperCase()) { setPitchNotationEdit(null); return }
     const parsed = parsePitchNotation(pitchNotationDraft, activePitchAnnotation ?? undefined)
     if (!parsed) { setNotice('音高格式无效。可输入 E4、E4-F4-E4、E4~，或用 — 表示无音高。'); setPitchNotationEdit(null); return }
-    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: parsed } : char) } : segment))
+    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: parsed, pitchPreference: 'manual' as const } : char) } : segment))
     setPitchNotationEdit(null)
     setNotice(`已保存「${activeChar.text}」的字幕音高；可撤回。`)
   }
   const resetPitchOverride = () => {
     if (!activeChar || editingLocked) return
-    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: undefined } : char) } : segment))
+    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: undefined, pitchPreference: undefined } : char) } : segment))
     setPitchNotationEdit(null)
-    setNotice(`「${activeChar.text}」已恢复模型音高建议。`)
+    setNotice(`「${activeChar.text}」的人工音高已删除，当前使用模型建议；可撤回。`)
+  }
+  const selectPitchPreference = (preference: 'manual' | 'model') => {
+    if (!activeChar || !activeLine || editingLocked || preference === 'manual' && !activeChar.pitchOverride) return
+    commit(segments.map(segment => segment.id === activeLine.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchPreference: preference } : char) } : segment))
+    setPitchNotationEdit(null)
+    setNotice(`「${activeChar.text}」已切换为${preference === 'manual' ? '人工结果' : '模型建议'}优先；另一份结果仍保留。`)
   }
   const updatePitchBoundary = (index: number, input: string) => {
     if (!activeChar || !activePitchAnnotation || editingLocked) return
@@ -2066,7 +2203,7 @@ export default function App() {
     const ratio = (value - activeChar.start) / span
     if (ratio <= notes[index].start + 0.005 / span || ratio >= notes[index + 1].end - 0.005 / span) { setNotice('换音点须位于相邻两个音之间。'); return }
     const updated = { ...activePitchAnnotation, notes: notes.map((item, itemIndex) => itemIndex === index ? { ...item, end: ratio } : itemIndex === index + 1 ? { ...item, start: ratio } : item) }
-    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: updated } : char) } : segment))
+    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: updated, pitchPreference: 'manual' as const } : char) } : segment))
     setNotice(`已调整「${activeChar.text}」的换音时间；可撤回。`)
   }
   const updatePitchNote = (index: number, input: string) => {
@@ -2075,7 +2212,7 @@ export default function App() {
     if (noteHz(name) === null) { setNotice('音名格式无效。请使用 E4、F#4 这样的格式。'); return }
     if (activePitchAnnotation.notes[index]?.note === name) return
     const updated = { ...activePitchAnnotation, notes: activePitchAnnotation.notes.map((item, itemIndex) => itemIndex === index ? { ...item, note: name } : item) }
-    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: updated } : char) } : segment))
+    commit(segments.map(segment => segment.id === activeLine?.id ? { ...segment, chars: segment.chars.map(char => char.id === activeChar.id ? { ...char, pitchOverride: updated, pitchPreference: 'manual' as const } : char) } : segment))
     setNotice(`已修改「${activeChar.text}」的第 ${index + 1} 个音；字幕同步更新。`)
   }
   const lineIndex = activeLine ? segments.findIndex(segment => segment.id === activeLine.id) : -1
@@ -2317,6 +2454,10 @@ export default function App() {
           </aside>
 
           <section className="min-w-0 rounded-xl border border-border bg-card p-3">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 px-1">
+              <div><h2 className="text-sm font-semibold">视频与字幕实时预览</h2><p className="text-[11px] text-muted-foreground">这里的字幕样式与最终导出共用，修改后立即更新</p></div>
+              <div className="flex flex-wrap gap-2"><Button size="sm" variant={floatingVideoUrl === mediaUrl && mediaIsVideo ? 'secondary' : 'outline'} onClick={() => setFloatingVideoUrl(current => current === mediaUrl ? '' : mediaUrl)} disabled={!mediaUrl || !mediaIsVideo} aria-pressed={floatingVideoUrl === mediaUrl && mediaIsVideo}><Video className="size-4" />{floatingVideoUrl === mediaUrl && mediaIsVideo ? '关闭小窗' : '悬浮小窗'}</Button><Button size="sm" variant="outline" onClick={() => setSubtitleStudioOpen(true)} disabled={!mediaUrl}><SlidersHorizontal className="size-4" />调整字幕样式</Button></div>
+            </div>
             <div className="relative flex min-h-64 items-center justify-center overflow-hidden rounded-lg bg-neutral-950">
               {mediaUrl ? mediaIsVideo ? <div ref={videoPreviewRef} className="video-preview-shell relative flex h-[330px] w-full items-center justify-center" style={{ '--video-aspect': videoAspect } as CSSProperties}><div className="video-preview-frame relative max-h-full max-w-full" style={{ width: `min(100%, ${330 * videoAspect}px)`, aspectRatio: videoAspect }}><video key={mediaUrl} ref={bindMedia} src={mediaUrl} className="h-full w-full object-contain" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} /><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div></div> : <div className="relative flex min-h-64 w-full flex-col items-center justify-center gap-4 text-white/60"><audio key={mediaUrl} ref={bindMedia} src={mediaUrl} className="hidden" onLoadedMetadata={event => onMediaMetadata(event.currentTarget)} onTimeUpdate={event => onMediaTimeUpdate(event.currentTarget)} onPlay={event => onMediaPlay(event.currentTarget)} onPause={onMediaPause} onSeeking={event => onMediaSeeking(event.currentTarget)} onSeeked={event => onMediaSeeked(event.currentTarget)} onRateChange={event => mixerRef.current?.rateChanged(event.currentTarget)} onVolumeChange={event => onMediaVolumeChange(event.currentTarget)} onEnded={onMediaEnded} /><AudioLines className="size-16" /><span>{mediaName}</span><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div> : <button type="button" onClick={() => mediaInputRef.current?.click()} className="flex flex-col items-center gap-3 text-white/55 hover:text-white"><Upload className="size-8" /><span>导入音频或视频开始</span></button>}
             </div>
@@ -2338,7 +2479,7 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-2"><Button size="sm" variant="outline" onClick={openEnvironmentSetup}>分析环境</Button><Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div>
                 <label className="block space-y-1 text-xs text-muted-foreground">人声分离模型<Select value={separationModel} onValueChange={setSeparationModel}><SelectTrigger className="h-9"><SelectValue placeholder="选择模型" /></SelectTrigger><SelectContent>{analysisEnvironment?.separationModels.filter(model => model.ready && model.runnable !== false).map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></label>
                 <Button size="sm" variant="outline" className="w-full" onClick={requestSeparation} disabled={!mediaUrl || pipelineTaskRunning}>单独运行人声分离</Button>
-                <label className="block space-y-1 text-xs text-muted-foreground">音高算法<Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="h-9"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe'].includes(method.id)}>{method.label}</SelectItem>)}</SelectContent></Select></label>
+                <label className="block space-y-1 text-xs text-muted-foreground">音高算法<Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="h-9"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe', 'rmvpe', 'fcpe'].includes(method.id)}>{method.label}</SelectItem>)}</SelectContent></Select></label>
                 <Button size="sm" variant="outline" className="w-full" onClick={requestPitchAnalysis} disabled={!vocalTrackReady || pipelineTaskRunning}>单独运行音高识别</Button>
                 <div className="grid grid-cols-2 gap-2"><Select value={alignmentModel} onValueChange={setAlignmentModel}><SelectTrigger className="h-9"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.alignment.models.map(model => <SelectItem key={model.id} value={model.id} disabled={!model.ready}>{model.label}</SelectItem>)}</SelectContent></Select><Select value={alignmentLanguage} onValueChange={setAlignmentLanguage}><SelectTrigger className="h-9"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="zh">中文</SelectItem><SelectItem value="en">英语</SelectItem><SelectItem value="ja">日语</SelectItem><SelectItem value="ko">韩语</SelectItem></SelectContent></Select></div>
                 <Button size="sm" variant="outline" className="w-full" onClick={requestLyricAlignment} disabled={!alignmentInputResultId || pipelineTaskRunning}>单独运行歌词对齐</Button>
@@ -2350,7 +2491,7 @@ export default function App() {
                 <label className="block space-y-1 text-xs text-muted-foreground">边缘距离：{subtitleStyle.marginBottom}px<Slider min={24} max={260} step={4} value={[subtitleStyle.marginBottom]} onValueChange={values => setSubtitleStyle(style => ({ ...style, marginBottom: values[0] }))} /></label>
                 {subtitleStyle.backgroundStyle === 'box' && <label className="block space-y-1 text-xs text-muted-foreground">底栏透明度：{subtitleStyle.backgroundOpacity}%<Slider min={20} max={100} step={5} value={[subtitleStyle.backgroundOpacity]} onValueChange={values => setSubtitleStyle(style => ({ ...style, backgroundOpacity: values[0] }))} /></label>}
                 <div className="relative aspect-video overflow-hidden rounded-md bg-neutral-950"><div className="absolute max-w-[86%] whitespace-nowrap px-2 py-1 text-xs" style={{ left: subtitleStyle.horizontalPosition === 'left' ? '7%' : subtitleStyle.horizontalPosition === 'right' ? '93%' : '50%', top: subtitleStyle.verticalPosition === 'top' ? '14%' : subtitleStyle.verticalPosition === 'middle' ? '50%' : '82%', transform: `translate(${subtitleStyle.horizontalPosition === 'left' ? '0' : subtitleStyle.horizontalPosition === 'right' ? '-100%' : '-50%'}, -50%)`, color: subtitleStyle.baseColor, fontFamily: subtitleStyle.fontName, fontWeight: subtitleStyle.bold ? 700 : 400, fontStyle: subtitleStyle.italic ? 'italic' : 'normal', letterSpacing: subtitleStyle.spacing, backgroundColor: subtitleStyle.backgroundStyle === 'box' ? `rgb(0 0 0 / ${subtitleStyle.backgroundOpacity}%)` : 'transparent', textShadow: subtitleStyle.backgroundStyle === 'outline' ? `0 0 ${Math.max(2, subtitleStyle.outline)}px ${subtitleStyle.outlineColor}` : 'none' }}>示例精准字幕</div></div>
-                <Button size="sm" className="w-full" onClick={() => setSubtitleStudioOpen(true)} disabled={!subtitleReady}>预览、导出或生成视频</Button>
+                <Button size="sm" className="w-full" onClick={() => setSubtitleStudioOpen(true)} disabled={!mediaUrl}>调整完整样式、预览或导出</Button>
               </div>
             </details>
           </aside>
@@ -2408,7 +2549,7 @@ export default function App() {
                 const selectedResultId = kind === 'vocals' ? activeVocalResultId : activeAccompanimentResultId
                 return <div key={kind} className="rounded-md border border-border bg-background p-2"><Button size="sm" className="w-full" variant={trackEnabled[kind] ? 'secondary' : 'outline'} aria-pressed={trackEnabled[kind]} onClick={() => toggleTrack(kind)} disabled={!available}>{label} · {trackEnabled[kind] ? '开' : '关'}</Button>{kind !== 'original' && kind !== 'harmonies' && separationResults.length > 0 && <Select value={selectedResultId} onValueChange={value => void selectStemResult(kind, value)}><SelectTrigger className="mt-2 h-8 w-full text-xs"><SelectValue placeholder={`选择${label}结果`} /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`${kind}-${result.id}`} value={result.id}>{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"><Slider min={0} max={kind === 'original' ? 100 : 200} step={5} value={[trackVolume[kind]]} onValueChange={values => setTrackVolume(current => ({ ...current, [kind]: values[0] }))} disabled={!available} aria-label={`${label}音量`} /><span className="w-9 text-right tabular-nums">{trackVolume[kind]}%</span></div></div>
               })}</div></div>
-              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">2. 音高识别</span><Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe'].includes(method.id)}>{method.label}{method.ready && method.runnable !== false ? ' · 已就绪' : ' · 尚未可用'}</SelectItem>)}</SelectContent></Select>{separationResults.length > 0 && <Select value={pitchInputResultId} onValueChange={value => void selectPitchInput(value)}><SelectTrigger className="w-64"><SelectValue placeholder="选择音高识别所用纯人声" /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`pitch-input-${result.id}`} value={result.id}>输入：{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<Button size="sm" variant="secondary" onClick={requestPitchAnalysis} disabled={!mediaUrl || !vocalTrackReady || !audioReady || workItems.some(item => item.id === 'pitch' && item.status === 'running')} >识别连续音高</Button>{workItems.some(item => item.id === 'pitch' && item.status === 'running') && <Button size="sm" variant="destructive" onClick={() => void cancelAnalysisTask('pitch')}><Square />取消运行</Button>}<Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div><p className="mt-2 text-xs text-muted-foreground">音高识别只读取上面明确选择的纯人声结果。{analysisEnvironment?.pitchMethods.find(method => method.id === pitchAlgorithm)?.description || '浏览器预览使用基础自相关分析。'} {pitchAlgorithm === 'torchcrepe' ? `当前将使用${analysisEnvironment?.compute.cudaAvailable ? ` GPU：${analysisEnvironment.compute.cudaDeviceName}` : ' CPU'}` : 'pYIN 使用 CPU。'}</p>{pitchResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">当前音高结果</span><Select value={activePitchResultId} onValueChange={selectPitchResult}><SelectTrigger className="w-64"><SelectValue /></SelectTrigger><SelectContent>{pitchResults.map(result => <SelectItem key={result.id} value={result.id}>{result.label}{result.device ? ` · ${result.device}` : ''} · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">字级匹配和字幕实时使用所选结果</span></div>}</div>
+              <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">2. 音高识别</span><Select value={pitchAlgorithm} onValueChange={value => setPitchAlgorithm(value as PitchAlgorithm)}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.pitchMethods.map(method => <SelectItem key={method.id} value={method.id} disabled={!method.ready || method.runnable === false || !['pyin', 'torchcrepe', 'rmvpe', 'fcpe'].includes(method.id)}>{method.label}{method.ready && method.runnable !== false ? ' · 已就绪' : ' · 尚未可用'}</SelectItem>)}</SelectContent></Select>{separationResults.length > 0 && <Select value={pitchInputResultId} onValueChange={value => void selectPitchInput(value)}><SelectTrigger className="w-64"><SelectValue placeholder="选择音高识别所用纯人声" /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`pitch-input-${result.id}`} value={result.id}>输入：{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<Button size="sm" variant="secondary" onClick={requestPitchAnalysis} disabled={!mediaUrl || !vocalTrackReady || !audioReady || workItems.some(item => item.id === 'pitch' && item.status === 'running')} >识别连续音高</Button>{workItems.some(item => item.id === 'pitch' && item.status === 'running') && <Button size="sm" variant="destructive" onClick={() => void cancelAnalysisTask('pitch')}><Square />取消运行</Button>}<Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div><p className="mt-2 text-xs text-muted-foreground">音高识别只读取上面明确选择的纯人声结果。{analysisEnvironment?.pitchMethods.find(method => method.id === pitchAlgorithm)?.description || '浏览器预览使用基础自相关分析。'} {pitchAlgorithm === 'pyin' || pitchAlgorithm === 'rmvpe' ? '当前使用 CPU。' : `当前将使用${analysisEnvironment?.compute.cudaAvailable ? ` GPU：${analysisEnvironment.compute.cudaDeviceName}` : ' CPU'}`}</p>{pitchResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">当前音高结果</span><Select value={activePitchResultId} onValueChange={selectPitchResult}><SelectTrigger className="w-64"><SelectValue /></SelectTrigger><SelectContent>{pitchResults.map(result => <SelectItem key={result.id} value={result.id}>{result.label}{result.device ? ` · ${result.device}` : ''} · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">字级匹配和字幕实时使用所选结果</span></div>}</div>
               <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">3. 歌词时间戳匹配</span><Select value={alignmentModel} onValueChange={setAlignmentModel}><SelectTrigger className="w-48"><SelectValue /></SelectTrigger><SelectContent>{analysisEnvironment?.alignment.models.map(model => <SelectItem key={model.id} value={model.id} disabled={!model.ready}>{model.label}{model.ready ? ' · 已就绪' : ' · 未准备'}</SelectItem>)}</SelectContent></Select><Select value={alignmentLanguage} onValueChange={setAlignmentLanguage}><SelectTrigger className="w-32"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="zh">中文</SelectItem><SelectItem value="en">英语</SelectItem><SelectItem value="ja">日语</SelectItem><SelectItem value="ko">韩语</SelectItem></SelectContent></Select>{separationResults.length > 0 && <Select value={alignmentInputResultId} onValueChange={value => void selectAlignmentInput(value)}><SelectTrigger className="w-64"><SelectValue placeholder="选择歌词匹配所用纯人声" /></SelectTrigger><SelectContent>{separationResults.map(result => <SelectItem key={`alignment-input-${result.id}`} value={result.id}>输入：{result.modelLabel} · {new Date(result.createdAt).toLocaleTimeString()}</SelectItem>)}</SelectContent></Select>}<Button size="sm" variant="secondary" onClick={requestLyricAlignment} disabled={!segments.length || !alignmentInputResultId || !analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.ready || workItems.some(item => item.id === 'alignment' && item.status === 'running')}>自动匹配歌词时间</Button>{workItems.some(item => item.id === 'alignment' && item.status === 'running') && <Button size="sm" variant="destructive" onClick={() => void cancelAnalysisTask('alignment')}><Square />取消运行</Button>}<Button size="sm" variant="outline" onClick={() => setModelManagerOpen(true)}>模型管理</Button></div><p className="mt-2 text-xs text-muted-foreground">输入歌词作为最终文本；模型只从所选纯人声中取得字词时间戳，再以单调文本匹配生成句级和字级时间建议。结果应用后仍可撤回和人工调整。当前使用{analysisEnvironment?.compute.alignmentCudaAvailable ? ' GPU' : ' CPU'}。</p><p className="mt-2 text-xs text-muted-foreground">{alignmentStatus}</p>{alignmentResults.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3"><span className="text-xs text-muted-foreground">已保留结果</span><Select value={activeAlignmentResultId} onValueChange={selectAlignmentResult}><SelectTrigger className="w-72"><SelectValue /></SelectTrigger><SelectContent>{alignmentResults.map(result => <SelectItem key={result.id} value={result.id}>{result.modelLabel} · {Math.round(result.coverage * 100)}% · {new Date(result.createdAt).toLocaleString()}</SelectItem>)}</SelectContent></Select><span className="text-xs text-muted-foreground">选择后应用该版本，可撤回</span></div>}</div>
               <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">4. 逐字音高与字幕校对</span><Button size="sm" variant="secondary" onClick={openPitchEditor} disabled={!segments.some(segment => segment.chars.length) || editingLocked}>打开逐字音高编辑</Button></div><p className="mt-2 text-xs text-muted-foreground">逐字查看将导出的完整音高序列；选中字后可对照模型建议，修改音名、转音或颤音，并精确调整每个换音点。完成音高识别后即可编辑，歌词时间匹配结果也会同步更新。</p></div>
               {pitchPoints.length > 0 && <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3"><span>有声比例：{Math.round(voicedPitchPoints.length / pitchPoints.length * 100)}%</span><span>音高范围：{voicedPitchPoints.length ? `${Math.round(Math.min(...voicedPitchPoints.map(point => point.hz)))}–${Math.round(Math.max(...voicedPitchPoints.map(point => point.hz)))} Hz` : '无有声帧'}</span><span>当前字匹配：{Object.keys(pitchMatches).length} 个</span></div>}
@@ -2422,14 +2563,30 @@ export default function App() {
                 <div className="flex flex-wrap items-center gap-3"><Tabs value={view} onValueChange={value => changeView(value as View)}><TabsList><TabsTrigger value="lines" className="transition-colors duration-100" disabled={editingLocked}>句级编辑</TabsTrigger><TabsTrigger value="chars" className="transition-colors duration-100" disabled={!activeLine || editingLocked}>单字时间与音高</TabsTrigger></TabsList></Tabs><div><h2 className="font-semibold">{view === 'lines' ? '句级时间轴' : '单字时间轴'}</h2><p className="mt-1 text-xs text-muted-foreground">单击只选中；未选中时双击定位试听、三击进入范围调整；已选中时双击进入调整。</p></div></div>
                 {view === 'lines' ? <div className="flex flex-wrap items-center justify-end gap-2">
                   <div className="mr-2 flex w-48 items-center gap-2 text-xs text-muted-foreground"><span>缩放</span><Slider min={40} max={240} step={5} value={[zoom]} onValueChange={values => setZoom(values[0])} disabled={!duration} /><span className="w-7 text-right">{zoom}</span></div>
+                  <Button size="sm" variant={showSpectrogram ? 'secondary' : 'outline'} onClick={() => setShowSpectrogram(value => !value)} disabled={!acoustics} title={!acoustics ? '请先准备纯人声轨' : undefined}>频谱</Button>
                   <Button size="sm" variant="secondary" onClick={addLine} disabled={!mediaUrl || editingLocked}><Plus />添加句</Button>
                   <Button size="sm" variant="secondary" onClick={mergeSelected} disabled={!mergeIndexes || editingLocked}><Merge />合并</Button>
                   <Button size="sm" variant="secondary" onClick={openSplit} disabled={!activeLine || !splitBoundaries.length || editingLocked}><Scissors />分割</Button>
                   <Button size="sm" variant="destructive" onClick={deleteSelected} disabled={!selectedLineIds.length || editingLocked}><Trash2 />删除</Button>
-                </div> : <div className="flex flex-wrap items-center gap-2"><label className="flex w-36 items-center gap-2 text-xs text-muted-foreground">缩放<Slider min={40} max={320} step={5} value={[zoom]} onValueChange={values => setZoom(values[0])} /></label><Button size="sm" variant={showSpectrogram ? 'secondary' : 'outline'} onClick={() => setShowSpectrogram(value => !value)} disabled={!acoustics}>频谱</Button><Button size="sm" variant="outline" onClick={reapplyActiveLine} disabled={!activeAlignment || editingLocked}>局部重排未锁定区间</Button><Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button><span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span><Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button></div>}
+                </div> : <div className="flex flex-wrap items-center gap-2">
+                  <label className="flex w-36 items-center gap-2 text-xs text-muted-foreground">缩放<Slider min={40} max={320} step={5} value={[zoom]} onValueChange={values => setZoom(values[0])} /></label>
+                  <Button size="sm" variant={showSpectrogram ? 'secondary' : 'outline'} onClick={() => setShowSpectrogram(value => !value)} disabled={!acoustics} title={!acoustics ? '请先准备纯人声轨' : undefined}>频谱</Button>
+                  <Button size="sm" variant={pitchViewOpen ? 'secondary' : 'outline'} onClick={() => setPitchViewOpen(value => !value)} aria-expanded={pitchViewOpen}>音高视图</Button>
+                  <Button size="sm" variant="outline" onClick={reapplyActiveLine} disabled={!activeAlignment || editingLocked}>局部重排未锁定区间</Button>
+                  <Button size="icon" variant="ghost" onClick={() => goLine(-1)} disabled={lineIndex <= 0 || editingLocked} aria-label="上一句"><ChevronLeft /></Button>
+                  <span className="min-w-20 text-center text-xs text-muted-foreground">{lineIndex >= 0 ? `${lineIndex + 1} / ${segments.length}` : '未选中'}</span>
+                  <Button size="icon" variant="ghost" onClick={() => goLine(1)} disabled={lineIndex < 0 || lineIndex >= segments.length - 1 || editingLocked} aria-label="下一句"><ChevronRight /></Button>
+                </div>}
               </div>
-              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} vocalPeaks={vocalPeaks} acoustics={acoustics} showSpectrogram={showSpectrogram} reviews={timingReviews} pitchPoints={pitchPoints} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive, range)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} onClipPreview={setTimelinePreview} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{view === 'lines' ? '选择多句' : '选择多个字'}：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>{view === 'chars' ? '紫色虚线是声学候选，不代表真实换字；接近时吸附，按 Alt 临时关闭。' : '矩形所指向的音频始终来自原媒体'}</span></div>
+              {view === 'chars' && pitchViewOpen && <div className="mb-3 grid gap-3 rounded-lg border border-border bg-muted/30 p-3 text-xs sm:grid-cols-2 lg:grid-cols-4" aria-label="音高视图设置">
+                <div className="space-y-2"><Button size="sm" variant={pitchViewSettings.guides ? 'secondary' : 'outline'} onClick={() => setPitchViewSettings(current => ({ ...current, guides: !current.guides }))} aria-pressed={pitchViewSettings.guides}>音名辅助线 · {pitchViewSettings.guides ? '开' : '关'}</Button><p className="text-muted-foreground">只用于时间轴校对，不进入视频。</p></div>
+                <label className="space-y-1.5 text-muted-foreground">辅助线密度<Select value={pitchViewSettings.density} onValueChange={value => setPitchViewSettings(current => ({ ...current, density: value as PitchGuideDensity }))}><SelectTrigger aria-label="音高辅助线密度"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="semitone">每半音</SelectItem><SelectItem value="natural">自然音名</SelectItem><SelectItem value="whole">每全音</SelectItem><SelectItem value="octave">每八度</SelectItem></SelectContent></Select></label>
+                  <div className="space-y-2 text-muted-foreground"><span>F0 显示范围：{pitchMidiName(displayedPitchView.lowMidi)}–{pitchMidiName(displayedPitchView.highMidi)}</span><Button size="sm" variant={pitchViewSettings.autoFitLine ? 'secondary' : 'outline'} onClick={() => setPitchViewSettings(current => ({ ...current, autoFitLine: !current.autoFitLine }))} aria-pressed={pitchViewSettings.autoFitLine}>实时适配每句音高范围 · {pitchViewSettings.autoFitLine ? '开' : '关'}</Button><label className="flex items-center gap-2">低音<Slider min={36} max={pitchViewSettings.highMidi - 4} step={1} value={[pitchViewSettings.lowMidi]} onValueChange={values => setPitchViewSettings(current => ({ ...current, lowMidi: values[0] }))} disabled={pitchViewSettings.autoFitLine} aria-label="F0 显示下限" /></label><label className="flex items-center gap-2">高音<Slider min={pitchViewSettings.lowMidi + 4} max={96} step={1} value={[pitchViewSettings.highMidi]} onValueChange={values => setPitchViewSettings(current => ({ ...current, highMidi: values[0] }))} disabled={pitchViewSettings.autoFitLine} aria-label="F0 显示上限" /></label><div className="flex gap-1"><Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" onClick={() => { if (!activeLine) return; const range = autoPitchViewRange(pitchPoints, activeLine.start, activeLine.end); if (range) setPitchViewSettings(current => ({ ...current, autoFitLine: false, lowMidi: range[0], highMidi: range[1] })); else setNotice('当前句没有可用的连续音高，无法自动适配显示范围。') }}>适配本句</Button><Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" onClick={() => setPitchViewSettings(current => ({ ...current, autoFitLine: false, lowMidi: 36, highMidi: 85 }))}>恢复范围</Button></div><span className="block">开启实时适配后，切句、合并、拆分或调整句范围都会重算；无有效 F0 时沿用手动范围。</span></div>
+                  <label className="space-y-2 text-muted-foreground">音高轨窗口高度：{pitchViewSettings.trackHeight}px<Slider min={112} max={480} step={8} value={[pitchViewSettings.trackHeight]} onValueChange={values => setPitchViewSettings(current => ({ ...current, trackHeight: values[0] }))} aria-label="音高轨窗口高度" /><span className="block">拉高时间轴，扩大音高曲线的纵向间距，不改变音高数据。</span></label>
+                  <label className="space-y-2 text-muted-foreground">纯人声波形显示增益：{pitchViewSettings.waveformGain.toFixed(1)} 倍<Slider min={1} max={8} step={0.25} value={[pitchViewSettings.waveformGain]} onValueChange={values => setPitchViewSettings(current => ({ ...current, waveformGain: values[0] }))} disabled={!vocalPeaks.length} aria-label="纯人声波形显示增益" /><span className="block">仅放大波形的画面高度。</span></label>
+              </div>}
+              <Timeline mode={view} segments={segments} activeSegment={activeLine} selectedIds={view === 'lines' ? selectedLineIds : selectedCharIds} duration={duration} peaks={peaks} vocalPeaks={vocalPeaks} acoustics={acoustics} showSpectrogram={showSpectrogram} reviews={timingReviews} pitchPoints={pitchPoints} pitchView={displayedPitchView} zoom={zoom} playhead={playhead} centerRequest={centerRequest} centerTargetId={centerTargetId} seekCenterRequest={seekCenterRequest} guideLine={guideLine} waveformStatus={waveformStatus} onSeekAndPlay={seekAndPlay} onSelect={(id, additive, range) => view === 'lines' ? selectLine(id, additive, range) : selectChar(id, additive, range)} onActivateLine={activateLine} onActivateChar={activateChar} onRetimeLines={retimeLines} onRetimeChar={retimeChar} onRetimeChars={retimeChars} onClipPreview={setTimelinePreview} rangeAdjusting={view === 'lines' ? rangeAdjusting : charRangeAdjusting} rangeDraft={view === 'lines' ? rangeDraft : charRangeDraft} onRangePreview={view === 'lines' ? setRangeDraft : setCharRangeDraft} onRangeEdgeChange={view === 'lines' ? setRangeEdge : setCharRangeEdge} onBeginRangeAdjust={() => view === 'lines' ? beginRangeAdjust() : beginCharRangeAdjust()} onSaveRangeAdjust={() => view === 'lines' ? finishRangeAdjust() : finishCharRangeAdjust()} onCancelRangeAdjust={() => view === 'lines' ? cancelRangeAdjust() : cancelCharRangeAdjust()} onContextMenu={view === 'lines' ? (event, time, id) => openContextMenu(event, id, time) : undefined} />
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{view === 'lines' ? '选择多句' : '选择多个字'}：Ctrl/⌘ 点击；连续选择：Shift 点击</span><span>{view === 'chars' ? '紫线是声学变化候选，不参与自动逐字划分；拖动字边界靠近时吸附，按 Alt 临时关闭。' : vocalPeaks.length ? '句级波形与频谱均来自当前纯人声轨。' : '纯人声轨尚未准备；当前波形仅用于原媒体定位。'}</span></div>
             </section>
 
             {activeLine && <section className="rounded-xl border border-border bg-card p-4">
@@ -2442,16 +2599,16 @@ export default function App() {
                   <div className="flex items-center justify-between"><p className="text-sm font-medium">逐字时间与完整音高序列</p><Badge variant="outline">{activeLine.chars.length} 字/词</Badge></div>
                   <p className="text-xs text-muted-foreground">右侧音高序列就是字幕实际使用的结果。点击某字可修改；拖动上方矩形调整字级时间边界。</p>
                   {timingReviews.some(item => item.score >= 25) && <div className="rounded-md border border-orange-400/50 bg-orange-400/5 p-2"><p className="mb-2 text-xs font-medium">建议优先复核的字（规则评分，仅作提示）</p><div className="flex flex-wrap gap-1">{timingReviews.filter(item => item.score >= 25).sort((a, b) => b.score - a.score).slice(0, 12).map(review => { const char = activeLine.chars.find(item => item.id === review.charId)!; return <Button key={review.charId} size="sm" variant="outline" title={review.reasons.join('、')} onClick={() => { setSelectedCharIds([char.id]); seek(char.start); setCenterTargetId(char.id); setCenterRequest(value => value + 1) }}>{char.text} · {review.score}</Button> })}</div></div>}
-                  <div className="max-h-72 space-y-1 overflow-y-auto">{activeLine.chars.map(char => { const lockedOut = editingLocked && charRangeDraft?.id !== char.id; const currentPitch = char.pitchOverride ?? pitchMatches[char.id]?.annotation ?? { motion: 'unvoiced' as const, notes: [] }; return <Button key={char.id} type="button" variant="ghost" disabled={lockedOut} onClick={() => { if (editingLocked) return; setSelectedCharIds([char.id]); playNormally(char.start, `已从「${char.text}」起点开始播放；进入范围调整后才会循环试听。`) }} onDoubleClick={() => activateChar(char.id)} className={`flex h-auto w-full items-center justify-start gap-2 px-2 py-1.5 text-left font-normal ${selectedCharIds.includes(char.id) ? 'bg-primary/15' : ''} ${lockedOut ? 'opacity-30' : ''}`}><span className="w-8 shrink-0 truncate font-medium">{char.text}</span><span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">{formatTime(char.start)} — {formatTime(char.end)}</span><span className="max-w-[45%] break-all text-right font-mono text-xs text-primary" title={pitchNotation(currentPitch)}>{pitchNotation(currentPitch)}</span><span className="shrink-0 text-[10px] text-muted-foreground">{char.pitchOverride ? '人工音高' : pitchPoints.length ? '模型音高' : '待分析'}</span></Button> })}</div>
+                  <div className="max-h-72 space-y-1 overflow-y-auto">{activeLine.chars.map(char => { const lockedOut = editingLocked && charRangeDraft?.id !== char.id; const currentPitch = pitchForChar(char, pitchPoints); return <Button key={char.id} type="button" variant="ghost" disabled={lockedOut} onClick={() => { if (editingLocked) return; setSelectedCharIds([char.id]); playNormally(char.start, `已从「${char.text}」起点开始播放；进入范围调整后才会循环试听。`) }} onDoubleClick={() => activateChar(char.id)} className={`flex h-auto w-full items-center justify-start gap-2 px-2 py-1.5 text-left font-normal ${selectedCharIds.includes(char.id) ? 'bg-primary/15' : ''} ${lockedOut ? 'opacity-30' : ''}`}><span className="w-8 shrink-0 truncate font-medium">{char.text}</span><span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">{formatTime(char.start)} — {formatTime(char.end)}</span><span className="max-w-[45%] break-all text-right font-mono text-xs text-primary" title={pitchNotation(currentPitch)}>{pitchNotation(currentPitch)}</span><span className="shrink-0 text-[10px] text-muted-foreground">{char.pitchOverride && char.pitchPreference !== 'model' ? '人工优先' : char.pitchOverride ? '模型优先' : pitchPoints.length ? '模型音高' : '待分析'}</span></Button> })}</div>
                   {activeChar && activePitchAnnotation && <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3">
-                    <div className="flex items-center justify-between gap-2"><p className="text-sm font-medium">「{activeChar.text}」字幕音高</p><Badge variant={activeChar.pitchOverride ? 'secondary' : 'outline'}>{activeChar.pitchOverride ? '人工修改' : '模型建议'}</Badge></div>
+                    <div className="flex items-center justify-between gap-2"><p className="text-sm font-medium">「{activeChar.text}」字幕音高</p><Badge variant={activePitchPreference === 'manual' ? 'secondary' : 'outline'}>{activePitchPreference === 'manual' ? '人工结果优先' : '模型建议优先'}</Badge></div>
                     <div className="flex flex-wrap gap-2"><Button size="sm" variant={activeChar.startLocked ? 'secondary' : 'outline'} onClick={() => toggleCharBoundaryLock('start')} disabled={editingLocked}>{activeChar.startLocked ? '已锁定起点' : '锁定起点'}</Button><Button size="sm" variant={activeChar.endLocked ? 'secondary' : 'outline'} onClick={() => toggleCharBoundaryLock('end')} disabled={editingLocked}>{activeChar.endLocked ? '已锁定终点' : '锁定终点'}</Button><span className="self-center text-xs text-muted-foreground">相邻字共用的边界会一起锁定。</span></div>
                     {timingReviews.find(item => item.charId === activeChar.id)?.reasons.length ? <p className="text-xs text-orange-600">复核提示：{timingReviews.find(item => item.charId === activeChar.id)?.reasons.join('、')}</p> : null}
-                    <div className="grid gap-2 text-xs sm:grid-cols-2"><div><p className="text-muted-foreground">模型建议</p><p className="mt-1 font-mono">{activePitchSuggestion ? pitchNotation(activePitchSuggestion) : '—'}</p></div><div><p className="text-muted-foreground">当前字幕</p><p className="mt-1 font-mono text-primary">{pitchNotation(activePitchAnnotation)}</p></div></div>
+                    <div className="grid gap-2 text-xs sm:grid-cols-2"><div className="rounded-md border border-border bg-background p-2"><p className="text-muted-foreground">模型建议 · 随字界重新计算</p><p className="mt-1 min-h-5 break-all font-mono">{activePitchSuggestion ? pitchNotation(activePitchSuggestion) : '—'}</p><Button size="sm" variant={activePitchPreference === 'model' ? 'secondary' : 'outline'} className="mt-2" onClick={() => selectPitchPreference('model')} disabled={editingLocked}>以模型为主</Button></div><div className="rounded-md border border-border bg-background p-2"><p className="text-muted-foreground">人工结果 · 独立保留</p><p className="mt-1 min-h-5 break-all font-mono text-primary">{activeManualPitch ? pitchNotation(activeManualPitch) : '尚未设置'}</p><Button size="sm" variant={activePitchPreference === 'manual' ? 'secondary' : 'outline'} className="mt-2" onClick={() => selectPitchPreference('manual')} disabled={editingLocked || !activeManualPitch}>以人工为主</Button></div></div>
                     <label className="block space-y-2 text-xs text-muted-foreground">修改音高简写<Input value={pitchNotationDraft} onChange={event => setPitchNotationEdit({ id: activeChar.id, base: activePitchNotation, value: event.target.value })} onBlur={savePitchNotation} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="E4 / E4-F4-E4 / E4~" className="font-mono text-foreground" disabled={editingLocked} /></label>
                     <p className="text-xs text-muted-foreground">单音 E4；转音 E4-F4-E4；颤音 E4~；无音高 —。失去焦点时保存，ASS 与字级 JSON 同步使用当前字幕音高。</p>
                     {activePitchAnnotation.notes.length > 0 && <div className="space-y-2 border-t border-border pt-3"><p className="text-xs font-medium">逐音音名与时值</p>{activePitchAnnotation.notes.map((item, index) => { const start = activeChar.start + (activeChar.end - activeChar.start) * item.start; const end = activeChar.start + (activeChar.end - activeChar.start) * item.end; return <div key={`${index}:${item.note}`} className="grid grid-cols-[4.5rem_1fr_1fr] items-center gap-2 text-xs"><Input key={`${activeChar.id}:${index}:${item.note}`} defaultValue={item.note} aria-label={`第 ${index + 1} 个音的音名`} onBlur={event => { if (event.currentTarget.value !== item.note) { updatePitchNote(index, event.currentTarget.value); event.currentTarget.value = item.note } }} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} className="h-8 font-mono text-xs" disabled={editingLocked} /><span className="font-mono text-muted-foreground">{formatTime(start)}</span>{index < activePitchAnnotation.notes.length - 1 ? <Input key={`${activeChar.id}:${index}:${end}`} defaultValue={formatTime(end)} aria-label={`第 ${index + 1} 个音的结束时间`} onBlur={event => { if (event.currentTarget.value !== formatTime(end)) { updatePitchBoundary(index, event.currentTarget.value); event.currentTarget.value = formatTime(end) } }} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} className="h-8 font-mono text-xs" disabled={editingLocked} /> : <span className="font-mono text-muted-foreground">{formatTime(end)}</span>}</div> })}<p className="text-xs text-muted-foreground">每行可直接改音名；修改结束时间会同步改变下一音的开始时间。首尾跟随本字范围。</p></div>}
-                    {activeChar.pitchOverride && <Button type="button" size="sm" variant="outline" onClick={resetPitchOverride} disabled={editingLocked}>恢复模型建议</Button>}
+                    {activeChar.pitchOverride && <Button type="button" size="sm" variant="outline" onClick={resetPitchOverride} disabled={editingLocked}>删除人工结果</Button>}
                   </div>}
                 </div>}
                 {view === 'lines' && <Button variant="outline" className="w-full" disabled={editingLocked} onClick={() => changeView('chars')}>校对本句的单字时间与音高 <ChevronRight /></Button>}
@@ -2463,10 +2620,11 @@ export default function App() {
           <aside className="min-w-0 space-y-4">
             <section className="rounded-xl border border-border bg-card p-4">
               <div className="mb-3 flex items-center justify-between"><h2 className="font-semibold">歌词列表</h2><Badge variant="secondary">{segments.length} 句</Badge></div>
-              <div className="mb-3 flex flex-wrap items-center gap-2 border-b border-border pb-3"><span className="text-xs text-muted-foreground">整体移动</span><Button size="sm" variant="outline" onClick={() => shiftAll(-5)} disabled={!segments.length || editingLocked}>−5s</Button><Button size="sm" variant="outline" onClick={() => shiftAll(-1)} disabled={!segments.length || editingLocked}>−1s</Button><Button size="sm" variant="outline" onClick={() => shiftAll(1)} disabled={!segments.length || editingLocked}>+1s</Button><Button size="sm" variant="outline" onClick={() => shiftAll(5)} disabled={!segments.length || editingLocked}>+5s</Button><Button size="sm" variant="ghost" onClick={restoreShift} disabled={!lastShiftBefore || editingLocked}>还原</Button></div>
-              <div className="max-h-72 space-y-1 overflow-auto">
-                {segments.map((segment, index) => { const lockedOut = editingLocked && rangeDraft?.id !== segment.id; return <Button key={segment.id} type="button" variant="ghost" disabled={lockedOut} className={`flex h-auto w-full items-center justify-start gap-3 px-3 py-2 text-left font-normal ${selectedLineIds.includes(segment.id) ? 'bg-primary/15 ring-1 ring-primary/60' : ''} ${lockedOut ? 'opacity-30' : ''}`} onContextMenu={event => openContextMenu(event, segment.id)} onClick={event => { if (editingLocked) return; selectLine(segment.id, event.ctrlKey || event.metaKey, event.shiftKey); setSelectedCharIds(view === 'chars' && segment.chars[0] ? [segment.chars[0].id] : []); setCenterTargetId(segment.id); setCenterRequest(value => value + 1); playNormally(segment.start, '已从当前句起点开始播放；进入范围调整后才会循环试听。') }}>
-                  <span className="w-6 shrink-0 text-muted-foreground">{index + 1}</span><span className="w-22 shrink-0 font-mono text-xs text-muted-foreground">{formatTime(segment.start)}</span><span className="min-w-0 flex-1 truncate">{segment.text}</span><span className="font-mono text-xs text-muted-foreground">{formatTime(segment.end)}</span>
+              <div className="mb-3 flex items-center justify-between gap-2 border-b border-border pb-3"><span className="text-xs text-muted-foreground">逐句时间</span><Button size="sm" variant="outline" onClick={openShiftDialog} disabled={!segments.length || !duration || editingLocked}><SlidersHorizontal className="size-4" />整体偏移</Button></div>
+              <div className="mb-3 flex flex-wrap items-center gap-1.5"><Button size="sm" variant="outline" onClick={() => setSectionMarkingOpen(true)} disabled={!segments.length || editingLocked}>标记段落</Button><Button size="sm" variant="outline" onClick={() => setRepeatedSectionsOpen(true)} disabled={orderedRepeatedSections.length < 2 || editingLocked}>核对同类段落 · {orderedRepeatedSections.length}</Button></div>
+              <div ref={lyricListRef} className="max-h-72 space-y-1 overflow-auto">
+                {segments.map((segment, index) => { const lockedOut = editingLocked && rangeDraft?.id !== segment.id; return <Button key={segment.id} data-line-id={segment.id} type="button" variant="ghost" disabled={lockedOut} className={`flex h-auto w-full items-center justify-start gap-3 px-3 py-2 text-left font-normal ${selectedLineIds.includes(segment.id) ? 'bg-primary/15 ring-1 ring-primary/60' : ''} ${lockedOut ? 'opacity-30' : ''}`} onContextMenu={event => openContextMenu(event, segment.id)} onClick={event => { if (editingLocked) return; selectLine(segment.id, event.ctrlKey || event.metaKey, event.shiftKey); setSelectedCharIds(view === 'chars' && segment.chars[0] ? [segment.chars[0].id] : []); setCenterTargetId(segment.id); setCenterRequest(value => value + 1); playNormally(segment.start, '已从当前句起点开始播放；进入范围调整后才会循环试听。') }}>
+                  <span className="w-6 shrink-0 text-muted-foreground">{index + 1}</span>{repeatedLineLabels.has(segment.id) && <Badge variant="outline" className="shrink-0 text-[10px]">{repeatedLineLabels.get(segment.id)}</Badge>}<span className="w-22 shrink-0 font-mono text-xs text-muted-foreground">{formatTime(segment.start)}</span><span className="min-w-0 flex-1 truncate">{segment.text}</span><span className="font-mono text-xs text-muted-foreground">{formatTime(segment.end)}</span>
                 </Button> })}
                 {!segments.length && <p className="py-8 text-center text-muted-foreground">这里会显示每句歌词，方便快速选择和核对。</p>}
               </div>
@@ -2477,8 +2635,12 @@ export default function App() {
         </div>
       </main>
 
+      {mediaIsVideo && mediaUrl && floatingVideoUrl === mediaUrl && <FloatingVideoPreview mediaRef={mediaRef} segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} playhead={playhead} duration={duration} playing={playing} aspect={videoAspect} onSeek={seek} onTogglePlayback={() => void togglePlayback()} onClose={() => setFloatingVideoUrl('')} />}
       <footer className="flex items-center justify-between border-t border-border bg-card px-4 py-2 text-xs text-muted-foreground" role="status"><span>{notice}</span><span className="flex items-center gap-3"><span className="text-emerald-600">● 本地处理 · 文件不会上传</span><span>项目自动保存</span></span></footer>
       </>}
+
+      {sectionMarkingOpen && <SectionMarkingDialog open={sectionMarkingOpen} onOpenChange={setSectionMarkingOpen} segments={segments} sections={repeatedSections} onSectionsChange={setRepeatedSections} initialLineIds={selectedLineIds} onReview={() => setRepeatedSectionsOpen(true)} />}
+      <RepeatedSectionsDialog open={repeatedSectionsOpen} onOpenChange={setRepeatedSectionsOpen} segments={segments} points={pitchPoints} sections={repeatedSections} onSectionsChange={setRepeatedSections} onApply={next => { commit(next); setNotice('同类段落已同步；时间和人工音高可撤回。') }} duration={duration} playhead={playhead} onSeek={seek} />
 
       <Dialog open={importOpen} onOpenChange={setImportOpen}><DialogContent><DialogHeader><DialogTitle>粘贴歌词</DialogTitle><DialogDescription>支持普通歌词或带时间标签的 LRC。普通歌词会均匀排在媒体时长内，随后可逐句调整。</DialogDescription></DialogHeader><Textarea value={importDraft} onChange={event => setImportDraft(event.target.value)} rows={12} placeholder={'[00:12.30]第一句歌词\n[00:17.20]第二句歌词'} /><DialogFooter><Button variant="outline" onClick={() => setImportOpen(false)}>取消</Button><Button onClick={() => void importLyrics(importDraft)} disabled={!importDraft.trim()}>导入歌词</Button></DialogFooter></DialogContent></Dialog>
 
@@ -2488,19 +2650,38 @@ export default function App() {
 
       <Dialog open={pendingProjectTrash.length > 0} onOpenChange={open => { if (!open && !projectActionBusy) setPendingProjectTrash([]) }}><DialogContent><DialogHeader><DialogTitle>将工程移入回收站？</DialogTitle><DialogDescription>这会移动选中的整个工程文件夹，包括原媒体、分析结果和歌词备份。与“从最近列表移除”不同；在清空系统回收站前通常可以恢复。</DialogDescription></DialogHeader><div className="max-h-36 space-y-1 overflow-y-auto rounded-lg border border-border bg-muted/30 p-3 text-sm">{pendingProjectTrash.map(project => <p key={project.directory} className="truncate" title={project.directory}>{project.name}</p>)}</div><DialogFooter><Button variant="outline" onClick={() => setPendingProjectTrash([])} disabled={projectActionBusy}>取消</Button><Button variant="destructive" onClick={() => void confirmProjectTrash()} disabled={projectActionBusy}>{projectActionBusy ? '正在移动…' : `将 ${pendingProjectTrash.length} 个工程移入回收站`}</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={splitOpen} onOpenChange={setSplitOpen}><DialogContent><DialogHeader><DialogTitle>分割当前歌词</DialogTitle><DialogDescription>先用辅助线确定音频分割位置，再选择文字从哪里断开。左右两句会保留各自的媒体时间范围。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">音频分割时间<Input value={splitTimeDraft} onChange={event => setSplitTimeDraft(event.target.value)} className="font-mono" /></label><div className="space-y-2 text-sm"><label>文字分割位置</label><Select value={splitOffset} onValueChange={setSplitOffset}><SelectTrigger><SelectValue placeholder="选择字界" /></SelectTrigger><SelectContent>{splitBoundaries.map(offset => <SelectItem key={offset} value={String(offset)}>{activeLine?.text.slice(0, offset)} ｜ {activeLine?.text.slice(offset)}</SelectItem>)}</SelectContent></Select></div><div className="rounded-md bg-muted p-3 text-xs text-muted-foreground">点击时间轴或按空格暂停可设置辅助线；没有句内辅助线时取句中附近的音量低谷。文字边界优先参考中英文标点和空格，请试听确认。</div></div><DialogFooter><Button variant="outline" onClick={() => setSplitOpen(false)}>取消</Button><Button onClick={confirmSplit}>确认分割</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={splitOpen} onOpenChange={setSplitOpen}><DialogContent><DialogHeader><DialogTitle>分割当前歌词</DialogTitle><DialogDescription>先用辅助线确定音频分割位置，再选择文字从哪里断开。左右两句会保留各自的媒体时间范围。</DialogDescription></DialogHeader><div className="space-y-4"><label className="block space-y-2 text-sm">音频分割时间<Input value={splitTimeDraft} onChange={event => setSplitTimeDraft(event.target.value)} className="font-mono" /></label><div className="space-y-2 text-sm"><label>文字分割位置</label><Select value={splitOffset} onValueChange={setSplitOffset}><SelectTrigger><SelectValue placeholder="选择字界" /></SelectTrigger><SelectContent>{splitBoundaries.map(offset => <SelectItem key={offset} value={String(offset)}>{activeLine?.text.slice(0, offset)} ｜ {activeLine?.text.slice(offset)}</SelectItem>)}</SelectContent></Select></div><div className="rounded-md bg-muted p-3 text-xs text-muted-foreground">点击时间轴可设置辅助线；空格只控制播放和暂停。没有句内辅助线时取句中附近的音量低谷。文字边界优先参考中英文标点和空格，请试听确认。</div></div><DialogFooter><Button variant="outline" onClick={() => setSplitOpen(false)}>取消</Button><Button onClick={confirmSplit}>确认分割</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={conflictOpen} onOpenChange={() => undefined}><DialogContent><DialogHeader><DialogTitle>{charRangeAdjusting ? '单字范围发生冲突' : '句子范围发生冲突'}</DialogTitle><DialogDescription>新的时间范围与相邻{charRangeAdjusting ? '字' : '歌词'}重叠，请选择处理方式后继续。</DialogDescription></DialogHeader><div className="space-y-2 text-sm"><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" onClick={() => resolveConflict('compress')}>1. 压缩两侧时间块并推动后续块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="outline" onClick={() => resolveConflict('push')}>2. 保持其他时间块形状，只推动相邻块</Button><Button className="h-auto w-full justify-start whitespace-normal py-3 text-left" variant="ghost" onClick={() => resolveConflict('discard')}>3. 放弃本次修改</Button></div></DialogContent></Dialog>
 
       <Dialog open={shiftConfirmOpen} onOpenChange={setShiftConfirmOpen}><DialogContent><DialogHeader><DialogTitle>歌词即将超出媒体范围</DialogTitle><DialogDescription>目前最{pendingShift > 0 ? '后' : '前'}面的歌词时间已经无法继续整体移动。是否继续压缩最外侧句子，并逐步压缩靠里的句子？</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setShiftConfirmOpen(false)}>取消</Button><Button onClick={() => { setShiftConfirmOpen(false); shiftAll(pendingShift, true) }}>继续移动</Button></DialogFooter></DialogContent></Dialog>
 
+      <Dialog open={shiftDialogOpen} onOpenChange={setShiftDialogOpen}><DialogContent><DialogHeader><DialogTitle>整体偏移歌词</DialogTitle><DialogDescription>所有句子及其逐字时间一起移动；音高轨迹保持原位。改完可立即试听和预览。</DialogDescription></DialogHeader>
+        <div className="space-y-4 text-sm">
+          <div className="grid grid-cols-2 gap-2"><Button type="button" variant={shiftMode === 'seconds' ? 'secondary' : 'outline'} onClick={() => setShiftMode('seconds')}>指定偏移</Button><Button type="button" variant={shiftMode === 'first-line' ? 'secondary' : 'outline'} onClick={() => setShiftMode('first-line')}>按第一句校准</Button></div>
+          {shiftMode === 'seconds' ? <div className="space-y-3">
+            <label className="block space-y-1.5">偏移秒数（负数提前，正数延后）<Input type="number" step="0.01" value={shiftSecondsDraft} onChange={event => setShiftSecondsDraft(event.target.value)} aria-label="整体偏移秒数" className="font-mono" /></label>
+            <div className="flex flex-wrap gap-2">{[-5, -1, 1, 5].map(amount => <Button key={amount} type="button" size="sm" variant="outline" onClick={() => setShiftSecondsDraft(String(roundTime((Number(shiftSecondsDraft) || 0) + amount)))}>{amount > 0 ? '+' : ''}{amount}s</Button>)}</div>
+          </div> : <div className="space-y-3">
+            <p className="rounded-md bg-muted/50 p-2 text-xs">第一句「{segments[0]?.text || '—'}」目前开始于 <span className="font-mono font-medium">{segments[0] ? formatTime(segments[0].start) : '—'}</span></p>
+            <label className="block space-y-1.5">调整第一句的开始时间<Input value={firstLineStartDraft} onChange={event => setFirstLineStartDraft(event.target.value)} placeholder="00:12.345" aria-label="第一句目标开始时间" className="font-mono" /></label>
+            <div className="space-y-1"><Slider min={Math.max(0, (segments[0]?.start ?? 0) - 5)} max={Math.min(duration, (segments[0]?.start ?? 0) + 5)} step={0.01} value={[clamp(firstLineTarget ?? segments[0]?.start ?? 0, Math.max(0, (segments[0]?.start ?? 0) - 5), Math.min(duration, (segments[0]?.start ?? 0) + 5))]} onValueChange={values => setFirstLineStartDraft(formatTime(values[0]))} /><p className="text-[11px] text-muted-foreground">拖动可在原起点前后 5 秒内微调；更大的偏移可直接输入时间。</p></div>
+            <div className="flex flex-wrap gap-2">{[-1, -0.1, 0.1, 1].map(amount => <Button key={amount} type="button" size="sm" variant="outline" onClick={() => setFirstLineStartDraft(formatTime(Math.max(0, roundTime((firstLineTarget ?? segments[0]?.start ?? 0) + amount))))}>{amount > 0 ? '+' : ''}{amount}s</Button>)}<Button type="button" size="sm" variant="ghost" onClick={() => { if (firstLineTarget !== null) playNormally(firstLineTarget, '正在试听第一句的目标起点。') }} disabled={firstLineTarget === null || !mediaUrl}>试听目标位置</Button></div>
+            <p className="text-xs text-muted-foreground">先试听并修改第一句起点；应用时用它与原起点的差值移动全部歌词，不会只改第一句。</p>
+          </div>}
+          <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs">{shiftDraft === null ? '请输入有效的时间。' : <>预计整体{shiftDraft < 0 ? '提前' : '延后'} <span className="font-mono font-semibold">{Math.abs(shiftDraft).toFixed(3)} 秒</span>{segments[0] && <span className="ml-2 text-muted-foreground">第一句将从 {formatTime(segments[0].start)} 移至 {formatTime(segments[0].start + shiftDraft)}</span>}</>}</div>
+          <div className="flex items-center justify-between border-t border-border pt-3"><p className="max-w-[70%] text-xs text-muted-foreground">恢复会撤销本轮连续的整体偏移；若中途单独修改歌词，请使用撤销记录。</p><Button type="button" size="sm" variant="ghost" onClick={restoreShift} disabled={!lastShiftBefore || editingLocked}><RotateCcw className="size-4" />恢复原偏移</Button></div>
+        </div>
+        <DialogFooter><Button variant="outline" onClick={() => setShiftDialogOpen(false)}>取消</Button><Button onClick={applyShiftDraft} disabled={shiftDraft === null || Math.abs(shiftDraft) < 0.001 || editingLocked}>应用到全部歌词</Button></DialogFooter>
+      </DialogContent></Dialog>
+
       <Dialog open={separationPromptOpen} onOpenChange={setSeparationPromptOpen}><DialogContent><DialogHeader><DialogTitle>需要先完成人声分离</DialogTitle><DialogDescription>音高识别和歌词时间戳匹配只读取纯人声结果。Pitchord 会直接处理当前工程中已经导入的媒体，不需要再次选择文件。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setSeparationPromptOpen(false)}>取消</Button><Button onClick={() => { setSeparationPromptOpen(false); requestSeparation() }}>进行人声分离</Button></DialogFooter></DialogContent></Dialog>
-      <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : pitchAlgorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={!!rerunPrompt} onOpenChange={open => { if (!open) setRerunPrompt(null) }}><DialogContent><DialogHeader><DialogTitle>该部分任务已经完成</DialogTitle><DialogDescription>是否要尝试其他模型的效果？Pitchord 会同时保留所有模型生成的结果，不会覆盖当前结果。</DialogDescription></DialogHeader><div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p>本次将运行：{rerunPrompt === 'separation' ? selectedSeparationModel?.label || separationModel : rerunPrompt === 'alignment' ? analysisEnvironment?.alignment.models.find(model => model.id === alignmentModel)?.label || alignmentModel : installOptionLabels.pitchMethods[pitchAlgorithm]}</p><p className="mt-1 text-xs text-muted-foreground">结果文件会加入模型或算法后缀，并可以在试听轨和下游输入中重新选择。</p></div><DialogFooter><Button variant="outline" onClick={() => setRerunPrompt(null)}>取消</Button><Button onClick={() => { const kind = rerunPrompt; setRerunPrompt(null); if (kind === 'separation') void runSeparation(); else if (kind === 'alignment') void runLyricAlignment(); else void analyzePitch() }}>继续运行并保留结果</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={repairEnvironmentOpen} onOpenChange={setRepairEnvironmentOpen}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{environmentInstallState === 'success' ? '分析环境安装完成' : environmentInstallState === 'running' ? '正在准备分析环境' : analysisEnvironment?.completeReady ? '分析环境设置' : '首次准备分析环境'}</DialogTitle><DialogDescription>{environmentInstallState === 'success' ? '所选运行组件和模型已通过检查，可以开始使用。' : '选择一套方案即可同时准备 Python、计算组件和所需模型；也可以按需要自定义。安装可在后台继续，关闭此窗口不会取消任务。'}</DialogDescription></DialogHeader>
       {environmentInstallState === 'success' && <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-5 text-sm" role="status"><div className="flex items-center gap-2 font-semibold text-emerald-700"><CheckCircle2 className="size-5" />所选分析环境已准备完成</div><p className="mt-2 text-muted-foreground">现在可以创建或打开项目，开始人声分离、音高识别和歌词对齐。需要调整模型时，可随时从“分析环境”或“模型管理”重新进入。</p></div>}
       {environmentInstallState === 'error' && <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive" role="alert">安装未完成：{analysisProgress}。请查看任务提示或重试。</div>}
       <div className={environmentInstallState === 'success' ? 'hidden' : 'space-y-4 text-sm'}>
-        <div className="grid grid-cols-2 gap-2"><Button variant={environmentMode === 'managed' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('managed')} disabled={analysisEnvironmentBusy}>创建独立环境</Button><Button variant={environmentMode === 'custom' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('custom')} disabled={analysisEnvironmentBusy}>使用现有 Python</Button></div>
+        <div className="grid grid-cols-3 gap-2"><Button variant={environmentMode === 'managed' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('managed')} disabled={analysisEnvironmentBusy}>创建独立环境</Button><Button variant={environmentMode === 'existing' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('existing')} disabled={analysisEnvironmentBusy}>复用整套环境</Button><Button variant={environmentMode === 'custom' ? 'secondary' : 'outline'} onClick={() => setEnvironmentMode('custom')} disabled={analysisEnvironmentBusy}>仅使用 Python</Button></div>
         {environmentMode === 'managed' ? <>
           <div className="space-y-2"><p className="font-medium">环境存放位置</p><div className="flex gap-2"><Input value={environmentRootDraft} readOnly className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseAnalysisDirectory(environmentRootDraft); if (selected) setEnvironmentRootDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><div className="flex items-center justify-between gap-2"><p className="text-xs text-muted-foreground">默认放在软件同目录的 environment 文件夹，也可以选择 D 盘等其他位置。</p>{analysisEnvironment?.defaultRoot && environmentRootDraft !== analysisEnvironment.defaultRoot && <Button size="sm" variant="ghost" onClick={() => setEnvironmentRootDraft(analysisEnvironment.defaultRoot)}>恢复默认</Button>}</div></div>
           <label className="block space-y-2"><span className="font-medium">计算环境</span><Select value={computeProfileDraft} onValueChange={value => setComputeProfileDraft(value as 'auto' | 'cpu' | 'cuda121')} disabled={analysisEnvironmentBusy}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="auto">自动选择（推荐）</SelectItem><SelectItem value="cuda121">NVIDIA GPU · CUDA 12.1</SelectItem><SelectItem value="cpu">仅 CPU</SelectItem></SelectContent></Select></label>
@@ -2508,7 +2689,7 @@ export default function App() {
           <div className="rounded-xl border border-border p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-medium">选择安装内容</p><p className="mt-1 text-xs text-muted-foreground">音高、人声分离和歌词对齐各选至少一项；提取主唱模型可选。后续仍可在模型管理中增删。</p></div><Badge variant="outline">预计下载约 {formatBytes(estimatedInstallBytes)}</Badge></div>
             <div className="mt-3 grid grid-cols-3 gap-2"><Button type="button" size="sm" variant={installPreset === 'minimum' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('minimum')} disabled={analysisEnvironmentBusy}>轻量</Button><Button type="button" size="sm" variant={installPreset === 'recommended' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('recommended')} disabled={analysisEnvironmentBusy}>推荐</Button><Button type="button" size="sm" variant={installPreset === 'all' ? 'secondary' : 'outline'} onClick={() => applyInstallPreset('all')} disabled={analysisEnvironmentBusy}>全部</Button></div>
             <div className="mt-4 grid gap-4 md:grid-cols-3">
-              <div><p className="mb-2 text-xs font-medium">音高识别</p><div className="space-y-2">{(['pyin', 'torchcrepe'] as PitchAlgorithm[]).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.pitchMethods.includes(id)} onChange={() => toggleInstallOption('pitchMethods', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.pitchMethods[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'pyin' ? '轻量，适合干净人声' : '复杂唱法更稳'}</span></span></label>)}</div></div>
+              <div><p className="mb-2 text-xs font-medium">音高识别</p><div className="space-y-2">{(['pyin', 'torchcrepe', 'rmvpe', 'fcpe'] as PitchAlgorithm[]).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.pitchMethods.includes(id)} onChange={() => toggleInstallOption('pitchMethods', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.pitchMethods[id]}{id === 'rmvpe' || id === 'fcpe' ? ' · 可选' : ''}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'pyin' ? '轻量，适合干净人声' : id === 'torchcrepe' ? '复杂唱法与弱基频；支持 GPU' : id === 'rmvpe' ? '歌声专用，10ms 轨迹；额外下载约 360 MB，CPU 推理' : '歌声快速模型，10ms 轨迹；额外安装约 40 MB，支持 GPU'}</span></span></label>)}</div></div>
               <div><p className="mb-2 text-xs font-medium">人声分离</p><div className="space-y-2">{(['htdemucs', 'htdemucs_ft', 'mdx_extra_q'] as const).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.separationModels.includes(id)} onChange={() => toggleInstallOption('separationModels', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.separationModels[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'htdemucs' ? '默认平衡方案' : id === 'htdemucs_ft' ? '更高质量，速度较慢' : '体积较小，速度较快'}</span></span></label>)}</div></div>
               <div><p className="mb-2 text-xs font-medium">歌词对齐</p><div className="space-y-2">{(['small', 'base'] as const).map(id => <label key={id} className="flex cursor-pointer items-start gap-2 rounded-md bg-muted/40 p-2 text-xs"><input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={installSelectionDraft.alignmentModels.includes(id)} onChange={() => toggleInstallOption('alignmentModels', id)} disabled={analysisEnvironmentBusy} /><span><span className="font-medium">{installOptionLabels.alignmentModels[id]}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{id === 'small' ? '精度与体积均衡' : '下载更小、运行更快'}</span></span></label>)}</div></div>
             </div>
@@ -2524,14 +2705,19 @@ export default function App() {
             <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">{environmentProgress.transferState === 'downloading' && <><span>{environmentProgress.speedBytesPerSecond ? `当前网速 ${formatBytes(environmentProgress.speedBytesPerSecond)}/s` : '正在等待下载数据…'}</span>{environmentProgress.downloadedBytes !== undefined && <span>{formatBytes(environmentProgress.downloadedBytes)}{environmentProgress.totalBytes ? ` / ${formatBytes(environmentProgress.totalBytes)}` : ' 已下载'}</span>}{environmentProgress.etaSeconds !== undefined && <span>预计剩余 {formatDuration(environmentProgress.etaSeconds)}</span>}</>}{environmentProgress.transferState === 'cache' && <span>已复用本地下载缓存</span>}{environmentProgress.transferState === 'installing' && <span>下载完成或无需下载，正在安装与校验</span>}</div>
             {environmentProgress.detail && <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground" title={environmentProgress.detail}>当前明细：{environmentProgress.detail}</p>}
           </div>}
+        </> : environmentMode === 'existing' ? <>
+          <div className="space-y-2"><p className="font-medium">旧版 environment 文件夹</p><div className="flex gap-2"><Input value={existingEnvironmentDraft} readOnly placeholder="选择旧版 Pitchord 的 environment 文件夹" className="min-w-0 flex-1 font-mono text-xs" aria-label="已有环境目录" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.chooseExistingAnalysisDirectory(existingEnvironmentDraft || analysisEnvironment?.root); if (selected) { setExistingEnvironmentDraft(selected); setExistingEnvironmentError('') } }} disabled={analysisEnvironmentBusy}>选择文件夹…</Button></div><p className="text-xs text-muted-foreground">请选择包含 base-runtime 和 models 的整个 environment 文件夹，不是里面的 python.exe。会一起使用旧环境中的人声、音高、去和声和歌词对齐模型；不会复制、移动或重新下载文件。复用期间请保留旧文件夹；以后在模型管理中增删模型会影响共用此目录的旧版软件。</p></div>
+          {existingEnvironmentError && <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive" role="alert">{existingEnvironmentError}</p>}
+          {analysisEnvironment?.runtimePreference === 'existing' && analysisEnvironment.root === existingEnvironmentDraft && <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs"><p className="font-medium">当前已复用此目录</p><p className="mt-1 break-all text-muted-foreground">Python：{analysisEnvironment.path}</p><p className="mt-1">Whisper Small：{analysisEnvironment.alignment.models.find(model => model.id === 'small')?.ready ? '已识别' : '未识别'} · 人声模型：{analysisEnvironment.separationModels.filter(model => model.ready).length} 个 · 音高方法：{analysisEnvironment.pitchMethods.filter(method => method.ready).length} 个</p>{!analysisEnvironment.completeReady && <p className="mt-1 text-orange-600">此目录已切换，但所选组件并非全部可用。请在模型管理中查看缺失项。</p>}</div>}
         </> : <>
           <div className="space-y-2"><p className="font-medium">Python 可执行文件</p><div className="flex gap-2"><Input value={externalPythonDraft} readOnly placeholder="选择 python.exe" className="min-w-0 flex-1 font-mono text-xs" /><Button variant="outline" onClick={async () => { const selected = await window.pitchordDesktop?.choosePython(externalPythonDraft); if (selected) setExternalPythonDraft(selected) }} disabled={analysisEnvironmentBusy}>选择…</Button></div><p className="text-xs text-muted-foreground">支持 Python 3.10–3.12。Pitchord 只检测并使用该环境，不会自动安装或删除其中的内容。</p></div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">适合已有环境的用户</p><p className="mt-1 text-xs text-muted-foreground">检测会确认 Demucs、TorchCrepe、librosa 和 faster-whisper。缺失的组件会明确列出，不会静默修改环境。</p></div>
+          <div className="rounded-lg border border-border bg-muted/30 p-3"><p className="font-medium">只切换 Python</p><p className="mt-1 text-xs text-muted-foreground">模型通常仍从当前 environment 目录读取。若所选 python.exe 位于 Pitchord 的 environment/base-runtime 中，软件会自动识别并切换整套环境；更推荐直接使用“复用整套环境”。</p></div>
         </>}
-      </div><DialogFooter>{environmentInstallState === 'success' ? <Button onClick={() => setRepairEnvironmentOpen(false)}>完成，开始使用</Button> : <><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>{analysisEnvironmentBusy ? '后台继续' : analysisEnvironment?.completeReady ? '关闭' : '稍后设置'}</Button>{analysisEnvironmentBusy && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy || !environmentRootDraft || !installSelectionComplete}>{analysisEnvironmentBusy ? '正在准备所选环境…' : analysisEnvironment?.completeReady ? '重新准备所选环境' : '下载并准备所选环境'}</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</>}</DialogFooter></DialogContent></Dialog>
+      </div><DialogFooter>{environmentInstallState === 'success' ? <Button onClick={() => setRepairEnvironmentOpen(false)}>完成，开始使用</Button> : <><Button variant="outline" onClick={() => setRepairEnvironmentOpen(false)}>{analysisEnvironmentBusy ? '后台继续' : analysisEnvironment?.completeReady ? '关闭' : '稍后设置'}</Button>{analysisEnvironmentBusy && environmentMode === 'managed' && <Button variant="destructive" onClick={() => void window.pitchordDesktop?.cancelAnalysisTask('environment')}><Square />取消安装</Button>}{environmentMode === 'managed' ? <Button onClick={() => void installAnalysisRuntime()} disabled={analysisEnvironmentBusy || !environmentRootDraft || !installSelectionComplete}>{analysisEnvironmentBusy ? '正在准备所选环境…' : analysisEnvironment?.completeReady ? '重新准备所选环境' : '下载并准备所选环境'}</Button> : environmentMode === 'existing' ? <Button onClick={() => void applyExistingEnvironment()} disabled={analysisEnvironmentBusy || !existingEnvironmentDraft}>{analysisEnvironmentBusy ? '正在检查…' : '检查并复用此环境'}</Button> : <Button onClick={() => void applyExternalPython()} disabled={analysisEnvironmentBusy || !externalPythonDraft}>检测并使用</Button>}</>}</DialogFooter></DialogContent></Dialog>
 
       <Dialog open={modelManagerOpen} onOpenChange={setModelManagerOpen}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>模型管理</DialogTitle><DialogDescription>功能页只显示已经安装且可以运行的模型。这里可以准备推荐模型，或把自己的模型复制到 Pitchord 环境中统一管理。</DialogDescription></DialogHeader><div className="space-y-3">
-        <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">模型计算设备</p><Badge variant={analysisEnvironment?.compute.cudaAvailable ? 'secondary' : 'outline'}>{analysisEnvironment?.compute.label || '正在检测…'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">支持 CUDA 的 Pitchord 运行环境会自动让 Demucs、MSST 和 TorchCrepe 使用 GPU；pYIN 使用 CPU。歌词识别会单独检测 CTranslate2 的 CUDA 支持，GPU 初始化失败时自动回退 CPU。</p>{analysisEnvironment?.compute.torchVersion && <p className="mt-1 text-xs text-muted-foreground">PyTorch {analysisEnvironment.compute.torchVersion}{analysisEnvironment.compute.torchBuildCuda ? ` · CUDA ${analysisEnvironment.compute.torchBuildCuda}` : ' · CPU 构建'}</p>}</div>
+        <Button size="sm" variant="outline" onClick={() => { setModelManagerOpen(false); window.setTimeout(openEnvironmentSetup, 0) }}><SlidersHorizontal className="size-4" />选择并准备音高识别模型</Button>
+        <div className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">模型计算设备</p><Badge variant={analysisEnvironment?.compute.cudaAvailable ? 'secondary' : 'outline'}>{analysisEnvironment?.compute.label || '正在检测…'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">CUDA 环境可让 Demucs、MSST、TorchCrepe 和 FCPE 使用 GPU；pYIN 与当前 RMVPE ONNX 推理使用 CPU。歌词识别单独检测 CTranslate2 的 CUDA 支持。</p>{analysisEnvironment?.compute.torchVersion && <p className="mt-1 text-xs text-muted-foreground">PyTorch {analysisEnvironment.compute.torchVersion}{analysisEnvironment.compute.torchBuildCuda ? ` · CUDA ${analysisEnvironment.compute.torchBuildCuda}` : ' · CPU 构建'}</p>}</div>
         <p className="text-sm font-medium">人声分离模型</p>{analysisEnvironment?.separationModels.map(model => <div key={model.id} className="rounded-lg border border-border bg-muted/30 p-3"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{model.label}</p><Badge variant={model.ready ? 'secondary' : 'outline'}>{model.ready ? model.runnable === false ? '已纳入，暂不可运行' : '已安装' : '未安装'}</Badge><Badge variant="outline">{model.source === 'custom' ? '用户模型' : '推荐模型'}</Badge></div><p className="mt-1 text-xs text-muted-foreground">{model.description}</p>{!model.bundled && model.source !== 'custom' && <p className="mt-1 text-xs text-muted-foreground">准备此模型需要联网下载，文件保存在 Pitchord/environment/models。</p>}{model.provider === 'msst' && <p className="mt-1 text-xs text-muted-foreground">MSST `.ckpt` 必须与配套 YAML 一起导入。当前可直接运行 MelBandRoformer 与 BSRoformer，架构会按常见模型文件名识别。</p>}</div><div className="flex shrink-0 gap-2">{!model.ready && model.source !== 'custom' && <Button size="sm" onClick={() => setPendingModelDownload(model.id)} disabled={!analysisEnvironment.runtimeReady}>准备</Button>}{model.canDelete && model.ready && <Button size="sm" variant="outline" onClick={() => setPendingModelRemoval(model.id)}>删除</Button>}</div></div></div>)}
         {!analysisEnvironment?.separationModels.length && <p className="py-6 text-center text-sm text-muted-foreground">正在读取模型目录…</p>}
         <div className="rounded-lg border border-dashed border-border p-3"><p className="text-sm font-medium">导入自己的人声分离模型</p><p className="mt-1 text-xs text-muted-foreground">请一次选择 MSST `.ckpt` 权重和配套 YAML；也兼容 Demucs `.th`。文件会复制到 environment/models/custom，之后删除 Pitchord 中的副本不会影响原文件。可识别的 MelBandRoformer 与 BSRoformer 会立即出现在功能页。</p><Button className="mt-3" size="sm" variant="outline" onClick={() => void importAnalysisModel('separation')}>选择模型文件…</Button></div>
@@ -2547,8 +2733,8 @@ export default function App() {
       <Dialog open={subtitleStudioOpen} onOpenChange={open => { setSubtitleStudioOpen(open); if (!open) setPitchColorOpen(false) }}>
         <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-5xl">
           <DialogHeader>
-            <DialogTitle>字幕导出与视频生成</DialogTitle>
-            <DialogDescription>字幕文件可以单独保存并用于其他视频；生成视频时会使用下方的位置与样式。</DialogDescription>
+            <DialogTitle>字幕样式、预览与导出</DialogTitle>
+            <DialogDescription>左侧调整后，右侧立即显示当前视频画面上的字幕；导出时使用同一套设置。</DialogDescription>
           </DialogHeader>
           <div className="grid gap-5 lg:grid-cols-[minmax(0,1.15fr)_minmax(300px,.85fr)]">
             <div className="space-y-5">
@@ -2588,6 +2774,18 @@ export default function App() {
                     <Button size="sm" variant={subtitleStyle.showPitch ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(style => ({ ...style, showPitch: !style.showPitch }))}>显示音高</Button>
                     <Button size="sm" variant={subtitleStyle.showDot ? 'secondary' : 'outline'} onClick={() => setSubtitleStyle(style => ({ ...style, showDot: !style.showDot }))}>强调点</Button>
                   </div>
+                  {subtitleStyle.showPitch && <label className="block space-y-1.5 text-xs text-muted-foreground">唱过后保留的音高标记<Select value={subtitleStyle.retainedPitchLabel} onValueChange={value => setSubtitleStyle(style => ({ ...style, retainedPitchLabel: value as SubtitleStyle['retainedPitchLabel'] }))}><SelectTrigger aria-label="唱过后保留的音高标记"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="last">最后音高（推荐）</SelectItem><SelectItem value="lowest">最低音高</SelectItem><SelectItem value="highest">最高音高</SelectItem><SelectItem value="longest">时值最长的音高</SelectItem></SelectContent></Select><span className="block leading-relaxed">每个唱过的字都会留下一个标记；歌词字色保留该字音高序列中最后一音的颜色。右上角原始 F0 仅供校对，不参与字幕标记。</span></label>}
+                  <div className="space-y-3 rounded-lg border border-border p-3">
+                    <div className="flex items-center justify-between gap-3"><div><p className="text-xs font-medium">原始人声音高标记</p><p className="mt-1 text-xs text-muted-foreground">独立于人工修正的逐字音高；颜色共用歌词色带。</p></div><Button size="sm" variant={subtitleStyle.embedRawPitch ? 'secondary' : 'outline'} aria-label="将原始 F0 嵌入视频" aria-pressed={subtitleStyle.embedRawPitch} onClick={() => setSubtitleStyle(style => ({ ...style, embedRawPitch: !style.embedRawPitch }))}>{subtitleStyle.embedRawPitch ? '已嵌入' : '嵌入视频'}</Button></div>
+                    {subtitleStyle.embedRawPitch && <><div className="space-y-1.5"><p className="text-xs text-muted-foreground">嵌入位置</p><div className="grid max-w-44 grid-cols-3 gap-1.5">{(['top', 'middle', 'bottom'] as const).flatMap(vertical => (['left', 'center', 'right'] as const).map(horizontal => {
+                      const selected = subtitleStyle.rawPitchVerticalPosition === vertical && subtitleStyle.rawPitchHorizontalPosition === horizontal
+                      const label = `原始 F0 ${vertical === 'top' ? '上' : vertical === 'middle' ? '中' : '下'}${horizontal === 'left' ? '左' : horizontal === 'center' ? '中' : '右'}`
+                      return <button key={`${vertical}-${horizontal}`} type="button" aria-label={label} title={label} onClick={() => setSubtitleStyle(style => ({ ...style, rawPitchVerticalPosition: vertical, rawPitchHorizontalPosition: horizontal }))} className={`flex h-8 items-center justify-center rounded-md border transition ${selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-muted-foreground hover:border-primary/60'}`}><span className={`size-2 rounded-full ${selected ? 'bg-primary-foreground' : 'bg-current'}`} /></button>
+                    }))}</div></div>
+                      <label className="block space-y-2 text-xs text-muted-foreground">标记字号：{subtitleStyle.rawPitchFontSize}px<Slider min={20} max={96} step={2} value={[subtitleStyle.rawPitchFontSize]} onValueChange={values => setSubtitleStyle(style => ({ ...style, rawPitchFontSize: values[0] }))} /></label>
+                      <label className="block space-y-2 text-xs text-muted-foreground">边缘距离：{subtitleStyle.rawPitchMargin}px<Slider min={8} max={160} step={4} value={[subtitleStyle.rawPitchMargin]} onValueChange={values => setSubtitleStyle(style => ({ ...style, rawPitchMargin: values[0] }))} /></label>
+                    </>}
+                  </div>
                 </div>
               </section>
 
@@ -2620,8 +2818,19 @@ export default function App() {
             </div>
 
             <div className="space-y-4">
-              <div className="relative aspect-video overflow-hidden rounded-xl bg-neutral-950 shadow-inner"><LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} /></div>
-              <p className="text-xs text-muted-foreground">预览跟随当前播放头；视频区同时显示实际画面。拖动字边界时字幕立即更新。</p>
+              <div className="space-y-3 lg:sticky lg:top-0 lg:z-10 lg:rounded-xl lg:bg-background lg:p-2">
+              <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded-xl bg-neutral-950 shadow-inner">
+                <div className="relative max-h-full max-w-full" style={{ aspectRatio: mediaIsVideo ? videoAspect : 16 / 9, width: mediaIsVideo && videoAspect >= 16 / 9 ? '100%' : undefined, height: !mediaIsVideo || videoAspect < 16 / 9 ? '100%' : undefined }}>
+                  {mediaIsVideo && <VideoFrameMirror mediaRef={mediaRef} />}
+                  <LiveSubtitlePreview segments={effectiveSegments} points={pitchPoints} style={subtitleStyle} mediaRef={mediaRef} playhead={playhead} />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <input type="range" min={0} max={Math.max(duration, 0.01)} step={0.01} value={Math.min(playhead, Math.max(duration, 0.01))} onChange={event => seek(Number(event.target.value))} disabled={!mediaUrl} className="h-1.5 w-full cursor-pointer accent-primary disabled:cursor-default" aria-label="字幕预览播放进度" />
+                <div className="flex items-center justify-between gap-2"><span className="font-mono text-xs tabular-nums text-muted-foreground">{formatTime(playhead)} / {formatTime(duration)}</span><Button size="sm" variant="outline" onClick={() => void togglePlayback()} disabled={!mediaUrl}>{playing ? <Pause className="size-4" /> : <Play className="size-4" />}{playing ? '暂停预览' : '播放预览'}</Button></div>
+              </div>
+              <p className="text-xs text-muted-foreground">{!effectiveSegments.some(segment => segment.chars.length) ? '导入并完成逐字歌词后，此处会显示字幕；现在也可以先调整样式。' : subtitleStyle.embedRawPitch ? '可拖动上方进度查看任意位置。原始 F0 标记会随字幕一同嵌入视频；它不改变人工修正的逐字音高。字体细节以最终导出为准。' : '可拖动上方进度查看任意位置。右上角 F0 小窗仅供校对，不会嵌入视频；字体细节以最终导出为准。'}</p>
+              </div>
               <div className="space-y-2">
                 <div className="rounded-lg border border-border p-3"><p className="text-sm font-medium">LRC</p><p className="mt-1 text-xs text-muted-foreground">每句开始时间与歌词；适合音乐播放器，不含结束时间、字级时间和样式。</p></div>
                 <div className="rounded-lg border border-border p-3"><p className="text-sm font-medium">SRT</p><p className="mt-1 text-xs text-muted-foreground">每句开始/结束时间与歌词；兼容性最好，不含字级音高和视觉样式。</p></div>

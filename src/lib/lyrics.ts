@@ -9,6 +9,7 @@ export type CharSpan = {
   end: number
   origin: 'estimated' | 'manual'
   pitchOverride?: PitchAnnotation
+  pitchPreference?: 'manual' | 'model'
   timingEvidence?: {
     source: 'asr' | 'interpolated' | 'lrc' | 'punctuation'
     asrProbability?: number
@@ -83,7 +84,7 @@ export function carryPitchOverrides(next: LyricSegment[], current: LyricSegment[
     ...segment,
     chars: segment.chars.map(char => {
       const previous = existing.get(char.id)
-      return previous?.text === char.text ? { ...char, pitchOverride: previous.pitchOverride } : { ...char, pitchOverride: undefined }
+      return previous?.text === char.text ? { ...char, pitchOverride: previous.pitchOverride, pitchPreference: previous.pitchPreference } : { ...char, pitchOverride: undefined, pitchPreference: undefined }
     }),
   }))
 }
@@ -113,10 +114,10 @@ export function replaceText(segment: LyricSegment, text: string): LyricSegment {
   const middleEnd = right.length ? right[0].start : segment.end
   if (middle.length && middleEnd - middleStart < middle.length * 0.001) {
     const redistributed = estimateChars(text, segment.start, segment.end).map((char, index) => {
-      if (index < prefix) return { ...char, id: segment.chars[index].id, pitchOverride: segment.chars[index].pitchOverride }
+      if (index < prefix) return { ...char, id: segment.chars[index].id, pitchOverride: segment.chars[index].pitchOverride, pitchPreference: segment.chars[index].pitchPreference }
       if (index >= newUnits.length - suffix) {
         const previous = segment.chars[oldUnits.length - (newUnits.length - index)]
-        return { ...char, id: previous.id, pitchOverride: previous.pitchOverride }
+        return { ...char, id: previous.id, pitchOverride: previous.pitchOverride, pitchPreference: previous.pitchPreference }
       }
       return char
     })

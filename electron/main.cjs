@@ -8,7 +8,9 @@ const { createHash } = require('node:crypto')
 const { resolvePitchInput } = require('./pitch-input.cjs')
 const { findGeneratedStem } = require('./harmony-stems.cjs')
 const { orderedDownloadSources, downloadFromSources } = require('./download-sources.cjs')
+const { pitchInstallRequirements, pitchMethodReady, selectedPitchMethodsReady } = require('./pitch-runtime.cjs')
 const { validatedProjectDirectory, duplicateProject } = require('./project-operations.cjs')
+const { findExistingEnvironment, inferExistingEnvironmentFromPython } = require('./existing-environment.cjs')
 
 let ffmpegPath = null
 try { ffmpegPath = require('ffmpeg-static') } catch { ffmpegPath = null }
@@ -73,6 +75,7 @@ const settingsFile = () => path.join(app.getPath('userData'), 'pitchord-settings
 const runtimeManifest = JSON.parse(fs.readFileSync(path.join(scriptRoot, 'runtime-manifest.json'), 'utf8'))
 const analysisRuntimeVersion = runtimeManifest.analysisRuntimeVersion
 const bootstrapInstaller = runtimeManifest.bootstrapInstaller
+const demucsCheckpoints = runtimeManifest.demucsCheckpoints || {}
 const analysisModel = 'htdemucs'
 const separationModelCatalog = [
   { id: 'htdemucs', label: 'HTDemucs', description: '默认平衡方案，首次使用时按需下载模型。', bundled: false },
@@ -97,6 +100,13 @@ const alignmentModelCatalog = [
   { id: 'small', label: 'Whisper Small', description: '推荐的中英文歌词对齐模型，精度与体积较均衡。', revision: '536b0662742c02347bc0e980a01041f333bce120' },
   { id: 'base', label: 'Whisper Base', description: '下载更小、运行更快，复杂演唱的识别精度较低。', revision: 'ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66' },
 ]
+const pitchMethodLabels = { pyin: 'pYIN', torchcrepe: 'TorchCrepe', rmvpe: 'RMVPE', fcpe: 'FCPE' }
+const rmvpeModel = {
+  repository: 'lj1995/VoiceConversionWebUI', revision: 'e6d0c1a17da07c33557852f9dfa2bd44cc75737d',
+  filename: 'rmvpe.onnx', sha256: '5370e71ac80af8b4b7c793d27efd51fd8bf962de3a7ede0766dac0befa3660fd', size: 361688443,
+}
+const rmvpeModelPath = () => path.join(modelRoot(), 'pitch', 'rmvpe', rmvpeModel.filename)
+const rmvpeModelMarker = () => path.join(modelRoot(), 'pitch', 'rmvpe', 'pitchord-model.json')
 const defaultInstallSelection = {
   pitchMethods: ['pyin', 'torchcrepe'],
   separationModels: ['htdemucs'],
@@ -108,7 +118,7 @@ function normalizeInstallSelection(value, requireComplete = false) {
   const source = value && typeof value === 'object' ? value : defaultInstallSelection
   const uniqueSupported = (items, supported) => [...new Set(Array.isArray(items) ? items.filter(item => supported.includes(item)) : [])]
   const selection = {
-    pitchMethods: uniqueSupported(source.pitchMethods, ['pyin', 'torchcrepe']),
+    pitchMethods: uniqueSupported(source.pitchMethods, Object.keys(pitchMethodLabels)),
     separationModels: uniqueSupported(source.separationModels, separationModelCatalog.map(model => model.id)),
     harmonyModels: uniqueSupported(source.harmonyModels, harmonyModelCatalog.map(model => model.id)),
     alignmentModels: uniqueSupported(source.alignmentModels, alignmentModelCatalog.map(model => model.id)),
@@ -130,6 +140,8 @@ const managedRuntimeRoot = () => baseRuntimeRoot()
 const managedPythonPath = () => basePythonPath()
 const modelRoot = () => path.join(analysisRoot(), 'models')
 const modelMarker = (modelId = analysisModel) => path.join(modelRoot(), 'demucs', `${modelId}.json`)
+const demucsCheckpointDirectory = () => path.join(modelRoot(), 'torch', 'hub', 'checkpoints')
+const demucsCheckpointsPresent = modelId => (demucsCheckpoints[modelId] || []).every(checkpoint => fs.existsSync(path.join(demucsCheckpointDirectory(), checkpoint.file)))
 const alignmentModelRoot = () => path.join(modelRoot(), 'whisper')
 const alignmentModelDirectory = modelId => path.join(alignmentModelRoot(), modelId)
 const alignmentModelMarker = modelId => path.join(alignmentModelDirectory(modelId), 'pitchord-model.json')
@@ -272,7 +284,7 @@ async function detectNvidiaGpu() {
 
 async function preferredPythonPath() {
   const settings = await readSettings()
-  if (settings.runtimePreference === 'custom' && typeof settings.pythonPath === 'string' && fs.existsSync(settings.pythonPath)) return settings.pythonPath
+  if (['custom', 'existing'].includes(settings.runtimePreference) && typeof settings.pythonPath === 'string' && fs.existsSync(settings.pythonPath)) return settings.pythonPath
   const managed = managedPythonPath()
   if (settings.runtimePreference === 'managed') return fs.existsSync(managed) ? managed : null
   if (fs.existsSync(managed)) return managed
@@ -381,7 +393,7 @@ async function probePython(pythonPath) {
   if (!pythonPath || (!fs.existsSync(pythonPath) && path.isAbsolute(pythonPath))) return null
   const program = [
     'import json, platform, importlib.util',
-    "result = {'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'fasterWhisper': bool(importlib.util.find_spec('faster_whisper')), 'pip': bool(importlib.util.find_spec('pip')), 'torchVersion': '', 'torchBuildCuda': '', 'cudaAvailable': False, 'cudaDeviceCount': 0, 'cudaDeviceName': '', 'ctranslateCudaAvailable': False}",
+    "result = {'version': platform.python_version(), 'demucs': bool(importlib.util.find_spec('demucs')), 'torchcrepe': bool(importlib.util.find_spec('torchcrepe')), 'rmvpe': bool(importlib.util.find_spec('rmvpe_onnx')), 'fcpe': bool(importlib.util.find_spec('torchfcpe')), 'librosa': bool(importlib.util.find_spec('librosa')), 'fasterWhisper': bool(importlib.util.find_spec('faster_whisper')), 'pip': bool(importlib.util.find_spec('pip')), 'torchVersion': '', 'torchBuildCuda': '', 'cudaAvailable': False, 'cudaDeviceCount': 0, 'cudaDeviceName': '', 'ctranslateCudaAvailable': False}",
     "torch_spec = importlib.util.find_spec('torch')",
     "exec(\"import torch\\nresult['torchVersion'] = str(torch.__version__)\\nresult['torchBuildCuda'] = str(torch.version.cuda or '')\\nresult['cudaAvailable'] = bool(torch.cuda.is_available())\\nresult['cudaDeviceCount'] = int(torch.cuda.device_count()) if result['cudaAvailable'] else 0\\nresult['cudaDeviceName'] = torch.cuda.get_device_name(0) if result['cudaAvailable'] else ''\") if torch_spec else None",
     "ctranslate_spec = importlib.util.find_spec('ctranslate2')",
@@ -401,10 +413,10 @@ async function analysisRuntimeStatus() {
   const selectedPath = await preferredPythonPath()
   const probe = await probePython(selectedPath)
   const baseProbe = await probePython(basePythonPath())
-  const source = selectedPath === managedPath ? 'managed' : selectedPath && nearbyPythonPaths().includes(selectedPath) ? 'portable' : selectedPath ? 'custom' : 'missing'
+  const source = settings.runtimePreference === 'existing' && selectedPath ? 'existing' : selectedPath === managedPath ? 'managed' : selectedPath && nearbyPythonPaths().includes(selectedPath) ? 'portable' : selectedPath ? 'custom' : 'missing'
   const models = await Promise.all(separationModelCatalog.map(async model => {
     let ready = false
-    try { ready = JSON.parse(await readFile(modelMarker(model.id), 'utf8')).model === model.id } catch { /* not prepared by Pitchord */ }
+    try { ready = JSON.parse(await readFile(modelMarker(model.id), 'utf8')).model === model.id && demucsCheckpointsPresent(model.id) } catch { /* not prepared by Pitchord */ }
     return { ...model, ready, runnable: true, source: 'recommended', canDelete: !model.bundled, provider: 'demucs' }
   }))
   const customModels = readCustomModels()
@@ -428,16 +440,20 @@ async function analysisRuntimeStatus() {
     const manifest = JSON.parse(await readFile(path.join(analysisRoot(), 'pitchord-environment.json'), 'utf8'))
     installSelection = normalizeInstallSelection(manifest.installSelection)
   } catch { /* use the recommended selection for older or custom environments */ }
+  let rmvpeReady = false
+  try {
+    const marker = JSON.parse(await readFile(rmvpeModelMarker(), 'utf8'))
+    rmvpeReady = marker.sha256 === rmvpeModel.sha256 && (await fs.promises.stat(rmvpeModelPath())).size === rmvpeModel.size
+  } catch { /* model not prepared */ }
   const requiredPackagesReady = (
     (!installSelection.separationModels.length || !!probe?.demucs) &&
-    (!installSelection.pitchMethods.includes('pyin') || !!probe?.librosa) &&
-    (!installSelection.pitchMethods.includes('torchcrepe') || !!probe?.torchcrepe) &&
+    selectedPitchMethodsReady(probe, installSelection.pitchMethods) &&
     (!installSelection.alignmentModels.length || !!probe?.fasterWhisper)
   )
   const selectedSeparationModelsReady = installSelection.separationModels.every(id => models.some(model => model.id === id && model.ready))
   const selectedHarmonyModelsReady = installSelection.harmonyModels.every(id => harmonyModels.some(model => model.id === id && model.ready))
   const selectedAlignmentModelsReady = installSelection.alignmentModels.every(id => alignmentModels.some(model => model.id === id && model.ready))
-  const completeReady = requiredPackagesReady && selectedSeparationModelsReady && selectedHarmonyModelsReady && selectedAlignmentModelsReady
+  const completeReady = requiredPackagesReady && (!installSelection.pitchMethods.includes('rmvpe') || rmvpeReady) && selectedSeparationModelsReady && selectedHarmonyModelsReady && selectedAlignmentModelsReady
   const detectedGpu = await detectNvidiaGpu()
   const computeProfile = await configuredComputeProfile()
   return {
@@ -447,10 +463,10 @@ async function analysisRuntimeStatus() {
     pythonVersion: probe?.version || '',
     root: analysisRoot(),
     defaultRoot: defaultAnalysisRoot(),
-    runtimePreference: settings.runtimePreference === 'custom' ? 'custom' : 'managed',
+    runtimePreference: ['custom', 'existing'].includes(settings.runtimePreference) ? settings.runtimePreference : 'managed',
     computeProfile,
     detectedGpu,
-    packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, librosa: !!probe?.librosa, fasterWhisper: !!probe?.fasterWhisper, pip: !!probe?.pip },
+    packages: { demucs: !!probe?.demucs, torchcrepe: !!probe?.torchcrepe, rmvpe: !!probe?.rmvpe, fcpe: !!probe?.fcpe, librosa: !!probe?.librosa, fasterWhisper: !!probe?.fasterWhisper, pip: !!probe?.pip },
     compute: {
       backend: probe?.cudaAvailable ? 'cuda' : 'cpu',
       label: probe?.cudaAvailable ? `${probe.cudaDeviceName || 'CUDA GPU'}（CUDA ${probe.torchBuildCuda || '可用'}）` : 'CPU',
@@ -467,9 +483,10 @@ async function analysisRuntimeStatus() {
     separationModels: models,
     harmonyModels,
     pitchMethods: [
-      { id: 'pyin', label: 'pYIN', ready: !!probe?.librosa, description: '概率 YIN 与时间连续性平滑，适合干净纯人声。' },
-      { id: 'torchcrepe', label: 'TorchCrepe', ready: !!probe?.torchcrepe, description: '神经网络音高识别，适合复杂唱法和弱基频。' },
-      { id: 'rmvpe', label: 'RMVPE', ready: false, description: '人声专用模型；等待可再分发权重和推理环境后加入。' },
+      { id: 'pyin', label: 'pYIN', ready: pitchMethodReady(probe, 'pyin'), description: '概率 YIN 与时间连续性平滑，适合干净纯人声。' },
+      { id: 'torchcrepe', label: 'TorchCrepe', ready: pitchMethodReady(probe, 'torchcrepe'), description: '神经网络音高识别，适合复杂唱法和弱基频。' },
+      { id: 'rmvpe', label: 'RMVPE', ready: pitchMethodReady(probe, 'rmvpe', rmvpeReady), description: '歌声专用，10ms 音高轨迹；使用独立 ONNX 模型与 CPU 推理。' },
+      { id: 'fcpe', label: 'FCPE', ready: pitchMethodReady(probe, 'fcpe'), description: '快速歌声音高模型，10ms 音高轨迹；可使用 GPU。置信度暂不提供校准值。' },
       ...customModels.filter(item => item.kind === 'pitch').map(model => ({ ...model, ready: fs.existsSync(model.directory), source: 'custom', canDelete: true })),
     ],
     alignment: { manual: true, pitchMatching: true, forcedAlignment: !!probe?.fasterWhisper && alignmentModels.some(model => model.ready), models: alignmentModels },
@@ -632,7 +649,7 @@ async function chooseModelSource(model) {
 }
 
 function environmentPlan(computeProfile, packageSource = officialPackageSource, installSelection = defaultInstallSelection) {
-  const pitchLabels = installSelection.pitchMethods.map(id => id === 'pyin' ? 'pYIN' : 'TorchCrepe').join('、')
+  const pitchLabels = installSelection.pitchMethods.map(id => pitchMethodLabels[id] || id).join('、')
   const separationLabels = installSelection.separationModels.map(id => separationModelCatalog.find(model => model.id === id)?.label || id).join('、')
   const harmonyLabels = installSelection.harmonyModels.map(id => harmonyModelCatalog.find(model => model.id === id)?.label || id).join('、')
   const alignmentLabels = installSelection.alignmentModels.map(id => alignmentModelCatalog.find(model => model.id === id)?.label || id).join('、')
@@ -881,11 +898,46 @@ async function ensureBaseRuntime(force = false, onProgress, preferDomestic = tru
   return basePythonPath()
 }
 
+async function prepareDemucsCheckpoints(model, onProgress, taskId) {
+  const checkpoints = demucsCheckpoints[model.id]
+  if (!Array.isArray(checkpoints) || !checkpoints.length) return null
+  const directory = demucsCheckpointDirectory()
+  await mkdir(directory, { recursive: true })
+  const official = file => ({ label: 'Demucs 官方线路', url: `https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/${file}` })
+  const domestic = file => ({ label: '国内模型加速线路（HF Mirror）', url: `https://hf-mirror.com/${demucsCheckpoints.repository}/resolve/${demucsCheckpoints.revision}/${file}` })
+  const usedSources = new Set()
+  for (const [index, checkpoint] of checkpoints.entries()) {
+    if (pendingTaskCancellations.delete(taskId)) throw new TaskCancelledError()
+    const destination = path.join(directory, checkpoint.file)
+    if (fs.existsSync(destination)) {
+      try {
+        await verifyLocalFile(destination, checkpoint.sha256, checkpoint.size, checkpoint.file)
+        onProgress?.(0.06 + 0.84 * (index + 1) / checkpoints.length, `${model.label}：已复用并校验 ${checkpoint.file}（${index + 1}/${checkpoints.length}）。`, '', { transferState: 'cache' })
+        continue
+      } catch {
+        await fs.promises.rm(destination, { force: true })
+      }
+    }
+    const sources = process.env.PITCHORD_MODEL_SOURCE === 'official'
+      ? [official(checkpoint.file), domestic(checkpoint.file)]
+      : [domestic(checkpoint.file), official(checkpoint.file)]
+    const selected = await downloadFromSources(sources, async source => {
+      onProgress?.(0.06 + 0.84 * index / checkpoints.length, `${model.label}：正在通过${source.label}下载权重 ${index + 1}/${checkpoints.length}…`, checkpoint.file, { transferState: 'downloading' })
+      await downloadVerifiedFile(source.url, destination, checkpoint.sha256, checkpoint.size, (progress, message, telemetry) => {
+        if (pendingTaskCancellations.delete(taskId)) throw new TaskCancelledError()
+        onProgress?.(0.06 + 0.84 * (index + progress) / checkpoints.length, `${model.label}：${source.label} · ${message}`, checkpoint.file, telemetry)
+      }, checkpoint.file, 2)
+    }, (source, reason, next) => onProgress?.(0.06 + 0.84 * index / checkpoints.length, `${model.label}：${source.label}未完成，正在切换${next.label}…`, reason.slice(-180), { transferState: 'downloading' }))
+    usedSources.add(selected.label)
+  }
+  return [...usedSources].join('、') || '已缓存'
+}
+
 async function ensureRecommendedSeparationModel(python, modelId, onProgress, taskId = 'environment', taskTitle = '准备完整分析环境') {
   const selectedModel = separationModel(modelId)
   try {
     const marker = JSON.parse(await readFile(modelMarker(selectedModel.id), 'utf8'))
-    if (marker.model === selectedModel.id) {
+    if (marker.model === selectedModel.id && demucsCheckpointsPresent(selectedModel.id)) {
       onProgress?.(1, `${selectedModel.label} 已存在，无需重复下载。`)
       return
     }
@@ -893,12 +945,18 @@ async function ensureRecommendedSeparationModel(python, modelId, onProgress, tas
   await mkdir(path.dirname(modelMarker(selectedModel.id)), { recursive: true })
   const bundledModels = path.join(offlineAnalysisRoot(), 'models')
   const beforeFiles = new Set(await listFilesRecursive(modelRoot()))
+  let source = 'download'
   if (selectedModel.bundled && fs.existsSync(bundledModels)) {
     onProgress?.(0.15, `正在从完整版安装 ${selectedModel.label}…`)
     await fs.promises.cp(bundledModels, modelRoot(), { recursive: true, force: true })
+    source = 'offline-bundle'
   } else {
     let ticks = 0
-    onProgress?.(0.04, `正在下载 ${selectedModel.label} 人声分离模型…`)
+    const preloadedSource = await prepareDemucsCheckpoints(selectedModel, onProgress, taskId)
+    source = preloadedSource || 'Demucs 官方线路'
+    onProgress?.(preloadedSource ? 0.92 : 0.04, preloadedSource
+      ? `正在验证 ${selectedModel.label} 人声分离模型…`
+      : `正在通过Demucs 官方线路下载 ${selectedModel.label} 人声分离模型…`, source, { transferState: preloadedSource ? 'installing' : 'downloading' })
     const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(selectedModel.id)}); print('ready')`
     const downloadEnvironment = analysisEnvironment(python)
     delete downloadEnvironment.HF_HUB_OFFLINE
@@ -910,12 +968,17 @@ async function ensureRecommendedSeparationModel(python, modelId, onProgress, tas
         const line = output.trim().split(/\r?\n/).at(-1)
         if (!line || /unauthenticated requests|HF_TOKEN/i.test(line)) return
         ticks += 1
-        onProgress?.(Math.min(0.92, 0.08 + ticks * 0.025), `正在下载 ${selectedModel.label} 人声分离模型…`, line.slice(0, 240), { transferState: 'downloading', ...transferTelemetry(line) })
+        onProgress?.(preloadedSource ? Math.min(0.98, 0.92 + ticks * 0.01) : Math.min(0.92, 0.08 + ticks * 0.025), preloadedSource
+          ? `${selectedModel.label}：正在加载并验证模型…`
+          : `${selectedModel.label}：Demucs 官方线路 · 正在下载模型…`, line.slice(0, 240), { transferState: preloadedSource ? 'installing' : 'downloading', ...transferTelemetry(line) })
       },
     })
   }
-  const files = (await listFilesRecursive(modelRoot())).filter(file => !beforeFiles.has(file) && file !== path.relative(modelRoot(), modelMarker(selectedModel.id)))
-  await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source: selectedModel.bundled && fs.existsSync(bundledModels) ? 'offline-bundle' : 'download', files }, null, 2), 'utf8')
+  const files = [...new Set([
+    ...(await listFilesRecursive(modelRoot())).filter(file => !beforeFiles.has(file) && file !== path.relative(modelRoot(), modelMarker(selectedModel.id))),
+    ...(demucsCheckpoints[selectedModel.id] || []).map(checkpoint => path.relative(modelRoot(), path.join(demucsCheckpointDirectory(), checkpoint.file))),
+  ])]
+  await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source, files }, null, 2), 'utf8')
   onProgress?.(1, `${selectedModel.label} 人声分离模型已准备完成。`)
 }
 
@@ -1000,6 +1063,28 @@ async function ensureRecommendedHarmonyModel(modelId, onProgress) {
   }
   await writeFile(path.join(directory, 'pitchord-model.json'), JSON.stringify({ model: model.id, source: `https://huggingface.co/${model.repository}`, revision: model.revision, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
   onProgress?.(1, `${model.label} 已准备完成。`)
+}
+
+async function ensureRmvpeModel(onProgress) {
+  const destination = rmvpeModelPath()
+  await mkdir(path.dirname(destination), { recursive: true })
+  try { await verifyLocalFile(destination, rmvpeModel.sha256, rmvpeModel.size) }
+  catch {
+    await requireFreeSpace(512 * 1024 * 1024, '准备 RMVPE 音高模型')
+    await fs.promises.rm(destination, { force: true })
+    const sourcePath = `${rmvpeModel.repository}/resolve/${rmvpeModel.revision}/${rmvpeModel.filename}`
+    await downloadFromSources([
+      { label: 'HF Mirror 国内线路', url: `https://hf-mirror.com/${sourcePath}` },
+      { label: 'Hugging Face 官方线路', url: `https://huggingface.co/${sourcePath}` },
+    ], async source => {
+      onProgress?.(0.01, `正在通过${source.label}下载 RMVPE 权重…`, '', { transferState: 'downloading' })
+      await downloadVerifiedFile(source.url, destination, rmvpeModel.sha256, rmvpeModel.size,
+        (progress, message, telemetry) => onProgress?.(progress, `${source.label}：${message}`, '', telemetry), 'RMVPE 权重')
+    }, (source, reason, next) => onProgress?.(0.01, `${source.label}未完成，正在切换至${next.label}…`, reason.slice(-240), { transferState: 'downloading' }))
+  }
+  await writeFile(rmvpeModelMarker(), JSON.stringify({ model: 'rmvpe', source: `https://huggingface.co/${rmvpeModel.repository}`,
+    revision: rmvpeModel.revision, sha256: rmvpeModel.sha256, preparedAt: new Date().toISOString() }, null, 2), 'utf8')
+  onProgress?.(1, 'RMVPE 权重已校验，可以开始识别音高。')
 }
 
 const projectRoot = () => path.join(app.getPath('documents'), 'Pitchord Projects')
@@ -1139,6 +1224,16 @@ app.whenReady().then(async () => {
     return picked.canceled ? null : picked.filePaths[0]
   })
 
+  ipcMain.handle('pitchord:choose-existing-analysis-directory', async (event, currentPath) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: '选择已有的 Pitchord environment 文件夹',
+      defaultPath: typeof currentPath === 'string' && path.isAbsolute(currentPath) ? currentPath : applicationDirectory(),
+      properties: ['openDirectory'],
+    })
+    return picked.canceled ? null : picked.filePaths[0]
+  })
+
   ipcMain.handle('pitchord:choose-python', async (event, currentPath) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
     const picked = await dialog.showOpenDialog(mainWindow, {
@@ -1151,20 +1246,33 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('pitchord:configure-analysis-environment', async (event, request) => {
-    if (event.sender !== mainWindow?.webContents || !request || !['managed', 'custom'].includes(request.mode)) throw new Error('Invalid environment configuration')
+    if (event.sender !== mainWindow?.webContents || !request || !['managed', 'custom', 'existing'].includes(request.mode)) throw new Error('Invalid environment configuration')
+    if (analysisInstallTask || activeAnalysisTasks.size) throw new Error('分析任务正在运行，请在任务结束或取消后切换环境。')
     if (request.mode === 'managed') {
       if (typeof request.root !== 'string' || !path.isAbsolute(request.root)) throw new Error('请选择有效的环境目录。')
       configuredAnalysisRoot = path.resolve(request.root)
       await mkdir(configuredAnalysisRoot, { recursive: true })
       const computeProfile = ['auto', 'cpu', 'cuda121'].includes(request.computeProfile) ? request.computeProfile : 'auto'
       await writeSettings({ analysisRoot: configuredAnalysisRoot, runtimePreference: 'managed', computeProfile })
+    } else if (request.mode === 'existing') {
+      const found = findExistingEnvironment(request.root, pythonExecutable, baseRuntime.version)
+      const probe = await probePython(found.pythonPath)
+      if (!probe) throw new Error('所选 environment 中的 Python 无法启动。请确认文件夹没有缺失或损坏。')
+      const majorMinor = probe.version.split('.').slice(0, 2).map(Number)
+      if (majorMinor[0] !== 3 || majorMinor[1] < 10 || majorMinor[1] > 12) throw new Error(`当前支持 Python 3.10–3.12，所选版本为 ${probe.version}。`)
+      await writeSettings({ analysisRoot: found.root, pythonPath: found.pythonPath, runtimePreference: 'existing' })
+      configuredAnalysisRoot = found.root
     } else {
       if (typeof request.pythonPath !== 'string' || !path.isAbsolute(request.pythonPath) || !fs.existsSync(request.pythonPath)) throw new Error('请选择有效的 Python 可执行文件。')
       const probe = await probePython(request.pythonPath)
       if (!probe) throw new Error('所选 Python 无法启动，或不是可用的 Python 3 环境。')
       const majorMinor = probe.version.split('.').slice(0, 2).map(Number)
       if (majorMinor[0] !== 3 || majorMinor[1] < 10 || majorMinor[1] > 12) throw new Error(`当前支持 Python 3.10–3.12，所选版本为 ${probe.version}。`)
-      await rememberPythonPath(path.resolve(request.pythonPath))
+      const inferred = inferExistingEnvironmentFromPython(request.pythonPath, pythonExecutable, baseRuntime.version)
+      if (inferred) {
+        await writeSettings({ analysisRoot: inferred.root, pythonPath: inferred.pythonPath, runtimePreference: 'existing' })
+        configuredAnalysisRoot = inferred.root
+      } else await rememberPythonPath(path.resolve(request.pythonPath))
     }
     return analysisRuntimeStatus()
   })
@@ -1239,7 +1347,7 @@ app.whenReady().then(async () => {
       if (!python) throw new Error('未找到可用于安装分析依赖的 Python 3。')
       const wheelhouse = path.join(offlineAnalysisRoot(), 'wheelhouse')
       const offlineRequirements = path.join(offlineAnalysisRoot(), 'analysis-lock-win-x64.txt')
-      const useOfflineBundle = resolvedProfile === 'cpu' && fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
+      const useOfflineBundle = resolvedProfile === 'cpu' && !installSelection.pitchMethods.some(id => id === 'rmvpe' || id === 'fcpe') && fs.existsSync(wheelhouse) && fs.existsSync(offlineRequirements)
       let currentComponent = 'base-runtime'
       let componentMessage = '正在准备完整分析环境…'
       let progressTicks = 0
@@ -1357,8 +1465,7 @@ app.whenReady().then(async () => {
         beginComponent('dependencies', '正在并行安装所选音频分析组件…')
         const selectedRequirements = [
           'demucs==4.1.0',
-          ...(installSelection.pitchMethods.includes('torchcrepe') ? ['torchcrepe==0.0.24'] : []),
-          ...(installSelection.pitchMethods.includes('pyin') ? ['librosa==1.0.0'] : []),
+          ...pitchInstallRequirements(installSelection.pitchMethods),
           'faster-whisper==1.2.1',
           'omegaconf==2.2.3',
           'ml-collections==1.1.0',
@@ -1373,11 +1480,15 @@ app.whenReady().then(async () => {
         beginComponent('dependencies', '正在从本地完整版安装音频分析依赖…')
         await runProcess(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--find-links', wheelhouse, '--requirement', offlineRequirements], processOptions())
       }
-      finishComponent('音频分析依赖已安装。')
       const probe = await probePython(python)
-      const selectedPackagesReady = !!probe?.demucs && !!probe?.fasterWhisper && (!installSelection.pitchMethods.includes('torchcrepe') || !!probe?.torchcrepe) && (!installSelection.pitchMethods.includes('pyin') || !!probe?.librosa)
+      const selectedPackagesReady = !!probe?.demucs && !!probe?.fasterWhisper && selectedPitchMethodsReady(probe, installSelection.pitchMethods)
       if (!selectedPackagesReady) throw new Error('依赖安装完成，但所选分析组件未通过完整性检查。请再次点击修复。')
       if (resolvedProfile === 'cuda121' && !probe.cudaAvailable) throw new Error('CUDA 组件已安装，但 PyTorch 无法使用当前显卡。请选择“自动选择”或 CPU 环境后重试。')
+      if (installSelection.pitchMethods.includes('rmvpe')) {
+        beginComponent('dependencies', '正在准备 RMVPE 音高模型权重…', 0.75)
+        await ensureRmvpeModel((progress, message, detail, telemetry) => report('dependencies', 0.75 + progress * 0.25, message, detail, telemetry))
+      }
+      finishComponent('音频分析依赖与所选音高模型已准备完成。')
       const environmentManifest = { schemaVersion: 1, managedBy: 'Pitchord', runtimeVersion: analysisRuntimeVersion, requestedProfile, resolvedProfile, python, pythonVersion: probe.version, installSelection, createdAt: new Date().toISOString() }
       await writeFile(path.join(managedRuntimeRoot(), 'pitchord-runtime.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
       await writeFile(path.join(analysisRoot(), 'pitchord-environment.json'), JSON.stringify(environmentManifest, null, 2), 'utf8')
@@ -1394,7 +1505,7 @@ app.whenReady().then(async () => {
       report('verify', 0.25, '正在检查全部组件与推荐模型…')
       const finalStatus = await analysisRuntimeStatus()
       const selectedModelsReady = installSelection.separationModels.every(id => finalStatus.separationModels.find(model => model.id === id)?.ready) && installSelection.harmonyModels.every(id => finalStatus.harmonyModels.find(model => model.id === id)?.ready) && installSelection.alignmentModels.every(id => finalStatus.alignment.models.find(model => model.id === id)?.ready)
-      if (!finalStatus.runtimeReady || !selectedModelsReady) throw new Error('完整环境安装结束，但部分所选模型未通过检查。请点击修复后重试。')
+      if (!finalStatus.completeReady || !selectedModelsReady) throw new Error('完整环境安装结束，但部分所选模型未通过检查。请点击修复后重试。')
       report('verify', 1, '完整分析环境已准备完成。')
       sendAnalysisProgress('complete', '完整分析环境已准备完成。', { overallProgress: 1, componentProgress: 1, components: plan.map(item => ({ id: item.id, label: item.label, detail: item.detail, status: 'complete', progress: 1 })) })
       sendTaskProgress('environment', '准备完整分析环境', 'success', `${resolvedProfile === 'cuda121' ? 'GPU' : 'CPU'} 环境与所选模型已全部准备完成`, 1)
@@ -1419,31 +1530,10 @@ app.whenReady().then(async () => {
       const python = await preferredPythonPath()
       const probe = await probePython(python)
       if (!probe?.demucs) throw new Error('请先安装或修复分析环境。')
-      await mkdir(path.dirname(modelMarker(selectedModel.id)), { recursive: true })
-      sendAnalysisProgress('model', `正在准备 ${selectedModel.label} 人声分离模型…`)
-      sendTaskProgress('environment-model', '准备人声分离模型', 'running', `正在准备 ${selectedModel.label}…`)
-      const bundledModels = path.join(offlineAnalysisRoot(), 'models')
-      const beforeFiles = new Set(await listFilesRecursive(modelRoot()))
-      if (selectedModel.bundled && fs.existsSync(bundledModels)) {
-        sendAnalysisProgress('model', '正在从完整版安装人声分离模型…')
-        await fs.promises.cp(bundledModels, modelRoot(), { recursive: true, force: true })
-      } else {
-        const program = `from demucs.pretrained import get_model; get_model(${JSON.stringify(selectedModel.id)}); print('ready')`
-        const downloadEnvironment = analysisEnvironment(python)
-        delete downloadEnvironment.HF_HUB_OFFLINE
-        await runProcess(python, ['-c', program], {
-          env: downloadEnvironment,
-          onOutput: output => {
-            const line = output.trim().split(/\r?\n/).at(-1)
-            if (line && !/unauthenticated requests|HF_TOKEN/i.test(line)) {
-              sendAnalysisProgress('model', line.slice(0, 240))
-              sendTaskProgress('environment-model', '准备人声分离模型', 'running', line.slice(0, 240))
-            }
-          },
-        })
-      }
-      const files = (await listFilesRecursive(modelRoot())).filter(file => !beforeFiles.has(file) && file !== path.relative(modelRoot(), modelMarker(selectedModel.id)))
-      await writeFile(modelMarker(selectedModel.id), JSON.stringify({ model: selectedModel.id, preparedAt: new Date().toISOString(), source: selectedModel.bundled && fs.existsSync(bundledModels) ? 'offline-bundle' : 'download', files }, null, 2), 'utf8')
+      await ensureRecommendedSeparationModel(python, selectedModel.id, (progress, message, detail, telemetry) => {
+        sendAnalysisProgress('model', message, { overallProgress: progress, detail, ...telemetry })
+        sendTaskProgress('environment-model', '准备人声分离模型', 'running', message, progress)
+      }, 'environment-model', '准备人声分离模型')
       sendAnalysisProgress('complete', '人声分离模型已准备完成。')
       sendTaskProgress('environment-model', '准备人声分离模型', 'success', `${selectedModel.label} 已准备完成`, 1)
       return { ...await analysisRuntimeStatus(), busy: false }
@@ -1614,7 +1704,11 @@ app.whenReady().then(async () => {
       filters: [{ name: 'Python', extensions: process.platform === 'win32' ? ['exe'] : [''] }],
     })
     if (picked.canceled || !picked.filePaths[0]) return null
-    await rememberPythonPath(picked.filePaths[0])
+    const inferred = inferExistingEnvironmentFromPython(picked.filePaths[0], pythonExecutable, baseRuntime.version)
+    if (inferred) {
+      await writeSettings({ analysisRoot: inferred.root, pythonPath: inferred.pythonPath, runtimePreference: 'existing' })
+      configuredAnalysisRoot = inferred.root
+    } else await rememberPythonPath(picked.filePaths[0])
     return picked.filePaths[0]
   })
 
@@ -1940,19 +2034,21 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('pitchord:analyze-pitch', async (event, algorithm = 'pyin', selectedVocals) => {
     if (event.sender !== mainWindow?.webContents) throw new Error('Invalid sender')
-    if (!['pyin', 'torchcrepe'].includes(algorithm)) throw new Error('当前音高算法尚不可用。')
+    if (!Object.hasOwn(pitchMethodLabels, algorithm)) throw new Error('当前音高算法尚不可用。')
     pendingTaskCancellations.delete('pitch')
     const project = requireProject()
     const input = resolvePitchInput(project, selectedVocals)
     const output = path.join(project.directory, 'analysis', `pitch-${algorithm}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
     const python = await preferredPythonPath()
     const probe = await probePython(python)
-    if (!python || !probe?.librosa || (algorithm === 'torchcrepe' && !probe?.torchcrepe)) throw new Error(`分析环境尚未准备 ${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}。`)
-    const computeDevice = algorithm === 'torchcrepe' && probe.cudaAvailable ? 'cuda' : 'cpu'
+    if (!python || !probe) throw new Error('分析环境中的 Python 无法启动，请打开“分析环境”重新检测或修复。')
+    if (!probe.librosa) throw new Error('音高识别所需的公共音频组件尚未安装，请打开“分析环境”重新准备所选环境；无需删除已下载的模型。')
+    if ((algorithm === 'torchcrepe' && !probe.torchcrepe) || (algorithm === 'rmvpe' && (!probe.rmvpe || !fs.existsSync(rmvpeModelPath()))) || (algorithm === 'fcpe' && !probe.fcpe)) throw new Error(`分析环境尚未准备 ${pitchMethodLabels[algorithm]}，请在分析环境中选择并安装。`)
+    const computeDevice = (algorithm === 'torchcrepe' || algorithm === 'fcpe') && probe.cudaAvailable ? 'cuda' : 'cpu'
     const deviceLabel = computeDevice === 'cuda' ? probe.cudaDeviceName || 'CUDA GPU' : 'CPU'
-    sendTaskProgress('pitch', '连续音高识别', 'running', `正在使用 ${deviceLabel} 启动 ${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'}…`, 0.02)
+    sendTaskProgress('pitch', '连续音高识别', 'running', `正在使用 ${deviceLabel} 启动 ${pitchMethodLabels[algorithm]}…`, 0.02)
     try {
-      await runProcess(python, [path.join(scriptRoot, 'analyze-pitch.py'), input, '--algorithm', algorithm, '--output', output, '--device', computeDevice], {
+      await runProcess(python, [path.join(scriptRoot, 'analyze-pitch.py'), input, '--algorithm', algorithm, '--output', output, '--device', computeDevice, ...(algorithm === 'rmvpe' ? ['--model', rmvpeModelPath()] : [])], {
         env: analysisEnvironment(python),
         taskId: 'pitch',
         taskTitle: '连续音高识别',
@@ -1965,7 +2061,7 @@ app.whenReady().then(async () => {
       })
       const result = JSON.parse(await readFile(output, 'utf8'))
       if (!Array.isArray(result.points) || !result.points.every(point => Number.isFinite(point.time) && Number.isFinite(point.hz) && Number.isFinite(point.confidence) && Number.isFinite(point.rms) && typeof point.voiced === 'boolean')) throw new Error('音高分析结果格式无效。')
-      sendTaskProgress('pitch', '连续音高识别', 'success', `${algorithm === 'pyin' ? 'pYIN' : 'TorchCrepe'} 已用 ${result.device || deviceLabel} 生成 ${result.points.length} 个时间点`, 1)
+      sendTaskProgress('pitch', '连续音高识别', 'success', `${pitchMethodLabels[algorithm]} 已用 ${result.device || deviceLabel} 生成 ${result.points.length} 个时间点`, 1)
       return { algorithm, path: output, points: result.points, device: result.device || deviceLabel }
     } catch (error) {
       if (isTaskCancelled(error)) {

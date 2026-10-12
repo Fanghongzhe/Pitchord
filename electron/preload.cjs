@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('pitchordDesktop', {
   pickPython: () => ipcRenderer.invoke('pitchord:pick-python'),
   choosePython: currentPath => ipcRenderer.invoke('pitchord:choose-python', currentPath),
   chooseAnalysisDirectory: currentPath => ipcRenderer.invoke('pitchord:choose-analysis-directory', currentPath),
+  chooseExistingAnalysisDirectory: currentPath => ipcRenderer.invoke('pitchord:choose-existing-analysis-directory', currentPath),
   configureAnalysisEnvironment: request => ipcRenderer.invoke('pitchord:configure-analysis-environment', request),
   analysisStatus: () => ipcRenderer.invoke('pitchord:analysis-status'),
   cancelAnalysisTask: taskId => ipcRenderer.invoke('pitchord:cancel-analysis-task', taskId),
